@@ -71,8 +71,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/qbayee/sbb_pixelwise_segmentation"
-Changelog = "https://github.com/qbayee/sbb_pixelwise_segmentation/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/johnlockejrr/sbb_pytorch"
+Changelog = "https://github.com/johnlockejrr/sbb_pytorch/blob/refactor/packaged-rewrite/CHANGELOG.md"
+# The upstream this fork came from is qbayee/sbb_pixelwise_segmentation (named in README.md);
+# these URLs point at the repository the package is actually published from.
 
 [project.scripts]
 sbb = "sbb_pytorch.cli:main"
