@@ -1,307 +1,194 @@
-# SBB PyTorch Changelog
+# Changelog
 
-This document provides a comprehensive overview of the changes made when porting the SBB (Staatsbibliothek zu Berlin) pixelwise segmentation project from TensorFlow 2.12.1 to PyTorch.
+All notable changes to this project are documented in this file. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
+[semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Overview
+The version history has two entries. `0.1.0` is the state of the repository before the refactor:
+sixteen loose scripts in the root directory, the TensorFlow-to-PyTorch port. `0.2.0` is the
+packaged rewrite on `refactor/packaged-rewrite`, and its entry describes that change -- the older
+changelog text this file used to hold is summarised under 0.1.0 and, in full, in git.
 
-The original `sbb_pixelwise_segmentation` project was a TensorFlow-based document analysis system for pixelwise segmentation. The `sbb_pixelwise_segmentation_pytorch` directory contains a complete PyTorch refactor that not only ports the existing functionality but also adds significant improvements and new features.
+## [0.2.0] - 2026-10-29
 
-## Major Architectural Changes
+The refactor from root-level scripts to the installable `sbb_pytorch` package. The rule the whole
+rewrite was written under was *behaviour preservation outranks elegance*: every change that moves a
+number is listed in [docs/migration.md](docs/migration.md), which is the sign-off sheet for this
+release, and [TECHNICAL_CHANGELOG.md](TECHNICAL_CHANGELOG.md) maps each old file to its
+replacement.
 
-### 1. Framework Migration
-- **From**: TensorFlow 2.12.1 with Keras
-- **To**: PyTorch 2.0+ with PyTorch Lightning
-- **Impact**: Complete rewrite of all model definitions, training loops, and data handling
+### Added
 
-### 2. Model Architecture Overhaul
+- The `sbb_pytorch` package under `src/` with a hatchling build, `py.typed`, and the `sbb` console
+  script (`sbb = "sbb_pytorch.cli:main"`). `pip install -e .` makes the package importable from
+  anywhere; the empty root `__init__.py` that made the source tree an accidental module is gone.
+- `sbb`, one `click` group, replacing three argument-parsing styles (`argparse` in `train.py`, a
+  bare `click.command` in `inference_pytorch.py`, its own `click.group` in
+  `generate_gt_for_training.py`): `train`, `infer`, `gt generate`, `gt visualize`, `export`,
+  `validate`, `config-schema`.
+- `SBBConfig`, `Page2Label` and `ScalesConfig` as pydantic v2 models, replacing eight dataclasses
+  and the stateful `ConfigLoader` class. Every field has a type, a default and, where meaningful,
+  a constraint; `dump_json_schema` writes `docs/config-reference.json`, replacing the
+  hand-written option table that had already drifted from the code.
+- `Checkpoint` in `storage/checkpoint.py`: one schema for the three checkpoint layouts that were in
+  simultaneous use (`model_state`, `model_state_dict`, bare state dicts), plus
+  `load_checkpoint`, `save_checkpoint`, `latest_checkpoint`, `prune_checkpoints` and the
+  `model_config.json` sidecar.
+- `SBBDataModule` with a real `prepare_data`/`setup` split, `SegmentationDataset`,
+  `PatchConfig`/`preprocess_and_augment_data`, and one augmentation factory gated on the config.
+- `SBBLightningModule` -- one module for every task, replacing the single `SegmentationModel` that
+  `train.py` used for all six. `training/factory.py` is the only optimizer/initializer/scheduler
+  builder; `training/callbacks.py` derives its monitored metrics from what the module actually
+  logs; `training/trainer.py` assembles `pl.Trainer` and the `fit` the CLI calls.
+- `models/base.py`: one `UNetDecoder` plus four thin assemblies and a `MODEL_REGISTRY` of seven
+  architectures, replacing seven classes built from five copied decoders. `pairing="legacy"`
+  reproduces the old off-by-one skip pairing so old checkpoints still load.
+- `metrics/`: one `Metric` interface over `functional.py`, `segmentation.py` and `enhance.py`,
+  replacing five ways of computing two numbers. `losses.py` is now a thin `nn.Module` layer over
+  it, and the losses that existed only as plain functions (`SoftDiceLoss`, `TverskyLoss`,
+  `FocalTverskyLoss`, `GeneralizedDiceLoss`, `JaccardLoss`) are constructible modules.
+- `gt/`: one ALTO/PageXML parser, one contour-geometry module, one renderer, one generator and the
+  reading-order pair builder, replacing five near-identical XML readers (~1000 duplicated lines)
+  and five rasterising functions.
+- `sbb_pytorch.device` (`resolve_device`, `available_devices`) and `sbb_pytorch.exceptions`
+  (`SBBError` and its typed subclasses), so a bad device string or a stale config is one
+  explanatory line instead of a traceback.
+- `sbb_pytorch.logging.get_logger`: one cached logger per name, console plus optional timestamped
+  file handler, replacing the `train.py` logger that appended a fresh `FileHandler` on every call
+  and the ~200 `print()` calls spread across the old modules.
+- The `tests/` suite: twelve modules covering config, models, data, augmentations, metrics,
+  losses, storage, inference and training (plus the training factory).
+- `configs/`: six ready-made configs (textline, layout, binarization, enhancement,
+  classification, reading_order). The first two carry the values of `config_train_textline.json`
+  and `config_params.json`; the other four tasks had no legacy config at all.
 
-#### Original TensorFlow Models (`models.py`)
-- Custom ResNet50 implementation with manual layer definitions
-- Two variants: `resnet50_unet()` and `resnet50_unet_light()`
-- Manual ResNet50 blocks (identity_block, conv_block)
-- Custom UNet decoder implementation
-- Hardcoded pretrained weights loading
+### Changed
 
-#### New PyTorch Models (`models_pytorch.py`)
-- **ResNet50UNet**: Uses `torchvision.models.resnet50` with pretrained ImageNet weights
-- **ResNet50UNetLight**: Lighter version with reduced decoder channels
-- **ResNet50Classifier**: For classification tasks
-- **MachineBasedReadingOrderModel**: For reading order detection
-- **ViTResNet50UNet**: Vision Transformer + ResNet50 hybrid
-- **ViTResNet50UNetTransformerBeforeCNN**: Alternative ViT architecture
-- **EnhancementModel**: For image enhancement with attention mechanisms
+- Every legacy script is replaced by a module: see [TECHNICAL_CHANGELOG.md](TECHNICAL_CHANGELOG.md)
+  for the file-by-file table, including the four root JSON configs (now `configs/*.json`),
+  `requirements.txt` (now `pyproject.toml`), and `train.md` (folded into the README and the
+  changelogs).
+- `--device` defaults to `auto` and is validated at parse time. `train.py` hard-coded `cuda` and
+  called `pl.Trainer(accelerator=device, devices=1)`, which rejected the valid spec `cuda:1` and
+  made the second GPU of a machine unreachable.
+- Config flags and config fields are the same values. `train.py`'s `get_arg_with_priority` helper
+  became `config.loaders.apply_overrides` (flag, then file, then default), and `--resume` --
+  accepted and never forwarded to `fit(ckpt_path=...)` -- is a real field.
+- Checkpoint file names: `model-{epoch:02d}-{val_loss:.4f}.ckpt` and
+  `best-{epoch:02d}-{val_accuracy:.4f}.ckpt`, `top_k=3` each; mid-epoch checkpoints go in a
+  `steps/` subdirectory instead of one directory per step.
+- Metric names: `val_acc` becomes `val_accuracy`, and the accuracy/IoU/Dice set is replaced by one
+  confusion matrix reporting `val_loss`, `val_accuracy`, `val_miou`, `val_dice_macro`,
+  `val_dice_micro` and the per-class keys. Reading an old TensorBoard or CSV run by the old keys
+  needs the new ones; **there is no flag that gets the old numbers back.**
+- Metrics are computed once per epoch from pooled counts instead of `compute()` on every batch, so
+  a logged epoch value no longer depends on batch size and order.
+- Every model returns raw logits. `ResNet50UNet` returned logits for segmentation and `sigmoid`
+  otherwise while four other classes returned `softmax`, so `CrossEntropyLoss` normalised twice on
+  those and they trained on a flattened loss surface.
+- `configs/layout.json`: `num_patches_xy` `[56, 56]` (the legacy `transformer_num_patches_xy`, a
+  224x224 grid behind a 448 input) becomes `[112, 112]`; `"blur_k": ["blur", "guass", "median"]`
+  is corrected to `"gauss"`; `page2label.use_case` in `configs/layout.json` becomes `layout`.
+- `requirements.txt` → `pyproject.toml`: `sacred` dropped (only the Keras build script used it),
+  and with it the seven declared packages `src/` never imports -- `shapely`, `matplotlib`,
+  `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`. Three of those still install through other
+  dependencies (`scipy` via `albumentations`, `tqdm` via `pytorch_lightning`, `Pillow` via
+  `torchvision`), so the install actually shrinks by `shapely`, `matplotlib`, `seaborn` and
+  `scikit-learn`. Floors raised where the code requires it (`numpy>=1.24,<3`,
+  `albumentations>=1.4.5`), `pydantic`, `click`, `rich` and `tensorboard` added.
+  `torch`/`torchvision` are declared but the active build still has to be chosen before install.
+- README license section corrected from MIT to Apache-2.0, which is what `LICENSE` has always
+  contained, and `pyproject.toml` declares `license = "Apache-2.0"`.
 
-#### Key Improvements:
-- Modern PyTorch architecture using `torchvision.models`
-- Better weight initialization
-- More flexible model creation with factory pattern
-- Support for multiple task types (segmentation, classification, enhancement, reading order)
-- Attention mechanisms in enhancement models
+### Fixed
 
-### 3. Training Pipeline Revolution
+Crashes and silently wrong values, grouped where they lived; the annotated list with the
+breaking/fix/api markers is [docs/migration.md](docs/migration.md).
 
-#### Original TensorFlow Training (`train.py`)
-- Sacred experiment framework
-- Manual data generation with `data_gen()`
-- Basic model compilation and training
-- Simple epoch loop with `model.fit_generator()`
-- Manual model saving
+- **Models.** Four of the five copied decoders could not complete a forward pass (3072 channels fed
+  into a `Conv2d(2048, 1024)`), and their skip pairing was off by one (`f4` unused, `f1` twice).
+  Both ViT variants raised `RuntimeError` on their first batch. `TaskType.BINARIZATION` did not
+  exist as an enum member, so a binarization config failed at parse time.
+- **Training.** `torch.save({... "val_acc": trainer.callback_metrics["val_acc"]})` raised `KeyError`
+  *after* a full run for any task that does not log it, throwing away the result.
+  `config.precision`, `config.accumulate_grad_batches` and `config.gradient_clip_val` were read by
+  nothing. `ReduceLROnPlateau` was imported and never constructed, so no scheduler ever ran;
+  `torch.optim.Adadelta` was built without `weight_decay`; `momentum` was passed to optimizers that
+  do not take it; pretrained ImageNet weights were re-initialised with kaiming one line after being
+  downloaded.
+- **Callbacks.** `SaveWeightsAfterSteps` declared a signature pytorch-lightning never calls, so it
+  never fired; `training.py`'s `ModelCheckpoint.save_model` read attributes its own `__init__`
+  never assigned, so the first save raised `AttributeError`; pruning sorted `epoch_10` before
+  `epoch_2` and deleted the newest files. Two checkpoints and two early-stopping callbacks were
+  registered unconditionally and raised on any task that never logs `val_acc`.
+- **Losses and metrics.** Tversky's `alpha`/`beta` were swapped (penalising false negatives where
+  the config asked for false positives); focal loss used `alpha=4.0` in `metrics.py` and `0.25` in
+  `losses.py` and diluted the loss by `1/n_classes`; focal-Tversky used an unpublished formula;
+  Jaccard loss was multiplied by its smoothing constant; generalized dice merged every image in the
+  batch; `ignore_index` filtered the result vector instead of the labels; `losses.SSIMLoss` raised
+  `NameError` on construction, which made the only enhancement loss unreachable.
+- **Data and images.** Training and inference fed the model different tensors for the same file
+  (RGB via PIL, BGR via cv2 with RGB statistics); label loading collapsed 3-channel SBB masks by
+  luminance, turning class ids `{1,2,3}` into `{10,90,187}`; `im.split('.')[0]` truncated
+  `page.001.png` to `page`; `augmentation: false` was ignored, because the module that read the
+  config was dead code; `preprocess_and_augment_data` ran in `DataModule.__init__`, so two
+  processes wrote the same files at once; a missing image folder raised from a worker mid-epoch
+  instead of at construction.
+- **Inference.** The output image was a thumbnail: the page was downsampled to the model's
+  448x672 output instead of the mask being upscaled; a bilinear resize of the label map invented
+  class ids; normalisation was applied before resizing and skipped entirely for classification;
+  `--save` wrote nothing at all for classification; `--patches` and the whole `reading_order`
+  branch were `pass` statements; `--ground_truth` was documented as a directory, read as a file,
+  and its IoU computed and thrown away; `color_images` hard-coded three colours, rendering every
+  class from 3 up black.
+- **Ground truth.** The XML namespace prefix was derived as `"PcGts}"` for a namespace-less
+  document, leaving `imageHeight`/`imageWidth` unbound; `config_params=None` crashed the layout
+  branch although `--config` was documented as ignorable; `case_label` was applied to every region
+  whatever the use case; the overlay blended with weights summing to 0.6, dimming the result.
+- **Config.** Any key a file omitted raised `KeyError` even when the value was irrelevant --
+  `config_train_textline.json` was loadable through exactly one code path -- and a `" "`
+  `dir_of_start_model` (the shipped way of writing "unset") is now `None`. `validate_configs`'
+  three hand-written `if` checks become `SBBConfig.warnings()` and `validate_pair()`, which report
+  rather than raise; `sbb validate --strict` turns the reports into an exit code.
 
-#### New PyTorch Training (`train.py`)
-- **PyTorch Lightning Integration**: Modern training framework
-- **Advanced Callbacks**: ModelCheckpoint, EarlyStopping
-- **TensorBoard Logging**: Built-in experiment tracking
-- **Command Line Interface**: argparse-based configuration
-- **Resume Training**: Checkpoint-based training resumption
-- **Advanced Metrics**: IoU, Dice Score, Accuracy tracking
-- **Better Error Handling**: Comprehensive logging and validation
+### Removed
 
-#### Key Improvements:
-- Automatic mixed precision support
-- Better GPU memory management
-- Distributed training ready
-- Comprehensive logging and monitoring
-- Model checkpointing and early stopping
-- More robust error handling
+- The root modules `train.py`, `training.py`, `initialization.py`, `model_utils.py`,
+  `models_pytorch.py`, `dataset.py`, `augmentation.py`, `utils.py`, `metrics.py`, `losses.py`,
+  `config_loader.py`, `inference_pytorch.py`, `gt_gen_utils.py`, `generate_gt_for_training.py`,
+  `build_model_load_pretrained_weights_and_save.py` (a Keras script in a PyTorch repository) and
+  the root `__init__.py`, plus `requirements.txt`, `train.md` and the four root config JSONs. Each
+  one is replaced in `src/sbb_pytorch/` before it is deleted; the deletion is the last commit of
+  the refactor.
+- The `sacred` dependency, whose only user was the Keras build script.
 
-### 4. Configuration System Overhaul
+## [0.1.0] - 2025-10-23
 
-#### Original Configuration (`config_params.json`)
-```json
-{
-    "n_classes": 3,
-    "n_epochs": 2,
-    "input_height": 448,
-    "input_width": 672,
-    "weight_decay": 1e-6,
-    "n_batch": 2,
-    "learning_rate": 1e-4,
-    "patches": true,
-    "pretraining": true,
-    "augmentation": false,
-    // ... basic parameters
-}
-```
+The pre-refactor state of the repository: the port of
+[qbayee/sbb_pixelwise_segmentation](https://github.com/qbayee/sbb_pixelwise_segmentation) from
+TensorFlow 2.12.1 to PyTorch 2 with PyTorch Lightning, as a set of scripts in the repository root.
 
-#### New Configuration System
-- **Multiple Config Files**: `config_params.json`, `config_train_textline.json`, `custom_config_page2label.json`, `scales_enhancement.json`
-- **Structured Configuration**: `config_loader.py` with dataclasses and enums
-- **Type Safety**: Enum-based configuration validation
-- **Modular Design**: Separate configs for different tasks and use cases
+### Added
 
-#### New Configuration Features:
-- **Backbone Types**: transformer, resnet, nontransformer
-- **Task Types**: segmentation, classification, enhancement, reading_order
-- **Use Cases**: textline, layout, printspace, glyph, word
-- **Advanced Augmentation**: RGB background/foreground, channel shuffling, degradation
-- **Transformer Configuration**: Patch sizes, projection dimensions, attention heads
-- **Device Configuration**: CUDA/CPU selection
+- `models_pytorch.py`: `ResNet50UNet`, `ResNet50UNetLight`, `ResNet50Classifier`,
+  `MachineBasedReadingOrderModel`, `ViTResNet50UNet`, `ViTResNet50UNetTransformerBeforeCNN`,
+  `EnhancementModel` -- torchvision ResNet50 encoders with hand-written decoders, five copies of
+  the same decoder.
+- `train.py` (Sacred-style config plus `argparse`, a `SegmentationModel` Lightning module used for
+  every task), `training.py` (a hand-written trainer and its own `ModelCheckpoint`),
+  `initialization.py` (three weight-init schemes, a gradient clipper, an L2 regularizer that
+  returned a norm), `model_utils.py` (save/load/checkpoint in a fourth layout).
+- `dataset.py` and `augmentation.py` (the dataset plus two `albudataloading`-style augmentation
+  pipelines, one of which the dataset never used), `utils.py` (49 KB of image, patch, logging and
+  checkpoint helpers, several functions duplicated with divergent behaviour), `metrics.py` and
+  `losses.py` (five ways to compute accuracy/IoU/Dice and their losses).
+- `config_loader.py` with eight dataclasses and enums, `config_params.json`,
+  `config_train_textline.json`, `custom_config_page2label.json`, `scales_enhancement.json`,
+  `requirements.txt`, `train.md`, `README.md`, `CHANGELOG.md`, `TECHNICAL_CHANGELOG.md`.
+- `inference_pytorch.py` (`SBBPredict`), `gt_gen_utils.py` and `generate_gt_for_training.py`
+  (ALTO/PageXML parsing, contour extraction and label rasterising, six of its functions
+  near-identical).
 
-### 5. Data Handling and Augmentation
-
-#### Original Data Pipeline (`utils.py`)
-- Basic image loading and preprocessing
-- Simple augmentation functions
-- Manual patch generation
-- Basic data flow management
-
-#### New Data Pipeline (`dataset.py`)
-- **PyTorch Dataset**: Proper `torch.utils.data.Dataset` implementation
-- **DataLoader Integration**: Efficient data loading with multiprocessing
-- **Albumentations**: Professional augmentation library
-- **Advanced Augmentations**:
-  - RGB background/foreground replacement
-  - Channel shuffling
-  - Image degradation
-  - Brightness adjustment
-  - Elastic transformations
-  - Advanced rotation and scaling
-
-#### Key Improvements:
-- Better memory efficiency
-- Parallel data loading
-- More sophisticated augmentations
-- Proper tensor handling
-- Better error handling for missing files
-
-### 6. Loss Functions and Metrics
-
-#### Original Loss Functions (`metrics.py`)
-- Basic soft dice loss
-- Weighted categorical crossentropy
-- Simple accuracy metrics
-
-#### New Loss Functions (`losses.py`)
-- **DiceLoss**: Improved dice coefficient implementation
-- **FocalLoss**: For handling class imbalance
-- **WeightedCrossEntropyLoss**: Better weight handling
-- **CombinedLoss**: Dice + CrossEntropy combination
-- **SSIMLoss**: Structural similarity for enhancement tasks
-
-#### New Metrics (`metrics.py`)
-- **IoU (Intersection over Union)**: Proper segmentation metric
-- **DiceScore**: Dice coefficient metric
-- **Accuracy**: Classification accuracy
-- **Abstract Metric Base Class**: Extensible metric system
-
-### 7. Inference Pipeline
-
-#### Original Inference
-- Basic model loading and prediction
-- Simple visualization
-- Limited output options
-
-#### New Inference (`inference_pytorch.py`)
-- **Multi-task Support**: Segmentation, classification, reading order
-- **Batch Processing**: Efficient batch inference
-- **Advanced Visualization**: Better color mapping and output
-- **XML Integration**: Reading order detection with XML output
-- **Ground Truth Comparison**: IoU calculation with ground truth
-- **Command Line Interface**: Click-based CLI
-
-### 8. New Features and Capabilities
-
-#### Completely New Features:
-1. **Vision Transformer Support**: ViT-ResNet50 hybrid models
-2. **Reading Order Detection**: Machine-based reading order model
-3. **Image Enhancement**: Dedicated enhancement models with attention
-4. **Multi-task Framework**: Support for multiple document analysis tasks
-5. **Advanced Augmentation**: Professional-grade data augmentation
-6. **Model Checkpointing**: Automatic model saving and resumption
-7. **Experiment Tracking**: TensorBoard integration
-8. **Configuration Validation**: Type-safe configuration system
-
-#### Enhanced Features:
-1. **Better Model Architecture**: Modern PyTorch implementations
-2. **Improved Training**: PyTorch Lightning integration
-3. **Advanced Metrics**: Comprehensive evaluation metrics
-4. **Better Data Handling**: Efficient data loading and preprocessing
-5. **Enhanced Visualization**: Better output visualization
-6. **Robust Error Handling**: Comprehensive error handling and logging
-
-### 9. Dependencies and Requirements
-
-#### Original Dependencies (`requirements.txt`)
-```
-tensorflow == 2.12.1
-sacred
-opencv-python-headless
-seaborn
-tqdm
-imutils
-numpy
-scipy
-```
-
-#### New Dependencies (`requirements.txt`)
-```
-numpy>=1.21.0
-opencv-python-headless>=4.5.0
-albumentations>=1.3.0
-Pillow>=9.0.0
-tqdm>=4.65.0
-scikit-learn>=1.0.0
-scipy>=1.7.0
-seaborn>=0.12.0
-shapely>=2.0.0
-click>=8.0.0
-sacred>=0.8.0
-# PyTorch and PyTorch Lightning (version-specific installation)
-```
-
-### 10. File Structure Changes
-
-#### New Files Added:
-- `config_loader.py`: Configuration management system
-- `dataset.py`: PyTorch dataset and data loading
-- `losses.py`: Advanced loss functions
-- `training.py`: Training utilities and callbacks
-- `inference_pytorch.py`: PyTorch inference pipeline
-- `model_utils.py`: Model utilities and checkpointing
-- `initialization.py`: Weight initialization utilities
-- `augmentation.py`: Advanced augmentation functions
-- `gt_gen_utils.py`: Ground truth generation utilities
-- `generate_gt_for_training.py`: Training data generation
-- `custom_config_page2label.json`: Page-to-label configuration
-- `config_train_textline.json`: Textline training configuration
-- `scales_enhancement.json`: Enhancement scales configuration
-- `train.md`: Training documentation
-
-#### Modified Files:
-- `models.py` → `models_pytorch.py`: Complete rewrite
-- `train.py`: Complete rewrite with PyTorch Lightning
-- `utils.py`: Enhanced with new utility functions
-- `metrics.py`: Enhanced with new metrics
-- `config_params.json`: Enhanced configuration
-- `requirements.txt`: Updated dependencies
-
-### 11. Performance Improvements
-
-#### Training Performance:
-- **Faster Data Loading**: PyTorch DataLoader with multiprocessing
-- **Memory Efficiency**: Better GPU memory management
-- **Mixed Precision**: Automatic mixed precision training
-- **Distributed Training**: Ready for multi-GPU training
-
-#### Model Performance:
-- **Better Initialization**: Improved weight initialization
-- **Modern Architecture**: Using torchvision pretrained models
-- **Attention Mechanisms**: Enhanced model capabilities
-- **Multi-task Learning**: Support for multiple related tasks
-
-### 12. Code Quality Improvements
-
-#### Architecture:
-- **Object-Oriented Design**: Better class structure
-- **Type Hints**: Comprehensive type annotations
-- **Error Handling**: Robust error handling and validation
-- **Documentation**: Better code documentation
-
-#### Maintainability:
-- **Modular Design**: Separated concerns
-- **Configuration Management**: Centralized configuration
-- **Logging**: Comprehensive logging system
-- **Testing**: Better structure for unit testing
-
-## Migration Guide
-
-### For Users:
-1. **Installation**: Use the new requirements.txt with PyTorch
-2. **Configuration**: Use the new configuration system with multiple config files
-3. **Training**: Use the new command-line interface with PyTorch Lightning
-4. **Inference**: Use the new inference script with enhanced features
-
-### For Developers:
-1. **Model Development**: Use the new model factory pattern
-2. **Data Pipeline**: Use the new Dataset and DataLoader classes
-3. **Training**: Use PyTorch Lightning for new training scripts
-4. **Configuration**: Use the new configuration loader system
-
-## Breaking Changes
-
-1. **Framework**: Complete migration from TensorFlow to PyTorch
-2. **API**: New command-line interface and configuration system
-3. **Model Loading**: Different model checkpoint format
-4. **Data Format**: Enhanced data preprocessing pipeline
-5. **Configuration**: New configuration file structure
-
-## Future Enhancements
-
-The PyTorch version provides a solid foundation for future enhancements:
-- **Multi-GPU Training**: Distributed training support
-- **Model Optimization**: Quantization and pruning
-- **Advanced Architectures**: More transformer-based models
-- **Real-time Inference**: Optimized inference pipeline
-- **Web Interface**: REST API and web interface
-- **Cloud Integration**: Cloud training and deployment
-
-## Conclusion
-
-The PyTorch refactor represents a significant improvement over the original TensorFlow implementation, providing:
-- Modern deep learning framework
-- Better performance and scalability
-- Enhanced features and capabilities
-- Improved code quality and maintainability
-- Future-ready architecture
-
-This migration not only preserves all original functionality but also adds substantial new capabilities and improvements, making it a comprehensive upgrade to the SBB document analysis system.
+[Unreleased]: https://github.com/cneud/sbb_pytorch/compare/main...refactor/packaged-rewrite
+[0.2.0]: https://github.com/cneud/sbb_pytorch/tree/refactor/packaged-rewrite
+[0.1.0]: https://github.com/cneud/sbb_pytorch/tree/main
