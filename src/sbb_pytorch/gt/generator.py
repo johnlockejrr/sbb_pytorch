@@ -30,8 +30,10 @@ from typing import Any, Final
 import cv2
 import numpy as np
 
+from ..storage.images import IMAGE_SUFFIXES
 from .geometry import (
     DEFAULT_MIN_AREA_FRACTION,
+    contour_area,
     update_region_contours,
 )
 from .parser import (
@@ -246,7 +248,10 @@ class GroundTruthConfig:
             separatorregion=_int_or_none(data.get("separatorregion")),
             tableregion=_int_or_none(data.get("tableregion")),
             noiseregion=_int_or_none(data.get("noiseregion")),
-            case_label=int(data.get("case_label", data.get("artificial_class_label", 1))),
+            # The legacy single-class label, implicitly 1 in every legacy file that omitted it.
+            # It used to fall back to ``artificial_class_label`` first, so a config setting only
+            # the boundary class silently reused it as the region class.
+            case_label=int(data.get("case_label", 1)),
             artificial_class_label=_int_or_none(data.get("artificial_class_label")),
             printspace_as_class_in_layout=_int_or_none(data.get("printspace_as_class_in_layout")),
             columns_width=_columns_width_map(data.get("columns_width")),
@@ -519,9 +524,13 @@ def _layout_map(page: Page, config: GroundTruthConfig, shape: tuple[int, int]) -
     3. the artificial boundary class last, over every region it was carved from.
     """
     labelled = [(region, config.label_for(region)) for region in page.regions]
-    pairs = [(region, label) for region, label in labelled if label is not None]
-    if not pairs:
+    usable = [(region, label) for region, label in labelled if label is not None]
+    if not usable:
         return None
+    # The order the docstring promises: biggest first, so a small region inside a large one
+    # keeps its own colour.  Appending in document order let a header declared before its
+    # paragraph be painted first and then buried by it.
+    pairs = sorted(usable, key=lambda pair: contour_area(pair[0].contour), reverse=True)
 
     entries: list[tuple[np.ndarray, int]] = []
     if config.printspace_as_class_in_layout is not None and page.printspace_contour is not None:
@@ -676,28 +685,41 @@ def _copy_source_image(
 
 
 def _find_image(page: Page, images_dir: str | Path) -> Path | None:
-    """The photo of *page* in *images_dir*, under either of its two stems."""
+    """The photo of *page* in *images_dir*, under either of its two stems.
+
+    Only files whose suffix is in :data:`~sbb_pytorch.storage.images.IMAGE_SUFFIXES` are
+    candidates.  Matching any file let the page's own ``.xml`` win when the XML folder and
+    the image folder were the same directory -- ``000123456-1800.xml`` sorts before
+    ``1800.png`` -- after which ``read_image`` returned ``None`` and the source copy was
+    dropped without a word.
+    """
     base = Path(images_dir)
     if not base.is_dir():
         return None
     wanted = {output_stem(page.path), page.file_name}
     entries = sorted(base.iterdir())
     for entry in entries:
-        if entry.is_file() and entry.stem in wanted:
+        if entry.is_file() and entry.suffix.lower() in IMAGE_SUFFIXES and entry.stem in wanted:
             return entry
     return None
 
 
 def output_stem(path: str | Path) -> str:
-    """Output stem for a PageXML file: the part after the first hyphen.
+    """Output stem for a PageXML file: the legacy ``name.split('-')[1].split('.')[0]``.
 
-    ``000123456-1800.xml`` → ``1800``; ``000123456.xml`` → ``000123456``.  The legacy code
-    wrote ``gt_list[index].split('-')[1].split('.')[0]`` in a ``try`` whose ``except``
-    fell back to ``split('.')[0]``; ``Path.stem`` replaces both branches and cannot raise.
+    ``000123456-1800.xml`` → ``1800``; ``a-b-c.xml`` → ``b``; ``000123456-1800.tar.gz`` →
+    ``1800``; a name with no hyphen keeps its whole stem (``000123456.xml`` →
+    ``000123456``), which is what the legacy ``except`` branch produced.  An earlier port
+    used ``Path.stem`` plus ``partition("-")``, which answered ``b-c`` and ``1800.tar`` for
+    the multi-hyphen and multi-dot spellings -- the segment between the first hyphen and the
+    *last* extension is not what the legacy datasets were named with, so re-running one
+    produced a second file beside the original instead of overwriting it.
     """
-    stem = Path(path).stem
-    _, separator, remainder = stem.partition("-")
-    return remainder if separator else stem
+    name = Path(path).name
+    parts = name.split("-")
+    if len(parts) < 2:
+        return name.split(".")[0]  # the legacy ``except`` branch, reached via IndexError
+    return parts[1].split(".")[0]
 
 
 def labelled_contours(contours: Iterable[np.ndarray], label: int) -> list[tuple[np.ndarray, int]]:

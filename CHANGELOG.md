@@ -58,12 +58,14 @@ replacement.
   and the ~200 `print()` calls spread across the old modules.
 - The `tests/` suite: fourteen modules covering config, models, data, augmentations, metrics,
   losses, storage, inference, training (plus the training factory) and ground truth.
-  `tests/test_gt.py` is the last to land and the largest -- 2163 lines, 111 test functions, 241
+  `tests/test_gt.py` is the last to land and the largest -- 2183 lines, 111 test functions, 241
   collected cases over `parser`, `geometry`, `render`, `reading_order` and `generator`, none of
   which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`. Its expected
   values are derived from the geometry or from the legacy contract each docstring states rather
-  than read back off the implementation, and every place the two disagree is pinned with a
-  `# TODO(file.py:line)` marker and mirrored in [docs/migration.md](docs/migration.md) section 5.
+  than read back off the implementation. Eleven of its assertions disagreed with the code they
+  covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
+  assertion, and the eleven fixes are listed in
+  [docs/migration.md](docs/migration.md) section 3.8 and under **Fixed** below.
 - `configs/`: six ready-made configs (textline, layout, binarization, enhancement,
   classification, reading_order). The first two carry the values of `config_train_textline.json`
   and `config_params.json`; the other four tasks had no legacy config at all.
@@ -171,6 +173,23 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   used an `int`, so the column-normalising resize never ran; and `--use-case` offered
   `config.models.UseCase`'s five members where the generator's own enum has seven, rejecting
   `binarization` and `reading_order`.
+- **Eleven more, found by `tests/test_gt.py` and fixed in the same commit that retired its
+  `TODO` markers.** `generate_pairs` could not build a single sample for any input size other than
+  the page's own -- `np.stack` refused the page-sized label maps beside the resampled layout
+  channel, so a 448×448 config on a 60×60 page raised `ValueError: all input arrays must have the
+  same shape`; `_is_header` matched the literal `"header"` and gave no separator band to a
+  `heading` or `rest_as_header` region; `write_pair` wrote `pair.name` and ignored the `suffix`
+  property it documents; `label_image` range-checked its entry labels but passed `background`
+  straight to `np.full`, where `999` raised `OverflowError`; a 1-pixel `outline_color` was
+  swallowed by the fill it sat on, so it only appeared once the stroke grew past the fill; a
+  digit-less `@ID` took its class id from `hash((kind, type)) % 19`, which CPython re-randomises on
+  every interpreter start, so the same page rendered different colours on consecutive runs;
+  `crop_to` let numpy clip the slice, returning a smaller crop than the box asked for; `from_dict`
+  defaulted `case_label` to `artificial_class_label` before `1`; `_layout_map` painted regions in
+  document order instead of the documented big-over-small, burying a header inside its own
+  paragraph; `_find_image` preferred a page's `.xml` to its `.png` when both shared a stem; and
+  `output_stem` produced `b-c` and `1800.tar` where the ported rule writes `b` and `1800`, so
+  regenerating a dataset wrote a second file beside the existing one rather than overwriting it.
 - **Config.** Any key a file omitted raised `KeyError` even when the value was irrelevant --
   `config_train_textline.json` was loadable through exactly one code path -- and a `" "`
   `dir_of_start_model` (the shipped way of writing "unset") is now `None`. `validate_configs`'

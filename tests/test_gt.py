@@ -1121,13 +1121,14 @@ def test_label_image_validates_every_entry_before_painting_any() -> None:
         render.label_image(entries, (40, 40))
 
 
-def test_label_image_background_is_not_range_checked_like_the_entries() -> None:
-    """# TODO(render.py:191): the entry labels are checked with a friendly ``ValueError`` but
-    ``background`` goes straight into ``np.full``, so an out-of-range background raises numpy's
-    ``OverflowError`` instead -- and a background above 255 is the easy way to mistype a class id.
-    """
-    with pytest.raises(OverflowError, match="out of bounds for uint8"):
+def test_label_image_background_is_range_checked_like_the_entries() -> None:
+    """``background`` gets the same ``ValueError`` as an entry label. It used to skip the check and
+    reach ``np.full`` with the value, where numpy answered ``OverflowError`` -- and a background
+    above 255 is the easy way to mistype a class id (``render.py:191``, pinned here as a bug before
+    it was fixed)."""
+    with pytest.raises(ValueError, match="background id 999 does not fit a uint8 label map"):
         render.label_image([], (4, 4), background=999)
+    assert render.label_image([], (4, 4), background=7).min() == 7
 
 
 def test_label_map_to_image_matches_the_colour_function_it_calls() -> None:
@@ -1192,19 +1193,26 @@ def test_paint_contours_without_contours_is_black() -> None:
     assert render.paint_contours([], (5, 6), (1, 2, 3)).tolist() == [[[0, 0, 0]] * 6] * 5
 
 
-def test_one_pixel_outline_is_swallowed_by_the_fill_it_sits_on() -> None:
-    """# TODO(render.py:272): ``edge = stroked & ~filled`` -- but ``cv2.drawContours`` strokes
-    the polygon's own boundary, which ``mask_of`` has already filled, so the default 1-pixel
-    outline produces zero outline pixels and ``outline_color`` is invisible. A thicker stroke
-    (here 3) does escape the fill, which is the only way the parameter has any effect today.
-    """
+def test_the_outline_is_the_stroked_ring_and_the_fill_keeps_the_rest() -> None:
+    """Every pixel ``cv2.drawContours`` strokes belongs to the outline, and ``filled`` keeps only
+    what the ring does not cover -- so the parameter works at its default thickness.
+
+    Both counts come from the two numbers this file already pins: the fill-only call paints 336
+    pixels for RECT, and a 3-pixel stroke puts 152 of its ring outside that fill. At thickness 1
+    the whole 70-pixel ring lies inside the fill, so the split is 70 outline + 266 fill = the same
+    336. At thickness 3 the ring is 152 + 186 = 338 pixels, all outline, and the green drops to
+    336 - 186 = 150. The first version asked for ``stroked & ~filled``, which is empty at
+    thickness 1 -- ``outline_color`` did nothing until the stroke grew past the fill
+    (``render.py:272``, pinned here as a bug before it was fixed)."""
     thin = render.paint_contours([RECT], (40, 40), (0, 255, 0), outline_color=(0, 0, 255))
-    assert int((thin == (0, 0, 255)).all(axis=-1).sum()) == 0
+    assert int((thin == (0, 0, 255)).all(axis=-1).sum()) == 70
+    assert int((thin == (0, 255, 0)).all(axis=-1).sum()) == 266
+    assert int((thin != (0, 0, 0)).any(axis=-1).sum()) == 336  # the fill-only total, unchanged
     thick = render.paint_contours(
         [RECT], (40, 40), (0, 255, 0), outline_color=(0, 0, 255), outline_thickness=3
     )
-    assert int((thick == (0, 0, 255)).all(axis=-1).sum()) == 152
-    assert int((thick == (0, 255, 0)).all(axis=-1).sum()) == 336
+    assert int((thick == (0, 0, 255)).all(axis=-1).sum()) == 338  # 152 outside + 186 inside
+    assert int((thick == (0, 255, 0)).all(axis=-1).sum()) == 150  # 336 - the 186 the ring covers
 
 
 @pytest.mark.parametrize(
@@ -1335,12 +1343,12 @@ def test_label_of_prefers_the_mapping_then_the_region_id_digits(
 
 
 def test_label_of_without_any_digits_hashes_the_identity() -> None:
-    """# TODO(render.py:418): a region with no digits in its ``@ID`` gets ``hash((kind, type)) %
-    19``, which CPython randomises per process -- so the same page renders with different class
-    ids on different runs, and the value is only reproducible inside one interpreter.
-    """
+    """A region with no digits in its ``@ID`` gets a ``zlib.crc32`` of its identity, written out
+    here rather than recomputed with the builtin ``hash()`` -- which CPython randomises per
+    process, so the value this test asserted used to change on every interpreter start
+    (``render.py:418``, pinned here as a bug before it was fixed)."""
     subject = region(parser.RegionKind.TABLE, "", RECT, "table")
-    assert render._label_of(subject, None) == hash(("tableregion", "table")) % 19
+    assert render._label_of(subject, None) == 4  # zlib.crc32(b"tableregion:table") % 19
 
 
 def test_make_image_from_bb_clamps_every_box_to_the_canvas() -> None:
@@ -1384,10 +1392,13 @@ def test_crop_to_slices_both_layouts(
 
 
 def test_crop_to_without_a_box_or_an_empty_box() -> None:
+    """``None``, a zero/negative size and a box that starts outside the image all return the image
+    itself instead of the zero-length slice numpy would otherwise hand back."""
     image = np.arange(60, dtype=np.uint8).reshape(6, 10)
     assert render.crop_to(image, None) is image
     assert render.crop_to(image, (0, 0, 0, 5)) is image  # zero width -> unchanged, not empty slice
     assert render.crop_to(image, (0, 0, 3, -1)) is image
+    assert render.crop_to(image, (20, 20, 4, 4)) is image  # the origin is past both edges
     assert render.crop_to(image, (1, 1, 2, 2)).tolist() == [[11, 12], [21, 22]]
 
 
@@ -1531,12 +1542,12 @@ def test_header_separator_band_sits_under_the_header(
     assert int(np.count_nonzero(mask == reading_order.HEADER_LABEL)) == count
 
 
-def test_header_label_needs_the_literal_header_spelling(tmp_path: Path) -> None:
-    """# TODO(reading_order.py:206): ``_is_header(page, region)`` takes the page -- and therefore
-    its config, and its ``rest_as_header`` spelling -- and ignores it, comparing the region's type
-    against the literal string ``"header"``. A ``heading`` region and a header registered under its
-    ``rest_as_`` alias are both invisible here, while the parser and generator normalise both.
-    """
+def test_every_header_spelling_the_page_uses_gets_the_label(tmp_path: Path) -> None:
+    """The page's own type list is what decides, through ``parser.normalise_text_type``: the bare
+    ``header``, the legacy ``heading`` and the ``rest_as_header`` a page-to-label config writes are
+    all headers. The first version compared the raw ``@type`` against the literal ``"header"`` and
+    left the other two without a separator band, which is all the ``page`` argument was for
+    (``reading_order.py:206``, pinned here as a bug before it was fixed)."""
     header = region(parser.RegionKind.TEXT, "h", TRIANGLE, "header")
     heading = region(parser.RegionKind.TEXT, "g", TRIANGLE, "heading")
     aliased = region(parser.RegionKind.TEXT, "r", TRIANGLE, "rest_as_header")
@@ -1551,9 +1562,9 @@ def test_header_label_needs_the_literal_header_spelling(tmp_path: Path) -> None:
         )
     )
     assert reading_order._is_header(page, header) is True
-    assert reading_order._is_header(page, heading) is False
-    assert reading_order._is_header(page, aliased) is False
-    assert page.regions[1].type_name == "heading"  # parsed as written, so the miss is real
+    assert reading_order._is_header(page, heading) is True
+    assert reading_order._is_header(page, aliased) is True
+    assert page.regions[1].type_name == "heading"  # parsed as written, normalised for the lookup
 
 
 def test_region_label_map_applies_the_query_then_the_other_kinds(tmp_path: Path) -> None:
@@ -1634,32 +1645,40 @@ def test_generate_pairs_needs_two_text_regions(tmp_path: Path) -> None:
     assert reading_order.generate_pairs(page) == []
 
 
-def test_generate_pairs_cannot_stack_a_resized_layout_channel(tmp_path: Path) -> None:
-    """# TODO(reading_order.py:315): with an ``input_height``/``input_width`` that differs from the
-    page, ``_layout_channel`` resizes to the network size while the two label maps stay at page
-    size, so ``np.stack`` raises ``ValueError`` -- the docstring's "rasterised at this size
-    directly" is what the label maps do *not* do. Every non-square-page config crashes here.
-    """
+def test_generate_pairs_rasterises_every_channel_at_the_requested_size(tmp_path: Path) -> None:
+    """An ``input_height``/``input_width`` other than the page's own used to raise ``ValueError:
+    all input arrays must have the same shape`` from ``np.stack`` -- the layout channel was
+    resampled to the network size while the two label maps stayed at page size, so every config
+    whose input size differed from the page produced no samples at all
+    (``reading_order.py:315``, pinned here as a bug before it was fixed). All three channels now
+    share the requested grid, which is what the docstring's "rasterised at this size directly"
+    always promised."""
     page = standard_page(tmp_path)
-    with pytest.raises(ValueError, match="all input arrays must have the same shape"):
-        reading_order.generate_pairs(page, input_height=30, input_width=30)
+    pairs = reading_order.generate_pairs(page, input_height=30, input_width=30)
+    assert len(pairs) == 6  # the same n * (n - 1) the page-sized call yields
+    assert {pair.modal_image.shape for pair in pairs} == {(30, 30, 3)}
+    assert [pair.name for pair in pairs][:2] == ["000123456-1800_0", "000123456-1800_1"]
 
 
-@pytest.mark.parametrize("name", ["page_0", "page_0_missed"])
-def test_write_pair_writes_a_png_and_a_zero_dimension_npy(tmp_path: Path, name: str) -> None:
-    """``<name>.png`` beside ``<name>.npy`` holding the scalar class as a 0-d array, so
-    ``np.load`` returns what the legacy ``np.save(..., class_type)`` did. The name is written as
-    given: ``generate_pairs`` already folds the ``_missed`` marker into it, and ``write_pair``
-    never appends the ``suffix`` property a hand-built pair carries."""
+@pytest.mark.parametrize(("missed", "stem"), [(False, "page_0"), (True, "page_0_missed")])
+def test_write_pair_composes_the_name_and_the_missed_suffix(
+    tmp_path: Path, missed: bool, stem: str
+) -> None:
+    """``<name><suffix>.png`` beside the matching ``.npy`` holding the scalar class as a 0-d array,
+    so ``np.load`` returns what the legacy ``np.save(..., class_type)`` did. ``name`` holds the stem
+    and ``suffix`` the ``_missed`` marker, and this function joins them -- the first version wrote
+    ``name`` alone and left the property unused, so only a pair whose marker ``generate_pairs`` had
+    folded into the name came out right (``reading_order.py:123``, pinned here as a bug before it
+    was fixed)."""
     image = np.zeros((6, 6, 3), np.uint8)
     image[..., 2] = 7
     pair = reading_order.ReadingOrderPair(
-        name=name, class_type=1, modal_image=image, missed=name.endswith("_missed")
+        name="page_0", class_type=1, modal_image=image, missed=missed
     )
     image_path, class_path = reading_order.write_pair(pair, tmp_path / "imgs", tmp_path / "cls")
     assert (image_path, class_path) == (
-        tmp_path / f"imgs/{name}.png",
-        tmp_path / f"cls/{name}.npy",
+        tmp_path / f"imgs/{stem}.png",
+        tmp_path / f"cls/{stem}.npy",
     )
     assert np.array_equal(render.read_image(image_path), image)
     stored = np.load(class_path)
@@ -1743,18 +1762,16 @@ def test_use_case_parse_is_identity_and_names_the_bad_value() -> None:
     [
         ("000123456-1800.xml", "1800"),  # the legacy rule: the segment after the first hyphen
         ("000123456.xml", "000123456"),  # no hyphen -> the whole stem, the legacy ``except`` path
-        ("000123456-1800.tar.gz", "1800.tar"),  # see the second TODO below: legacy said "1800"
-        ("a-b-c.xml", "b-c"),  # see the first TODO below: the legacy code produced "b"
+        ("000123456-1800.tar.gz", "1800"),  # ``split('.')[0]`` stops at 1800, not 1800.tar
+        ("a-b-c.xml", "b"),  # ``split('-')[1]`` is the segment between the first two hyphens
         ("x.XML", "x"),
     ],
 )
 def test_output_stem_never_raises_where_the_legacy_split_did(name: str, expected: str) -> None:
-    """# TODO(generator.py:700): two divergences from the ported
-    ``gt_list[index].split('-')[1].split('.')[0]``. One: ``Path.stem.partition("-")`` keeps
-    everything after the first hyphen, so ``a-b-c.xml`` names ``b-c`` where the legacy tool wrote
-    ``b``. Two: ``Path.stem`` strips only the *last* suffix, so ``000123456-1800.tar.gz`` leaks
-    ``.tar`` into the output name where the legacy ``split('.')[0]`` stopped at ``1800``.
-    """
+    """The ported ``gt_list[index].split('-')[1].split('.')[0]``, including its ``except`` branch.
+    An earlier port used ``Path.stem`` with ``partition("-")``, which answered ``b-c`` and
+    ``1800.tar`` for the two rows below -- a second file beside the one every legacy dataset
+    already has (``generator.py:700``, pinned here as a bug before it was fixed)."""
     assert generator.output_stem(name) == expected
 
 
@@ -1802,13 +1819,13 @@ def test_from_dict_normalises_the_integer_tables() -> None:
     )
 
 
-def test_case_label_falls_back_to_the_artificial_class_label() -> None:
-    """# TODO(generator.py:249): ``case_label`` defaults to ``data["artificial_class_label"]``
-    before ``1``, so a config that sets only the boundary class silently reuses it as the region
-    class -- while the docstring says the single-class label is the legacy implicit ``1``."""
+def test_case_label_defaults_to_one_not_to_the_boundary_class() -> None:
+    """``case_label`` is the legacy single-class label: omitted means ``1``, and the boundary
+    class is a separate field that used to be borrowed as its fallback
+    (``generator.py:249``, pinned here as a bug before it was fixed)."""
     assert generator.GroundTruthConfig.from_dict({}).case_label == 1
     assert generator.GroundTruthConfig.from_dict({"case_label": 3}).case_label == 3
-    assert generator.GroundTruthConfig.from_dict({"artificial_class_label": 9}).case_label == 9
+    assert generator.GroundTruthConfig.from_dict({"artificial_class_label": 9}).case_label == 1
 
 
 def test_label_for_under_a_layout_config_covers_every_region_kind(tmp_path: Path) -> None:
@@ -1911,12 +1928,12 @@ def test_build_label_map_single_class_carves_the_boundary_class(tmp_path: Path) 
     assert np.array_equal(built, expected)
 
 
-def test_the_layout_map_paints_in_document_order_not_big_over_small(tmp_path: Path) -> None:
-    """# TODO(generator.py:534): ``_layout_map`` promises "the configured regions, big over small,
-    so a drop-capital is not buried by the paragraph that contains it", but only
-    :func:`render.render_page` sorts its entries by area -- the generator appends them in document
-    order. A header declared before the paragraph it sits in disappears from the map (``{0, 1}``),
-    while the same page with the paragraph first keeps both classes."""
+def test_the_layout_map_paints_big_over_small_whatever_the_document_order(tmp_path: Path) -> None:
+    """The order :func:`_layout_map` documents -- biggest first, so a small region keeps its own
+    colour inside a large one -- and not the document order the port used to follow, where a header
+    declared before its paragraph was painted first and buried, leaving ``{0, 1}`` on a page whose
+    sibling spelling gave ``{0, 1, 2}`` (``generator.py:534``, pinned here as a bug before it was
+    fixed)."""
     small_first = _page(
         tmp_path,
         '<TextRegion ID="h1" type="header"><Coords points="4,4 20,4 20,12 4,12"/></TextRegion>'
@@ -1930,7 +1947,7 @@ def test_the_layout_map_paints_in_document_order_not_big_over_small(tmp_path: Pa
     config = generator.GroundTruthConfig(
         use_case=generator.UseCase.LAYOUT, textregions={"header": 2, "paragraph": 1}
     )
-    assert set(np.unique(generator.build_label_map(small_first, config)).tolist()) == {0, 1}
+    assert set(np.unique(generator.build_label_map(small_first, config)).tolist()) == {0, 1, 2}
     assert set(np.unique(generator.build_label_map(big_first, config)).tolist()) == {0, 1, 2}
 
 
@@ -2012,16 +2029,19 @@ def test_generate_ground_truth_crops_and_copies_the_source_image(tmp_path: Path)
     assert render.read_image(cropped.images[0]).shape == (57, 57, 3)
 
 
-def test_an_image_dir_holding_the_xml_finds_the_xml_as_the_photo(tmp_path: Path) -> None:
-    """# TODO(generator.py:683): ``_find_image`` matches any file whose *stem* is the page's, and
-    sorts the directory first -- so when the XML sits in ``images_dir`` alongside the photo, the
-    ``.xml`` wins, ``read_image`` returns ``None`` and the copy is silently dropped. Pass a real
-    image directory (the case above) and it copies."""
+def test_an_image_dir_holding_the_xml_still_finds_the_photo(tmp_path: Path) -> None:
+    """Only suffixes in ``storage.images.IMAGE_SUFFIXES`` are candidates. The first version matched
+    any file whose stem was the page's, and the sorted listing put ``000123456-1800.xml`` before
+    ``1800.png`` -- so ``read_image`` answered ``None`` and the page's own photo went uncopied
+    whenever the XML and image directories were the same (``generator.py:683``, pinned here as a
+    bug before it was fixed)."""
     page = _page(tmp_path, '<ImageRegion ID="i1"><Coords points="4,4 8,4 8,8 4,8"/></ImageRegion>')
     render.write_image(tmp_path / "1800.png", np.zeros((60, 60, 3), np.uint8))
     config = generator.GroundTruthConfig(use_case=generator.UseCase.LAYOUT, imageregion=4)
-    assert generator._find_image(page, tmp_path).name == "000123456-1800.xml"
-    assert generator._copy_source_image(page, config, tmp_path, tmp_path / "copies") is None
+    assert generator._find_image(page, tmp_path).name == "1800.png"
+    assert generator._copy_source_image(page, config, tmp_path, tmp_path / "copies") == (
+        tmp_path / "copies/1800.png"
+    )
 
 
 def test_generate_ground_truth_reports_unusable_pages(tmp_path: Path) -> None:

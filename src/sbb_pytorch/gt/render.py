@@ -26,6 +26,7 @@ keeping the same order keeps the rendered colours identical to the old output.
 from __future__ import annotations
 
 import enum
+import zlib
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Final
@@ -178,13 +179,17 @@ def label_image(
     Raises
     ------
     ValueError
-        A class id does not fit the ``uint8`` label map.  The legacy code produced this
-        silently by storing label ids in an image typed ``int8``/``uint8`` and writing
-        ``cv2.fillPoly(..., color=class_id)``, so a class id above 255 (or the ``int8``
-        reading-order maps, above 127) wrapped around.
+        A class id — including *background* — does not fit the ``uint8`` label map.  The
+        legacy code produced this silently by storing label ids in an image typed
+        ``int8``/``uint8`` and writing ``cv2.fillPoly(..., color=class_id)``, so a class id
+        above 255 (or the ``int8`` reading-order maps, above 127) wrapped around.
+        ``background`` used to skip the check and reach ``np.full`` with an out-of-range
+        value, which answered ``OverflowError`` instead of naming the mistyped id.
     """
     height, width = _hw(shape)
     labels = list(entries)
+    if not 0 <= int(background) <= 255:
+        raise ValueError(f"background id {int(background)} does not fit a uint8 label map")
     if any(not 0 <= int(label) <= 255 for _, label in labels):
         bad = next(int(label) for _, label in labels if not 0 <= int(label) <= 255)
         raise ValueError(f"class id {bad} does not fit a uint8 label map")
@@ -252,6 +257,10 @@ def paint_contours(
     ``drawContours`` of the same contours, which the layout visualiser applied to
     paragraphs only: the fill and the one-pixel outline are separate masks here, so the
     outline does not eat into the fill and the fill-only callers share the code path.
+    The stroked ring *is* the outline — ``filled`` keeps only the pixels it does not cover,
+    which is what makes ``outline_color`` visible at the default thickness of 1 (the first
+    version subtracted the fill from the ring, and a 1-pixel stroke coincides exactly with
+    the boundary ``mask_of`` has already filled, so nothing was left to colour).
     """
     height, width = _hw(shape)
     contour_list = list(contours)
@@ -269,7 +278,8 @@ def paint_contours(
             1,
             thickness=outline_thickness,
         )
-        edge = stroked.astype(bool) & ~filled
+        edge = stroked.astype(bool)
+        filled &= ~edge  # the two masks must not overlap: the ring wins, the fill keeps the rest
 
     image = np.zeros((height, width, 3), dtype=np.uint8)
     for channel in range(3):
@@ -408,14 +418,18 @@ def _label_of(region: Region, labels: Mapping[RegionKind, int] | None) -> int:
     The legacy tool encoded the class in the filename and in ``@ID`` suffixes
     (``paragraph_2`` → class 2); with no configured mapping and no numeric suffix the
     region hashes to a stable id instead of defaulting to 0 and vanishing into the
-    background.
+    background.  "Stable" needs the hash to be the same in every process, so it is
+    ``zlib.crc32`` of the identity rather than the builtin ``hash()``, which CPython
+    randomises per run and made the same page render with different class ids on
+    consecutive invocations.
     """
     if labels is not None and region.kind in labels:
         return int(labels[region.kind])
     digits = "".join(char for char in region.region_id if char.isdigit())
     if digits:
         return int(digits)
-    return hash((region.kind.value, region.type_name)) % len(DEFAULT_LABEL_PALETTE)
+    identity = f"{region.kind.value}:{region.type_name}".encode()
+    return zlib.crc32(identity) % len(DEFAULT_LABEL_PALETTE)
 
 
 def make_image_from_bb(
@@ -449,11 +463,19 @@ def crop_to(image: np.ndarray, bbox: BoundingBox | None) -> np.ndarray:
     The legacy print-space crop was written three times as
     ``img_poly[bb[1]:bb[1]+bb[3], bb[0]:bb[0]+bb[2], :]`` — with no guard for the empty
     or zero-height slice that a degenerate print space produces, which
-    ``cv2.imwrite`` then rejected.
+    ``cv2.imwrite`` then rejected.  The box is clamped to the image the way
+    :func:`make_image_from_bb` clamps its boxes, so a box that hangs over an edge crops
+    the intersection instead of handing back a too-small slice, and a box that starts
+    outside the image — where numpy answers a zero-length array — returns the image.
     """
     if bbox is None:
         return image
-    x, y, w, h = bbox
+    x, y, w, h = (int(value) for value in tuple(bbox)[:4])
+    height, width = image.shape[:2]
+    x, y = max(0, x), max(0, y)
+    if x >= width or y >= height:
+        return image
+    w, h = min(w, width - x), min(h, height - y)
     if w <= 0 or h <= 0:
         return image
     return image[y : y + h, x : x + w, ...]
