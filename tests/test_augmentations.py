@@ -102,7 +102,9 @@ def test_the_legacy_constructor_calls_do_not_exist_anymore() -> None:
     raised ``AttributeError``/``ValueError`` before a single image was read. The module uses the
     surviving spellings, which is why it builds at all."""
     assert not hasattr(A, "Flip"), "A.Flip came back -- the module's replacement can be simplified"
-    assert not hasattr(A, "set_seed"), "A.set_seed came back -- _compose could stop branching on None"
+    assert not hasattr(
+        A, "set_seed"
+    ), "A.set_seed came back -- _compose could stop branching on None"
     with pytest.raises(ValueError, match="size"):
         A.RandomResizedCrop(height=SIZE, width=SIZE)
 
@@ -146,7 +148,11 @@ def test_geometric_transforms_are_gated_on_the_config_fields(
 
 @pytest.mark.parametrize(
     ("codes", "expected"),
-    [((1,), {"HorizontalFlip"}), ((0,), {"VerticalFlip"}), ((-1,), {"HorizontalFlip", "VerticalFlip"})],
+    [
+        ((1,), {"HorizontalFlip"}),
+        ((0,), {"VerticalFlip"}),
+        ((-1,), {"HorizontalFlip", "VerticalFlip"}),
+    ],
 )
 def test_flip_codes_map_the_three_cv2_variants(codes: tuple[int, ...], expected: set[str]) -> None:
     """``cv2.flip`` code ``-1`` is *both* axes, which albumentations needs two transforms for."""
@@ -170,8 +176,14 @@ def test_eval_geometry_is_a_resize_and_nothing_else() -> None:
 def test_photometric_limits_come_from_the_config() -> None:
     """``brightness=1.8`` and ``degrade_scales=(0.2, 0.5)`` used to be read by a parallel
     ``AugmentationConfig`` that training never consulted; they now reach the transforms."""
-    config = make_config(blur_aug=True, blur_k=("gauss",), brightening=True, brightness=(1.8,),
-                         degrading=True, degrade_scales=(0.2, 0.5))
+    config = make_config(
+        blur_aug=True,
+        blur_k=("gauss",),
+        brightening=True,
+        brightness=(1.8,),
+        degrading=True,
+        degrade_scales=(0.2, 0.5),
+    )
     transforms = {(type(t).__name__): t for t in photometric_transforms(config)}
     assert transforms["RandomBrightnessContrast"].brightness_limit == (0.0, 0.8)
     assert transforms["RandomBrightnessContrast"].p == PHOTOMETRIC_PROBABILITY
@@ -211,7 +223,9 @@ def test_every_stochastic_transform_uses_the_legacy_probability() -> None:
 # --------------------------------------------------------------------------- composing the whole
 
 
-def test_normalizing_transforms_apply_the_imagenet_statistics(pair: tuple[np.ndarray, np.ndarray]) -> None:
+def test_normalizing_transforms_apply_the_imagenet_statistics(
+    pair: tuple[np.ndarray, np.ndarray],
+) -> None:
     """Swapping mean and std (or normalising in BGR after a cv2 read) changes every pixel."""
     image, _ = pair
     mean = np.asarray(IMAGENET_MEAN, "float32")
@@ -221,7 +235,9 @@ def test_normalizing_transforms_apply_the_imagenet_statistics(pair: tuple[np.nda
     np.testing.assert_allclose(out.numpy(), expected.transpose(2, 0, 1), rtol=1e-4, atol=1e-3)
 
 
-def test_augment_pair_stays_numpy_uint8_at_the_configured_size(pair: tuple[np.ndarray, np.ndarray]) -> None:
+def test_augment_pair_stays_numpy_uint8_at_the_configured_size(
+    pair: tuple[np.ndarray, np.ndarray],
+) -> None:
     """The offline path used to normalise the image and then write *that* back to disk, so the
     generated files were unviewable and unusable as inputs to the next run."""
     image, mask = pair
@@ -249,15 +265,25 @@ def test_a_seed_makes_the_augmentation_reproducible(pair: tuple[np.ndarray, np.n
         (
             True,
             {
-                "RandomResizedCrop", "HorizontalFlip", "VerticalFlip", "RandomRotate90", "Rotate",
-                "ChannelShuffle", "OneOf", "RandomBrightnessContrast", "GaussNoise", "Normalize",
+                "RandomResizedCrop",
+                "HorizontalFlip",
+                "VerticalFlip",
+                "RandomRotate90",
+                "Rotate",
+                "ChannelShuffle",
+                "OneOf",
+                "RandomBrightnessContrast",
+                "GaussNoise",
+                "Normalize",
                 "ToTensorV2",
             },
         ),
         (False, {"Resize", "Normalize", "ToTensorV2"}),
     ],
 )
-def test_build_transform_composes_the_requested_pipeline(training: bool, expected: set[str]) -> None:
+def test_build_transform_composes_the_requested_pipeline(
+    training: bool, expected: set[str]
+) -> None:
     """One entry point, two pipelines -- and the only difference from ``augmentation=false`` is
     the geometry and photometry, never the tensor tail."""
     built = build_transform(make_config(**ALL_FLAGS), training=training)
@@ -268,4 +294,6 @@ def test_augmentation_false_makes_training_the_eval_pipeline() -> None:
     """``augmentation=false`` has to switch *everything* off, not just the sub-flags -- the bug
     ``DataModule`` shipped with was a training pipeline that always augmented."""
     config = make_config(augmentation=False, flip_aug=True, blur_aug=True, rotation=True)
-    assert classes(training_transform(config).transforms) == classes(validation_transform(config).transforms)
+    assert classes(training_transform(config).transforms) == classes(
+        validation_transform(config).transforms
+    )

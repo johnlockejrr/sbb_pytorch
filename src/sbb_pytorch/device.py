@@ -34,7 +34,7 @@ def available_devices() -> list[str]:
     """Every device torch can use here, best first, always ending in ``cpu``."""
     devices: list[str] = []
     if torch.cuda.is_available():
-        devices.extend(f"cuda:{index}" for index in range(torch.device_count()))
+        devices.extend(f"cuda:{index}" for index in range(torch.cuda.device_count()))
     if _mps_available():
         devices.append("mps")
     return [*devices, "cpu"]

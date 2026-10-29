@@ -126,9 +126,9 @@ class ConvBlock(nn.Sequential):
     ) -> None:
         super().__init__()
         padding = kernel_size // 2
-        self.add_module("conv", nn.Conv2d(
-            in_channels, out_channels, kernel_size, stride, padding, bias=bias
-        ))
+        self.add_module(
+            "conv", nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+        )
         self.add_module("norm", nn.BatchNorm2d(out_channels))
         self.add_module("act", nn.ReLU(inplace=True))
 
@@ -176,7 +176,9 @@ class ResNetEncoder(nn.Module):
     def __init__(self, variant: str = "resnet50", pretrained: bool = True) -> None:
         super().__init__()
         if variant not in RESNET_LEVELS:
-            raise ValueError(f"unsupported backbone {variant!r}; choose from {sorted(RESNET_LEVELS)}")
+            raise ValueError(
+                f"unsupported backbone {variant!r}; choose from {sorted(RESNET_LEVELS)}"
+            )
         self.variant = variant
         self.channels = RESNET_LEVELS[variant]
         self.strides = RESNET_STRIDES
@@ -199,7 +201,9 @@ class ResNetEncoder(nn.Module):
             resnet.relu,
             resnet.maxpool,
         )
-        self.levels = nn.ModuleList([stem, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4])
+        self.levels = nn.ModuleList(
+            [stem, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4]
+        )
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Return one feature map per level, shallowest first (``features[-1]`` is the deepest)."""
@@ -266,7 +270,9 @@ class UNetDecoder(nn.Module):
         # keeps ``state_dict`` shapes compatible with its checkpoints.
         blocks = nn.ModuleList()
         previous = enc[-1]  # the deepest level feeds the deepest block
-        for position, (skip_index, out_channels) in enumerate(zip(self.skip_indices, dec, strict=False)):
+        for position, (skip_index, out_channels) in enumerate(
+            zip(self.skip_indices, dec, strict=False)
+        ):
             in_channels = enc[skip_index] if position == 0 else previous + enc[skip_index]
             block: list[nn.Module] = [
                 ConvBlock(
@@ -318,7 +324,9 @@ class UNetDecoder(nn.Module):
             raise ValueError(
                 f"expected {len(self.encoder_channels)} encoder feature maps, got {len(features)}"
             )
-        for index, (feature, expected) in enumerate(zip(features, self.encoder_channels, strict=False)):
+        for index, (feature, expected) in enumerate(
+            zip(features, self.encoder_channels, strict=False)
+        ):
             if feature.shape[1] != expected:
                 raise ValueError(
                     f"feature map {index} has {feature.shape[1]} channels, encoder declares "

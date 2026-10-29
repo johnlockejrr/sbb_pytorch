@@ -30,8 +30,10 @@ suggests. ``model_utils.save_model``/``load_model``/``save_checkpoint`` are repl
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -95,7 +97,7 @@ def _norm_init(module: nn.Module) -> None:
         nn.init.zeros_(module.bias)
 
 
-def _param_init(module: nn.Module, draw: callable, bias: float) -> bool:
+def _param_init(module: nn.Module, draw: Callable[..., Any], bias: float) -> bool:
     """Apply ``draw`` to ``module`` if it holds trainable weights; return whether it did."""
     if isinstance(module, nn.Conv1d | nn.Conv2d | nn.Conv3d | nn.Linear):
         draw(module.weight)
@@ -127,7 +129,7 @@ def orthogonal_init(module: nn.Module, gain: float = 1.0, bias: float = 0.0) -> 
     _param_init(module, lambda w: nn.init.orthogonal_(w, gain=gain), bias)
 
 
-_INIT_DISPATCH: dict[InitMethod, callable] = {
+_INIT_DISPATCH: dict[InitMethod, Callable[..., Any]] = {
     InitMethod.KAIMING: kaiming_init,
     InitMethod.XAVIER: xavier_init,
     InitMethod.ORTHOGONAL: orthogonal_init,

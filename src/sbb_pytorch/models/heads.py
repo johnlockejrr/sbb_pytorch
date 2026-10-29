@@ -33,7 +33,9 @@ def resnet_features(backbone: str = "resnet50", pretrained: bool = True) -> tupl
     ``nn.Sequential(*list(resnet50.children())[:-1])`` themselves.
     """
     if backbone not in RESNET_LEVELS:
-        raise ModelBuildError(f"unsupported backbone {backbone!r}; choose from {sorted(RESNET_LEVELS)}")
+        raise ModelBuildError(
+            f"unsupported backbone {backbone!r}; choose from {sorted(RESNET_LEVELS)}"
+        )
     builder = getattr(tv_models, backbone)
     weights = None
     if pretrained:
@@ -48,7 +50,9 @@ def resnet_features(backbone: str = "resnet50", pretrained: bool = True) -> tupl
 class _MLPHead(nn.Module):
     """``Linear -> ReLU -> Dropout -> Linear``, the hidden layer both classification heads share."""
 
-    def __init__(self, feature_dim: int, hidden: int, out_features: int, dropout: float = 0.2) -> None:
+    def __init__(
+        self, feature_dim: int, hidden: int, out_features: int, dropout: float = 0.2
+    ) -> None:
         super().__init__()
         self.body = nn.Sequential(
             nn.Linear(feature_dim, hidden),
