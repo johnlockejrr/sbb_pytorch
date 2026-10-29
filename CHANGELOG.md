@@ -56,8 +56,14 @@ replacement.
 - `sbb_pytorch.logging.get_logger`: one cached logger per name, console plus optional timestamped
   file handler, replacing the `train.py` logger that appended a fresh `FileHandler` on every call
   and the ~200 `print()` calls spread across the old modules.
-- The `tests/` suite: twelve modules covering config, models, data, augmentations, metrics,
-  losses, storage, inference and training (plus the training factory).
+- The `tests/` suite: fourteen modules covering config, models, data, augmentations, metrics,
+  losses, storage, inference, training (plus the training factory) and ground truth.
+  `tests/test_gt.py` is the last to land and the largest -- 2163 lines, 111 test functions, 241
+  collected cases over `parser`, `geometry`, `render`, `reading_order` and `generator`, none of
+  which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`. Its expected
+  values are derived from the geometry or from the legacy contract each docstring states rather
+  than read back off the implementation, and every place the two disagree is pinned with a
+  `# TODO(file.py:line)` marker and mirrored in [docs/migration.md](docs/migration.md) section 5.
 - `configs/`: six ready-made configs (textline, layout, binarization, enhancement,
   classification, reading_order). The first two carry the values of `config_train_textline.json`
   and `config_params.json`; the other four tasks had no legacy config at all.

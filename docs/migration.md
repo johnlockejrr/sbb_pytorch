@@ -286,7 +286,37 @@ instead of being made.
    TensorFlow → PyTorch port) both describe files this branch deletes.** They are being rewritten
    rather than dropped; confirm whether the TensorFlow-port history belongs in `CHANGELOG.md`, in
    `TECHNICAL_CHANGELOG.md`, or in a `docs/legacy/` folder.
-10. **Sandbox artifacts in the repository root** (`.bashrc`, `.bash_profile`, `.profile`, `.zshrc`,
+10. **`tests/test_gt.py` pins eleven behaviours it found without changing any of them.** The
+    serious one is `gt/reading_order.py:315`: `generate_pairs(page, input_height=..., input_width=...)`
+    raises `ValueError: all input arrays must have the same shape` for *every* size other than the
+    page's own, because `_layout_channel` resizes to the requested input size while the two
+    `region_label_map` channels stay at page size and the `np.stack` that follows refuses the
+    mismatch -- the same call with the default size returns its `n * (n - 1)` pairs, which is why no
+    command exercises it (`sbb gt reading-order` does not exist yet, item 6). The other ten are the
+    `# TODO(module.py:line)` markers inside that file: `generator.py:534` documents big-over-small
+    contour order ("a drop-capital is not buried by the paragraph that contains it") and appends in
+    document order, so a header declared before its paragraph disappears from the layout map;
+    `reading_order.py:206` `_is_header(page, region)` ignores its `page` argument and matches the
+    literal `"header"` only, so a `heading` or `rest_as_header` region gets no separator band even
+    though parser and generator both normalise those spellings; `generator.py:700` `output_stem`
+    diverges from the ported rule the row in 3.8 claims is preserved (`a-b-c.xml` → `b-c` where
+    legacy gave `b`, `000123456-1800.tar.gz` → `1800.tar` where legacy gave `1800`); `generator.py:249`
+    falls back `case_label → artificial_class_label`, so a config setting only the boundary class
+    silently reuses `9` as the region class where its docstring promises legacy's implicit `1`;
+    `generator.py:683` `_find_image` matches any file by stem and sorts the directory, so an XML
+    filed in the images directory wins over the `1800.png` and the source-image copy is dropped
+    without a log line; `render.py:272` computes `edge = stroked & ~filled`, which is empty at the
+    default 1-pixel outline, so `outline_color` does nothing until `outline_thickness > 1`;
+    `render.py:191` range-checks the entry labels with a friendly `ValueError` but passes
+    `background` straight to `np.full`, so `background=999` raises `OverflowError`; `render.py:418`
+    gives a region whose `@ID` holds no digits the class id `hash((kind, type)) % 19`, which CPython
+    randomises per process, so the same page renders with different ids on different runs;
+    `reading_order.py:123` accepts a `suffix` that `write_pair` never applies (the `_missed` marker
+    only reaches file names because `generate_pairs` bakes it into `name`); and `render.py:458`
+    `crop_to` silently returns a smaller crop than asked for when the box exceeds the image, where
+    `make_image_from_bb` clamps its boxes. Each fix changes rendered output or output names, so the
+    pin and the fix have to flip in one commit -- say which of the eleven to take and in what order.
+11. **Sandbox artifacts in the repository root** (`.bashrc`, `.bash_profile`, `.profile`, `.zshrc`,
    `.zprofile`, `.gitconfig`, `.mcp.json`, `.vscode`, `.idea`, `.ripgreprc`, `__pycache__/`,
    `.pytest_cache/`, `.ruff_cache/`) are tracked/untracked leftovers of the environment, and
    `.gitmodules` is an empty file with no submodule. The planned `.gitignore` excludes them; the
@@ -301,7 +331,8 @@ For any entry above, the order to check it in:
 2. Run the matching test file: `tests/test_metrics.py`, `test_losses.py`, `test_models.py`,
    `test_dataset.py`, `test_augmentations.py`, `test_datamodule.py`, `test_images.py`,
    `test_checkpoint.py`, `test_config.py`, `test_inference.py`, `test_training.py`,
-   `test_training_factory.py`.
+   `test_training_factory.py`, `test_gt.py` (the last one covers every row in section 3.8 and the
+   pins listed in section 5.10 -- a row fixed without its pin updated shows up as a failure there).
 3. For a **breaking** number, re-run one of your own historic configs with the legacy code and
    the package side by side and compare the two logged values against the formula in section 3 --
    the change should be explainable arithmetically, not just by "the old code was wrong".
