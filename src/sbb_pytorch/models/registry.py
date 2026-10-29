@@ -126,8 +126,10 @@ def create_model(
         # for the model that patchifies the input (cnn_first=False); the cnn-first variant
         # patchifies f5, whose size follows from the encoder, so the config's grid cannot be its
         # token count and None lets the constructor derive it (and still verify it) instead.
-        declared = None if transformer.cnn_first else (
-            transformer.num_patches_xy[0] * transformer.num_patches_xy[1]
+        declared = (
+            None
+            if transformer.cnn_first
+            else (transformer.num_patches_xy[0] * transformer.num_patches_xy[1])
         )
         args.update(
             patch_size_x=transformer.patchsize_x,

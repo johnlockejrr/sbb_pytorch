@@ -266,8 +266,7 @@ class Page:
         return [
             region.contour
             for region in self.regions
-            if region.kind is kind
-            and (type_name is None or region.type_name == type_name)
+            if region.kind is kind and (type_name is None or region.type_name == type_name)
         ]
 
     def grouped(self, kind: RegionKind) -> dict[str, list[Contour]]:

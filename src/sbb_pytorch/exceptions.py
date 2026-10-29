@@ -7,6 +7,15 @@ or -- as the pre-refactor code did -- silently return a blank image.
 
 from __future__ import annotations
 
+__all__ = [
+    "CheckpointError",
+    "ConfigError",
+    "ImageReadError",
+    "ModelBuildError",
+    "SBBError",
+    "TrainingError",
+]
+
 
 class SBBError(Exception):
     """Base class for all errors raised by this package."""

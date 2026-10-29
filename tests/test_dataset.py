@@ -180,7 +180,9 @@ def test_page2label_supplies_the_identity_mapping_over_configured_ids(tmp_path: 
     write_pair(root, "page", label_values=(1, 2))
     page2label = Page2Label(use_case="textline", textregions={"<textlines>": 1}, imageregion=2)
     dataset = SegmentationDataset(root, config=make_config(n_classes=3, page2label=page2label))
-    assert dataset._mapping == {1: 1, 2: 2}
+    # 0 is not one of the region ids the page2label lists, but it is what every background pixel
+    # of a rendered label stores, so the derived mapping covers it (see _resolve_mapping).
+    assert dataset._mapping == {0: 0, 1: 1, 2: 2}
     assert set(dataset[0][1].unique().tolist()) == {1, 2}
 
     # The same folder with a mapping that does not cover the stored values is an error, not a
@@ -309,15 +311,18 @@ def test_write_patches_with_a_scaler_keeps_the_patch_size(tmp_path: Path) -> Non
     yields fewer, same-sized patches. The variant that scaled the patch was never called."""
     image = np.full((SIZE, SIZE, 3), 200, np.uint8)
     label = np.zeros((SIZE, SIZE), np.uint8)
-    assert write_patches(
-        image,
-        label,
-        images_dir=tmp_path / "s" / "images",
-        labels_dir=tmp_path / "s" / "labels",
-        patch_height=16,
-        patch_width=16,
-        scaler=0.5,
-    ) == 1, "a 32x32 page at scale 0.5 is 16x16 -> exactly one patch"
+    assert (
+        write_patches(
+            image,
+            label,
+            images_dir=tmp_path / "s" / "images",
+            labels_dir=tmp_path / "s" / "labels",
+            patch_height=16,
+            patch_width=16,
+            scaler=0.5,
+        )
+        == 1
+    ), "a 32x32 page at scale 0.5 is 16x16 -> exactly one patch"
     with pytest.raises(ValueError, match="scaler must be in"):
         write_patches(
             image,
@@ -335,14 +340,17 @@ def test_patch_files_round_trip_byte_for_byte(tmp_path: Path) -> None:
     image = np.zeros((8, 8, 3), np.uint8)
     image[:, :, 2] = 255  # pure red in RGB order
     label = np.tile(np.arange(8, dtype=np.uint8) % 3, (8, 1))
-    assert write_patches(
-        image,
-        label,
-        images_dir=tmp_path / "images",
-        labels_dir=tmp_path / "labels",
-        patch_height=8,
-        patch_width=8,
-    ) == 1
+    assert (
+        write_patches(
+            image,
+            label,
+            images_dir=tmp_path / "images",
+            labels_dir=tmp_path / "labels",
+            patch_height=8,
+            patch_width=8,
+        )
+        == 1
+    )
     assert np.array_equal(read_image(tmp_path / "images" / "img_0.png"), image)
     assert np.array_equal(read_mask(tmp_path / "labels" / "img_0.png"), label)
 
@@ -396,10 +404,30 @@ def test_variant_names_match_the_legacy_set(tmp_path: Path) -> None:
     names = [variant.name for variant in variants(image, label, config)]
     assert names[0] == "base"
     for expected in (
-        "flip_1", "flip_0", "flip_-1", "blur_gauss", "bright_1.5", "bin", "degrade_0.5",
-        "rot90", "rot_5.0", "rot_-5.0", "shuffle_102", "scale_0.8", "shift_xpos", "shift_xmin",
-        "shift_ypos", "shift_ymin", "shift_xypos", "shift_xymin", "pad_white", "pad_black",
-        "scale_0.8_flip_1", "scale_0.8_bin", "scale_0.8_blur_gauss", "scale_0.8_bright_1.5",
+        "flip_1",
+        "flip_0",
+        "flip_-1",
+        "blur_gauss",
+        "bright_1.5",
+        "bin",
+        "degrade_0.5",
+        "rot90",
+        "rot_5.0",
+        "rot_-5.0",
+        "shuffle_102",
+        "scale_0.8",
+        "shift_xpos",
+        "shift_xmin",
+        "shift_ypos",
+        "shift_ymin",
+        "shift_xypos",
+        "shift_xymin",
+        "pad_white",
+        "pad_black",
+        "scale_0.8_flip_1",
+        "scale_0.8_bin",
+        "scale_0.8_blur_gauss",
+        "scale_0.8_bright_1.5",
     ):
         assert expected in names, f"{expected} disappeared"
 

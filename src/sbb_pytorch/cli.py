@@ -44,7 +44,6 @@ import click
 from sbb_pytorch import __version__
 from sbb_pytorch.config import (
     SBBConfig,
-    UseCase,
     apply_overrides,
     dump_json_schema,
     load_config,
@@ -55,6 +54,9 @@ from sbb_pytorch.device import resolve_device
 from sbb_pytorch.exceptions import CheckpointError, SBBError
 from sbb_pytorch.gt import (
     GroundTruthConfig,
+    # gt's own UseCase, not config.models.UseCase: the generator's has seven members
+    # (binarization and reading_order among them) and GroundTruthConfig.use_case needs one.
+    UseCase,
     discover_xml_files,
     generate_ground_truth,
     parse_pagexml,
@@ -651,11 +653,27 @@ def gt_generate(
 
 
 def _summarise(result: object) -> str:
-    """One line about a ``GenerationResult``, whatever fields it happens to carry."""
-    values = getattr(result, "model_dump", lambda: dict(vars(result)))()
-    if isinstance(values, dict):
-        return ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
-    return str(result)
+    """One line about a ``GenerationResult``, whatever fields it happens to carry.
+
+    ``GenerationResult`` is a ``slots`` dataclass, so ``vars()`` raises ``TypeError`` on it and
+    the plain ``getattr(result, "model_dump", ...)`` fallback never ran -- which is why every
+    non-``--dry-run`` ``gt generate`` died here while the dry-run tests passed. Its own
+    :meth:`~sbb_pytorch.gt.GenerationResult.summary` is written for exactly this call, so that
+    comes first; ``model_dump`` covers a pydantic result and ``vars`` a plain dict-holding one.
+    """
+    for name in ("summary", "model_dump"):
+        render = getattr(result, name, None)
+        if not callable(render):
+            continue
+        values = render()
+        if isinstance(values, dict):
+            return ", ".join(f"{key}={value}" for key, value in sorted(values.items(), key=str))
+        return str(values)
+    try:
+        values = vars(result)
+    except TypeError:  # no __dict__: a slots class without summary()
+        return str(result)
+    return ", ".join(f"{key}={value}" for key, value in sorted(values.items(), key=str))
 
 
 @gt.command("visualize")

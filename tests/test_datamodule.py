@@ -58,9 +58,7 @@ def data_root(tmp_path: Path, *, train: int = 5, evals: int = 2) -> Path:
 def module(tmp_path: Path) -> SBBDataModule:
     """A module over a five-train / two-eval dataset, exactly as ``train.py`` had it."""
     root = data_root(tmp_path)
-    return SBBDataModule(
-        make_config(dir_train=str(root / "train"), dir_eval=str(root / "eval"))
-    )
+    return SBBDataModule(make_config(dir_train=str(root / "train"), dir_eval=str(root / "eval")))
 
 
 # --------------------------------------------------------------------- construction

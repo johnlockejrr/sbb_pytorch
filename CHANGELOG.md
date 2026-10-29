@@ -97,6 +97,11 @@ replacement.
   `scikit-learn`. Floors raised where the code requires it (`numpy>=1.24,<3`,
   `albumentations>=1.4.5`), `pydantic`, `click`, `rich` and `tensorboard` added.
   `torch`/`torchvision` are declared but the active build still has to be chosen before install.
+- `ruff format` now passes across `src/` and `tests/` (eleven files were reformatted; `ruff check`
+  had been clean the whole time, which is why a lint-only gate never showed it), the two builtin
+  `callable` annotations in `training/factory.py` are `Callable[..., Any]`, and `exceptions.py`
+  gained the `__all__` every other root module has. `pyproject.toml`'s `[project.urls]` point at
+  the repository the package is published from.
 - README license section corrected from MIT to Apache-2.0, which is what `LICENSE` has always
   contained, and `pyproject.toml` declares `license = "Apache-2.0"`.
 
@@ -115,7 +120,9 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   nothing. `ReduceLROnPlateau` was imported and never constructed, so no scheduler ever ran;
   `torch.optim.Adadelta` was built without `weight_decay`; `momentum` was passed to optimizers that
   do not take it; pretrained ImageNet weights were re-initialised with kaiming one line after being
-  downloaded.
+  downloaded. `device.available_devices` called `torch.device_count()` -- an attribute that does not
+  exist, on the one branch that only runs when CUDA is present, so it passed every test here and
+  would have raised `AttributeError` on the machine `--device auto` is meant for.
 - **Callbacks.** `SaveWeightsAfterSteps` declared a signature pytorch-lightning never calls, so it
   never fired; `training.py`'s `ModelCheckpoint.save_model` read attributes its own `__init__`
   never assigned, so the first save raised `AttributeError`; pruning sorted `epoch_10` before
@@ -133,7 +140,11 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `page.001.png` to `page`; `augmentation: false` was ignored, because the module that read the
   config was dead code; `preprocess_and_augment_data` ran in `DataModule.__init__`, so two
   processes wrote the same files at once; a missing image folder raised from a worker mid-epoch
-  instead of at construction.
+  instead of at construction. `SegmentationDataset` added two faults of its own: it gave every task
+  the same target -- an `int64 (H, W)` label map -- which neither the classifier (`(B, C)` logits) nor the enhancement loss (a float image
+  target) accepts, so two of the six shipped configs failed on their first batch; and the
+  page2label-derived remap omitted class id `0`, the value every background pixel of a rendered
+  label carries, so a generated label image was rejected as "no class id configured".
 - **Inference.** The output image was a thumbnail: the page was downsampled to the model's
   448x672 output instead of the mask being upscaled; a bilinear resize of the label map invented
   class ids; normalisation was applied before resizing and skipped entirely for classification;
@@ -145,11 +156,25 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   document, leaving `imageHeight`/`imageWidth` unbound; `config_params=None` crashed the layout
   branch although `--config` was documented as ignorable; `case_label` was applied to every region
   whatever the use case; the overlay blended with weights summing to 0.6, dimming the result.
+  Five more, all found after the rewrite and before any release: `sbb gt generate` died in its own
+  result summary (`vars()` on a `slots` dataclass) on every run that was not `--dry-run`;
+  `--config` could not read a `configs/*.json` file because `GroundTruthConfig.from_dict` did not
+  look inside its `page2label` section; `label_for` queried the raw-keyed region table with a
+  normalised type name, so a `type="paragraph"` region under a `rest_as_paragraph` config labelled
+  nothing and the page produced no output; `columns_width` keys were stringified while the lookup
+  used an `int`, so the column-normalising resize never ran; and `--use-case` offered
+  `config.models.UseCase`'s five members where the generator's own enum has seven, rejecting
+  `binarization` and `reading_order`.
 - **Config.** Any key a file omitted raised `KeyError` even when the value was irrelevant --
   `config_train_textline.json` was loadable through exactly one code path -- and a `" "`
   `dir_of_start_model` (the shipped way of writing "unset") is now `None`. `validate_configs`'
   three hand-written `if` checks become `SBBConfig.warnings()` and `validate_pair()`, which report
-  rather than raise; `sbb validate --strict` turns the reports into an exit code.
+  rather than raise; `sbb validate --strict` turns the reports into an exit code. Two of the six
+  shipped configs also had their numbers corrected after review: `configs/textline.json` and
+  `configs/layout.json` now say `n_classes: 7`, the count their `page2label` ids (1-6, background
+  included) require -- the legacy files they were built from said `3` and `2` against a mapping
+  whose ids reach `6` -- and `configs/layout.json`'s `n_epochs` is `50` instead of the ported `0`,
+  which asks Lightning for a run that trains nothing.
 
 ### Removed
 

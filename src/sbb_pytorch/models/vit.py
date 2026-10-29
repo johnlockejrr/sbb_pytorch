@@ -82,15 +82,21 @@ def patchify(x: torch.Tensor, patch_height: int, patch_width: int) -> torch.Tens
     _, channels, height, width = x.shape
     count = expected_patch_count(height, width, patch_height, patch_width)
     unfolded = x.unfold(2, patch_height, patch_height).unfold(3, patch_width, patch_width)
-    return unfolded.permute(0, 2, 3, 1, 4, 5).reshape(-1, count, channels * patch_height * patch_width)
+    return unfolded.permute(0, 2, 3, 1, 4, 5).reshape(
+        -1, count, channels * patch_height * patch_width
+    )
 
 
-def unpatch(tokens: torch.Tensor, height: int, width: int, patch_height: int, patch_width: int) -> torch.Tensor:
+def unpatch(
+    tokens: torch.Tensor, height: int, width: int, patch_height: int, patch_width: int
+) -> torch.Tensor:
     """``(B, n_patches, C * ph * pw)`` -> ``(B, C, height, width)`` -- the inverse of :func:`patchify`."""
     batch, count, features = tokens.shape
     expected = expected_patch_count(height, width, patch_height, patch_width)
     if count != expected:
-        raise ValueError(f"{count} tokens cannot rebuild a {height}x{width} map ({expected} expected)")
+        raise ValueError(
+            f"{count} tokens cannot rebuild a {height}x{width} map ({expected} expected)"
+        )
     channels = features // (patch_height * patch_width)
     if channels * patch_height * patch_width != features:
         raise ValueError(f"{features} features is not a multiple of {patch_height}x{patch_width}")
@@ -181,7 +187,9 @@ class PatchDecoder(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block (identical maths to the legacy one; relocated for reuse)."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1) -> None:
+    def __init__(
+        self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1
+    ) -> None:
         super().__init__()
         if dim % num_heads:
             raise ModelBuildError(f"dim {dim} is not divisible by num_heads {num_heads}")
@@ -337,16 +345,24 @@ class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
         *,
         pretrained: bool = True,
     ) -> None:
-
         super().__init__()
-        declared = _check_declared(num_patches, input_height, input_width, patch_size_y, patch_size_x)
+        declared = _check_declared(
+            num_patches, input_height, input_width, patch_size_y, patch_size_x
+        )
         # The legacy model rebuilt the image with 3*ph*pw channels and handed it to a
         # 3-channel conv1; unpatch() restores the true (B, 3, H, W) image instead.
         self.patch_size_x, self.patch_size_y = patch_size_x, patch_size_y
         self.input_height, self.input_width = input_height, input_width
         self.mlp_head_units = tuple(mlp_head_units)
-        self.transformer = _ViTBackbone(3 * patch_size_y * patch_size_x, patch_size_x, patch_size_y,
-                                       declared, projection_dim, transformer_layers, num_heads)
+        self.transformer = _ViTBackbone(
+            3 * patch_size_y * patch_size_x,
+            patch_size_x,
+            patch_size_y,
+            declared,
+            projection_dim,
+            transformer_layers,
+            num_heads,
+        )
         self.unet = UNet(
             n_classes,
             input_height,

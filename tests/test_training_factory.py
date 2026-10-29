@@ -87,8 +87,13 @@ def test_optimizer_accepts_the_enum_and_its_string(tiny: nn.Module) -> None:
 def test_unknown_optimizer_is_a_training_error_not_a_silent_default(tiny: nn.Module) -> None:
     with pytest.raises(ValueError, match="optimizer"):
         SBBConfig.model_validate(
-            {"task": "segmentation", "n_classes": 3, "input_height": 32, "input_width": 32,
-             "optimizer": "ranger"}
+            {
+                "task": "segmentation",
+                "n_classes": 3,
+                "input_height": 32,
+                "input_width": 32,
+                "optimizer": "ranger",
+            }
         )
 
 
@@ -111,7 +116,9 @@ def test_bad_scheduler_arguments_are_refused(factor: float, mode: str) -> None:
 def test_scheduler_patience_scales_with_the_run() -> None:
     """A tenth of the run, and never zero -- ``patience=0`` stops on the first non-improvement."""
     for epochs in (1, 5, 50, 100):
-        scheduler = scheduler_from_config(make(n_epochs=epochs), build_optimizer(nn.Linear(2, 2), make()))
+        scheduler = scheduler_from_config(
+            make(n_epochs=epochs), build_optimizer(nn.Linear(2, 2), make())
+        )
         assert scheduler.patience == max(1, math.ceil(epochs / 10))
 
 

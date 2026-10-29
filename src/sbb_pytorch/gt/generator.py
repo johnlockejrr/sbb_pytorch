@@ -227,7 +227,17 @@ class GroundTruthConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, source: Path | None = None) -> GroundTruthConfig:
-        """Build a config from a mapping, tolerating absent keys."""
+        """Build a config from a mapping, tolerating absent keys.
+
+        Two file shapes are accepted. The legacy one is ``custom_config_page2label.json``: the
+        fields below at the top level. The other is an :class:`~sbb_pytorch.config.models.SBBConfig`,
+        which carries the same fields inside its ``page2label`` section -- without this, ``sbb gt
+        generate --config configs/layout.json`` parsed an empty mapping and every page came back
+        "no regions labelled", because the region tables were nested one level deeper than the
+        reader looked. The section wins over the surrounding keys.
+        """
+        section = data.get("page2label")
+        data = {**data, **section} if isinstance(section, dict) else data
         return cls(
             use_case=UseCase.parse(data.get("use_case", UseCase.LAYOUT)),
             textregions=_int_map(data.get("textregions")),
@@ -239,7 +249,7 @@ class GroundTruthConfig:
             case_label=int(data.get("case_label", data.get("artificial_class_label", 1))),
             artificial_class_label=_int_or_none(data.get("artificial_class_label")),
             printspace_as_class_in_layout=_int_or_none(data.get("printspace_as_class_in_layout")),
-            columns_width=_int_map(data.get("columns_width")),
+            columns_width=_columns_width_map(data.get("columns_width")),
             min_area=float(data.get("min_area", DEFAULT_MIN_AREA_FRACTION)),
             max_area=float(data.get("max_area", 1.0)),
             source=source,
@@ -279,7 +289,15 @@ class GroundTruthConfig:
             return None
         if isinstance(configured, int):
             return configured
-        return configured.get(normalise_text_type(region.type_name, list(configured)))
+        # Normalise both sides. The dict is keyed the way the JSON spells it
+        # (``rest_as_paragraph``) while a PageXML region says ``paragraph``, and asking the
+        # raw-keyed dict for the normalised name labelled nothing -- which made a real page
+        # generate no image at all, because the whole page is skipped when no region matches.
+        names = list(configured)
+        lookup = {
+            normalise_text_type(name, names): class_id for name, class_id in configured.items()
+        }
+        return lookup.get(normalise_text_type(region.type_name, names))
 
 
 def _int_map(value: Any) -> dict[str, int]:
@@ -293,6 +311,20 @@ def _int_map(value: Any) -> dict[str, int]:
         # ``elements_with_artificial_class`` lists effectively did.
         return {str(name): index for index, name in enumerate(value, start=1)}
     raise TypeError(f"expected a mapping of names to class ids, got {type(value).__name__}")
+
+
+def _columns_width_map(value: Any) -> dict[int, int]:
+    """Normalise ``{column count: page width}``, whose keys JSON spells as strings.
+
+    The keys are numbers here, not region names: :func:`_column_size` looks a page's
+    column count up as an ``int`` (``parser.Page.columns_width``), so keeping the JSON
+    ``"1"`` spelling made every lookup miss and the normalising resize never happen.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {int(key): int(item) for key, item in value.items()}
+    raise TypeError(f"expected a mapping of column counts to widths, got {type(value).__name__}")
 
 
 def _int_or_none(value: Any) -> int | None:

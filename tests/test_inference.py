@@ -87,7 +87,10 @@ def test_predict_accepts_an_array_and_a_path_equally(tmp_path: Path, page) -> No
     """``SBBPredict`` only worked through its constructor fields; both forms now return the same."""
     path, array = page
     model = StubModel(torch.zeros(1, 3, 8, 8))
-    from_path, from_array = Predictor(model, make()).predict(path), Predictor(model, make()).predict(array)
+    from_path, from_array = (
+        Predictor(model, make()).predict(path),
+        Predictor(model, make()).predict(array),
+    )
     assert np.array_equal(from_path.mask, from_array.mask)
     assert from_array.path is None
 

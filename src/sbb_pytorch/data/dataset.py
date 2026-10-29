@@ -147,6 +147,10 @@ def train_val_split(
 class SegmentationDataset(Dataset):
     """Image/mask pairs as ``(float32 (3, H, W), int64 (H, W))`` tensors.
 
+    The target is task-aware (see :meth:`__getitem__`): the label map for
+    ``segmentation``/``binarization``, one class id per page for ``classification``, and the label
+    image itself as a float tensor for ``enhancement``.
+
     Args:
         data_dir: Folder holding ``images/`` and ``labels/`` (the layout
             ``preprocess_and_augment_data`` writes and ``train.py`` expected).
@@ -220,15 +224,18 @@ class SegmentationDataset(Dataset):
         :meth:`~sbb_pytorch.config.models.Page2Label.class_ids`, which is exactly what
         ``storage.remap_mask`` needs in order to reject a label holding an unconfigured value.
         An explicit ``{stored_value: class_id}`` dict overrides it (that is the ``0/255`` case).
+
+        ``class_ids()`` only ever lists the ids the *regions* use, so 0 -- the background every
+        other pixel of a rendered label carries -- was missing from the derived mapping, and
+        ``remap_mask`` refused a generated label image with "no class id configured for label
+        values [0]". Background maps to class 0, which is what ``n_classes`` counts for it.
         """
         if isinstance(mapping, Page2Label):
-            return {class_id: class_id for class_id in mapping.class_ids()}
+            return {class_id: class_id for class_id in sorted({*mapping.class_ids(), 0})}
         if mapping is not None:
             return dict(mapping)
         if config is not None and config.page2label is not None:
-            return {
-                class_id: class_id for class_id in config.page2label.class_ids()
-            }
+            return {class_id: class_id for class_id in sorted({*config.page2label.class_ids(), 0})}
         return None
 
     def _default_transform(self, config: SBBConfig | None) -> A.Compose:
@@ -263,9 +270,16 @@ class SegmentationDataset(Dataset):
         (``storage.resize_mask``) -- the legacy code resized the *photo* with the nearest
         ``resize_image`` helper, which is why its training images looked blocky next to the
         inference ones.
+
+        For ``task=enhancement`` the label file is the enhanced *page*, not a class map, so it is
+        read with :func:`~sbb_pytorch.storage.images.read_image` and never remapped: the SSIM loss
+        and the PSNR/SSIM metrics compare images, and ``read_mask`` would hand them the green
+        channel as class ids.
         """
         image_path, label_path = self.pairs[index]
         image = read_image(image_path)
+        if self.task is TaskType.ENHANCEMENT:
+            return image, read_image(label_path)
         mask = read_mask(label_path)
         if self._mapping is not None:
             mask = remap_mask(mask, self._mapping, self.n_classes)
@@ -283,10 +297,48 @@ class SegmentationDataset(Dataset):
             )
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(image, mask)`` -- the tuple ``DataLoader`` collates, exactly as before."""
-        image, mask = self.load_pair(index)
-        image, mask = self._apply_transform(image, mask)
+        """``(image, target)`` -- the tuple the ``DataLoader`` collates.
+
+        The target follows the task: an ``int64 (H, W)`` label map for segmentation and
+        binarization, one ``int64`` class per page for classification, and a ``float32 (3, H, W)``
+        image for enhancement. A single target type for every task is what made
+        ``sbb train configs/classification.json`` and ``configs/enhancement.json`` fail on their
+        first batch -- see :meth:`load_pair` and :meth:`_image_targets`.
+        """
+        image, target = self.load_pair(index)
+        if self.task is TaskType.ENHANCEMENT:
+            return self._image_targets(image, target)
+        image, mask = self._apply_transform(image, target)
+        if self.task is TaskType.CLASSIFICATION:
+            return image, self._page_label(mask)
         return image, mask.long() if mask.dtype != torch.long else mask
+
+    def _page_label(self, mask: np.ndarray) -> torch.Tensor:
+        """The page's class: the most frequent class id in its label, lowest id on a tie.
+
+        A classifier answers one question per image, so its target is a scalar -- the mask's
+        dominant class is the honest reading of "the label of this page", and it is what makes
+        ``FocalLoss((B, C) logits, (B,) labels)`` (which the loss layer already supports) reachable.
+        """
+        counts = np.bincount(np.asarray(mask, dtype=np.int64).ravel(), minlength=self.n_classes)
+        return torch.tensor(int(counts.argmax()), dtype=torch.long)
+
+    def _image_targets(
+        self, image: np.ndarray, label: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both images at :attr:`image_size`, scaled to ``[0, 1]``, without the mask pipeline.
+
+        :func:`~sbb_pytorch.data.augmentations.build_transform` is written for ``(H, W)`` masks --
+        it normalises the image and resizes the mask with nearest neighbour -- so the enhancement
+        path resizes both with area interpolation instead of pushing a 3-channel target through
+        it. Augmentation is skipped there: photometric augmentation of the image would have to be
+        mirrored on the target image to mean anything, and the legacy pipeline never did that.
+        """
+        height, width = self.image_size
+        return (
+            torch.from_numpy(resize(image, height, width).transpose(2, 0, 1)).float() / 255.0,
+            torch.from_numpy(resize(label, height, width).transpose(2, 0, 1)).float() / 255.0,
+        )
 
     def _apply_transform(
         self, image: np.ndarray, mask: np.ndarray

@@ -146,9 +146,10 @@ Six ready-made files in [configs/](configs/), each loadable by `sbb_pytorch.conf
 
 | File | Notes |
 | --- | --- |
-| [configs/textline.json](configs/textline.json) | from `config_train_textline.json`, plus the ten keys that file omitted and `ConfigLoader` rebuilt by hand (their absence was a `KeyError`) |
-| [configs/layout.json](configs/layout.json) | from `config_params.json`; `num_patches_xy` corrected to `[112, 112]` for a 448 input, `n_epochs` kept at the legacy `0` (a validation-only run) |
-| [configs/binarization.json](configs/binarization.json), [configs/enhancement.json](configs/enhancement.json), [configs/classification.json](configs/classification.json), [configs/reading_order.json](configs/reading_order.json) | new; no legacy file existed for these tasks, so their numbers are chosen and documented, not ported |
+| [configs/textline.json](configs/textline.json) | from `config_train_textline.json`, plus the ten keys that file omitted and `ConfigLoader` rebuilt by hand (their absence was a `KeyError`); `n_classes` is `7`, the count its `page2label` ids (1-6, background included) need -- the legacy pair said `3` against ids up to `6`, which `sbb validate` reported and the legacy code trained on anyway |
+| [configs/layout.json](configs/layout.json) | from `config_params.json`; `num_patches_xy` corrected to `[112, 112]` for a 448 input; `n_classes` is `7` for the same reason, and `n_epochs` is `50` -- the legacy `0` asks Lightning for a zero-epoch run, which trains nothing rather than "validating only" |
+| [configs/binarization.json](configs/binarization.json), [configs/enhancement.json](configs/enhancement.json), [configs/classification.json](configs/classification.json) | new; no legacy file existed for these tasks, so their numbers are chosen and documented, not ported |
+| [configs/reading_order.json](configs/reading_order.json) | new, and **inference-only**: the port has no trainable reading-order loss, so `sbb train` on it raises `NotImplementedError` by design -- the order comes from `sbb gt` and `sbb infer` |
 
 The data directories in all six are placeholders (`data/<task>/{train,eval}`, `runs/<task>`) --
 point them at real data or pass `-o`. Every value that differs from the legacy file, and why, is
