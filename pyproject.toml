@@ -37,26 +37,26 @@ classifiers = [
 # torch/torchvision are declared here so the package resolves, but the *active*
 # PyTorch build (CPU vs cu118 vs cu121 vs rocm) must be chosen before install --
 # see the Installation section of README.md. pip cannot pick the CUDA variant itself.
+# This list is what src/ imports, plus the tooling the entry points need. Seven packages the
+# legacy requirements.txt carried are not in it, because the port imports none of them: Pillow
+# (images are read with cv2, not PIL.Image), scikit-learn (metrics.py imported sklearn and never
+# called it), shapely (areas come from cv2.contourArea), matplotlib and seaborn (Keras-era
+# plotting, superseded by rich). scipy and tqdm were dropped for the same reason and still install
+# on their own -- albumentations requires scipy>=1.10 and pytorch_lightning requires tqdm -- so
+# their pins (the .ndimage alias note that justified scipy>=1.11 among them) went with them.
+# docs/migration.md 5.7 records the decision; PyYAML stays because dev declares types-PyYAML and
+# the config loaders are the documented place a YAML config would be added.
 dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "pytorch_lightning>=2.0",
     "numpy>=1.24,<3",
     "opencv-python-headless>=4.8",
-    "Pillow>=10.0",
     # albumentations <1.4.5 cannot import against numpy 2.x.
     "albumentations>=1.4.5",
     "pydantic>=2.5",
     "click>=8.1",
     "rich>=13.0",
-    "tqdm>=4.65",
-    "scikit-learn>=1.0",
-    # scipy.ndimage.filters / .interpolation legacy aliases are gone in scipy 1.16;
-    # the code imports from scipy.ndimage directly, so 1.11 is the real floor.
-    "scipy>=1.11",
-    "shapely>=2.0",
-    "matplotlib>=3.7",
-    "seaborn>=0.12",
     "PyYAML>=6.0",
     "tensorboard>=2.13",
 ]

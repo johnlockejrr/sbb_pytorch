@@ -188,7 +188,7 @@ each other and the disagreement is the point.
 | Change | Marker |
 | --- | --- |
 | **The license is Apache-2.0, not MIT.** `LICENSE` has been the Apache-2.0 text all along while `README.md` said MIT; the README now matches the file, and `pyproject.toml` declares `license = "Apache-2.0"` with `license-files = ["LICENSE"]`. | **fix** |
-| **`requirements.txt` → `pyproject.toml`.** `sacred` is dropped (only `build_model_load_pretrained_weights_and_save.py` used it, and that file is a Keras script); `torch`/`torchvision` are declared but the active build (CPU / cu118 / cu121 / rocm) must still be chosen before install, which pip cannot decide by itself; floors are raised where the code requires it (`numpy>=1.24,<3`, `albumentations>=1.4.5` because earlier versions cannot import against numpy 2.x, `scipy>=1.11` because `scipy.ndimage.filters`/`.interpolation` aliases are gone in 1.16), and `pydantic`, `click`, `rich`, `tensorboard` join the list. Seven declared packages are never imported by `src/` (`shapely`, `matplotlib`, `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`) -- section 5.7. | **api** |
+| **`requirements.txt` → `pyproject.toml`.** `sacred` is dropped (only `build_model_load_pretrained_weights_and_save.py` used it, and that file is a Keras script); `torch`/`torchvision` are declared but the active build (CPU / cu118 / cu121 / rocm) must still be chosen before install, which pip cannot decide by itself; floors are raised where the code requires it (`numpy>=1.24,<3`, `albumentations>=1.4.5` because earlier versions cannot import against numpy 2.x), and `pydantic`, `click`, `rich`, `tensorboard` join the list. Seven packages the file carried without `src/` importing any of them (`shapely`, `matplotlib`, `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`) are removed as well -- four of the seven still install through other dependencies, so only four actually shrink: section 5.7. | **api** |
 | **The package is installable** (`pip install -e .`), so `sbb` is on `PATH` and `import sbb_pytorch` works from anywhere; the root `__init__.py` that made the source tree an accidental module is gone. | **api** |
 | **One CLI, three argument-parsing styles fewer.** `train.py` used `argparse`, `inference_pytorch.py` a bare `click.command`, `generate_gt_for_training.py` its own `click.group` -- so the same idea was `--batch-size` in one and `--batch_size` in the next, and `--out` meant "directory of reading-order XML" in one and "output directory" in the other. Everything is `sbb <subcommand>` now. | **api** |
 | **Logging is idempotent.** The pre-refactor repo had one logger (in `train.py`) that appended a fresh `FileHandler` on every call, so calling it twice duplicated every later line; everything else used `print()` (`utils.py` had 11 calls, 8 of them commented-out debug prints). | **fix** |
@@ -261,10 +261,14 @@ instead of being made.
    `--xml_file` and `--min_area` have no equivalent flag on `sbb infer`. Add them, or declare the
    current surface complete and say so in the README?
 7. **Seven declared dependencies are imported nowhere in `src/`** -- `shapely`, `matplotlib`,
-   `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`. They carried over from `requirements.txt`
-   (`matplotlib` also arrives transitively through `albumentations`); `sacred` was dropped because
-   only the deleted Keras script used it. Drop the rest as well, or keep them because an external
-   script still imports one of them?
+   `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`. They carried over from `requirements.txt`;
+   `sacred` was dropped because only the deleted Keras script used it. **Resolved:** all seven are
+   out of `pyproject.toml`. Three of them still arrive on their own -- `albumentations` requires
+   `scipy>=1.10`, `pytorch_lightning` requires `tqdm`, `torchvision` requires `Pillow` -- so the
+   install that actually shrinks is `shapely`, `matplotlib`, `seaborn`, `scikit-learn` (the earlier
+   note here said `matplotlib` came through `albumentations`: it does not, per that package's own
+   metadata). Anything outside this repo that imported one of those four because we declared it
+   now has to install it itself.
 8. **`docs/migration.md` says what changed; nothing yet verifies it automatically.** A useful next
    step is a small "reference run" fixture -- one tiny dataset, one 1-epoch train, one checkpoint,
    one inference -- whose numbers and file names are compared against the legacy script's output on

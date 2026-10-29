@@ -90,9 +90,13 @@ replacement.
   224x224 grid behind a 448 input) becomes `[112, 112]`; `"blur_k": ["blur", "guass", "median"]`
   is corrected to `"gauss"`; `page2label.use_case` in `configs/layout.json` becomes `layout`.
 - `requirements.txt` → `pyproject.toml`: `sacred` dropped (only the Keras build script used it),
-  floors raised where the code requires it (`numpy>=1.24,<3`, `albumentations>=1.4.5`,
-  `scipy>=1.11`), `pydantic`, `click`, `rich` and `tensorboard` added. `torch`/`torchvision` are
-  declared but the active build still has to be chosen before install.
+  and with it the seven declared packages `src/` never imports -- `shapely`, `matplotlib`,
+  `seaborn`, `scikit-learn`, `scipy`, `tqdm`, `Pillow`. Three of those still install through other
+  dependencies (`scipy` via `albumentations`, `tqdm` via `pytorch_lightning`, `Pillow` via
+  `torchvision`), so the install actually shrinks by `shapely`, `matplotlib`, `seaborn` and
+  `scikit-learn`. Floors raised where the code requires it (`numpy>=1.24,<3`,
+  `albumentations>=1.4.5`), `pydantic`, `click`, `rich` and `tensorboard` added.
+  `torch`/`torchvision` are declared but the active build still has to be chosen before install.
 - README license section corrected from MIT to Apache-2.0, which is what `LICENSE` has always
   contained, and `pyproject.toml` declares `license = "Apache-2.0"`.
 
