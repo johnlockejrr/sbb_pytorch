@@ -1,0 +1,48 @@
+# Byte-compiled, build and packaging artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+sdist/
+wheelhouse/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+ENV/
+
+# Type checkers, linters, tests
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+pytest.log
+
+# Training and inference outputs
+runs/
+outputs/
+lightning_logs/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+*.log
+sbb_*.log
+
+# Notebooks and editors
+.ipynb_checkpoints/
+.idea
+.vscode
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,652 @@
+{
+  "$defs": {
+    "BackboneType": {
+      "description": "Feature-extractor family. ``RESNET`` and ``NONTRANSFORMER`` are the same CNN backbone\nunder two historical names; both were selectable from the config.",
+      "enum": [
+        "transformer",
+        "resnet",
+        "nontransformer"
+      ],
+      "title": "BackboneType",
+      "type": "string"
+    },
+    "BlurKind": {
+      "description": "Blur variants. Replaces the free-form ``blur_k`` strings, where a shipped config\nspelled the value ``\"guass\"`` and hit an unbound-local crash.",
+      "enum": [
+        "gauss",
+        "median",
+        "blur"
+      ],
+      "title": "BlurKind",
+      "type": "string"
+    },
+    "OptimizerType": {
+      "description": "``initialization.py`` hard-coded ``torch.optim.Adam`` while the config carried an unused\n``\"optimizer\": \"adam\"`` string; that string is now the field that actually selects one.",
+      "enum": [
+        "adam",
+        "adamw",
+        "sgd",
+        "adadelta"
+      ],
+      "title": "OptimizerType",
+      "type": "string"
+    },
+    "Page2Label": {
+      "additionalProperties": false,
+      "description": "``custom_config_page2label.json`` -- which XML element names map to which class ids.\n\nThe legacy ``validate_configs`` required *exactly one* text region for the textline use\ncase; the shipped file defines three (``rest_as_paragraph``, ``header``, ``heading``,\n``marginalia``) so the rule contradicted the project's own config and is dropped. The\nduplicate value (both ``header`` and ``heading`` map to ``2``) is reported by\n:meth:`SBBConfig.warnings` rather than rejected, because it is present in the shipped file.",
+      "properties": {
+        "columns_width": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Columns Width",
+          "type": "object"
+        },
+        "graphicregions": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Graphicregions",
+          "type": "object"
+        },
+        "imageregion": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Imageregion"
+        },
+        "separatorregion": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Separatorregion"
+        },
+        "textregions": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Textregions",
+          "type": "object"
+        },
+        "use_case": {
+          "$ref": "#/$defs/UseCase"
+        }
+      },
+      "required": [
+        "use_case"
+      ],
+      "title": "Page2Label",
+      "type": "object"
+    },
+    "ScalesConfig": {
+      "additionalProperties": false,
+      "description": "``scales_enhancement.json``. The legacy validator required ``0 < scale < 1``; kept.",
+      "properties": {
+        "scales": {
+          "items": {
+            "type": "number"
+          },
+          "minItems": 1,
+          "title": "Scales",
+          "type": "array"
+        }
+      },
+      "required": [
+        "scales"
+      ],
+      "title": "ScalesConfig",
+      "type": "object"
+    },
+    "TaskType": {
+      "description": "What the model predicts.\n\n``BINARIZATION`` and ``READING_ORDER`` were absent from the enum although both are shipped\nEynollah use cases, so a config naming either one failed to load.",
+      "enum": [
+        "segmentation",
+        "classification",
+        "enhancement",
+        "binarization",
+        "reading_order"
+      ],
+      "title": "TaskType",
+      "type": "string"
+    },
+    "TransformerConfig": {
+      "additionalProperties": false,
+      "description": "Vision-transformer geometry. Was seven flat ``transformer_*`` keys.",
+      "properties": {
+        "cnn_first": {
+          "default": false,
+          "title": "Cnn First",
+          "type": "boolean"
+        },
+        "layers": {
+          "minimum": 1,
+          "title": "Layers",
+          "type": "integer"
+        },
+        "mlp_head_units": {
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 1,
+          "title": "Mlp Head Units",
+          "type": "array"
+        },
+        "num_heads": {
+          "minimum": 1,
+          "title": "Num Heads",
+          "type": "integer"
+        },
+        "num_patches_xy": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "title": "Num Patches Xy",
+          "type": "array"
+        },
+        "patchsize_x": {
+          "exclusiveMinimum": 0,
+          "title": "Patchsize X",
+          "type": "integer"
+        },
+        "patchsize_y": {
+          "exclusiveMinimum": 0,
+          "title": "Patchsize Y",
+          "type": "integer"
+        },
+        "projection_dim": {
+          "exclusiveMinimum": 0,
+          "title": "Projection Dim",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_patches_xy",
+        "patchsize_x",
+        "patchsize_y",
+        "projection_dim",
+        "mlp_head_units",
+        "layers",
+        "num_heads"
+      ],
+      "title": "TransformerConfig",
+      "type": "object"
+    },
+    "UseCase": {
+      "description": "Eynollah page layout use cases, used by the page-to-label mapping.",
+      "enum": [
+        "textline",
+        "layout",
+        "printspace",
+        "glyph",
+        "word"
+      ],
+      "title": "UseCase",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The whole configuration for one run: model, training, augmentation and directories.\n\nEvery field carries a default, so a config may name only what it cares about -- the old\nbracket-indexing made an omitted optional key a ``KeyError``.",
+  "properties": {
+    "accumulate_grad_batches": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Accumulate Grad Batches",
+      "type": "integer"
+    },
+    "add_red_textlines": {
+      "default": false,
+      "title": "Add Red Textlines",
+      "type": "boolean"
+    },
+    "adding_rgb_background": {
+      "default": false,
+      "title": "Adding Rgb Background",
+      "type": "boolean"
+    },
+    "adding_rgb_foreground": {
+      "default": false,
+      "title": "Adding Rgb Foreground",
+      "type": "boolean"
+    },
+    "augmentation": {
+      "default": false,
+      "title": "Augmentation",
+      "type": "boolean"
+    },
+    "backbone_type": {
+      "$ref": "#/$defs/BackboneType"
+    },
+    "binarization": {
+      "default": false,
+      "title": "Binarization",
+      "type": "boolean"
+    },
+    "blur_aug": {
+      "default": false,
+      "title": "Blur Aug",
+      "type": "boolean"
+    },
+    "blur_k": {
+      "items": {
+        "$ref": "#/$defs/BlurKind"
+      },
+      "title": "Blur K",
+      "type": "array"
+    },
+    "brightening": {
+      "default": false,
+      "title": "Brightening",
+      "type": "boolean"
+    },
+    "brightness": {
+      "default": [
+        1.3,
+        1.5,
+        1.7,
+        2.0
+      ],
+      "items": {
+        "type": "number"
+      },
+      "title": "Brightness",
+      "type": "array"
+    },
+    "channels_shuffling": {
+      "default": false,
+      "title": "Channels Shuffling",
+      "type": "boolean"
+    },
+    "continue_training": {
+      "default": false,
+      "title": "Continue Training",
+      "type": "boolean"
+    },
+    "data_is_provided": {
+      "default": false,
+      "title": "Data Is Provided",
+      "type": "boolean"
+    },
+    "degrade_scales": {
+      "default": [
+        0.2,
+        0.4
+      ],
+      "items": {
+        "type": "number"
+      },
+      "title": "Degrade Scales",
+      "type": "array"
+    },
+    "degrading": {
+      "default": false,
+      "title": "Degrading",
+      "type": "boolean"
+    },
+    "device": {
+      "default": "cuda",
+      "title": "Device",
+      "type": "string"
+    },
+    "dir_eval": {
+      "default": "",
+      "title": "Dir Eval",
+      "type": "string"
+    },
+    "dir_img_bin": {
+      "default": "",
+      "title": "Dir Img Bin",
+      "type": "string"
+    },
+    "dir_of_start_model": {
+      "anyOf": [
+        {
+          "format": "path",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Dir Of Start Model"
+    },
+    "dir_output": {
+      "default": "runs/default",
+      "title": "Dir Output",
+      "type": "string"
+    },
+    "dir_rgb_backgrounds": {
+      "default": "",
+      "title": "Dir Rgb Backgrounds",
+      "type": "string"
+    },
+    "dir_rgb_foregrounds": {
+      "default": "",
+      "title": "Dir Rgb Foregrounds",
+      "type": "string"
+    },
+    "dir_train": {
+      "default": "",
+      "title": "Dir Train",
+      "type": "string"
+    },
+    "enhancement_scales": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScalesConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "flip_aug": {
+      "default": false,
+      "title": "Flip Aug",
+      "type": "boolean"
+    },
+    "flip_index": {
+      "default": [
+        0,
+        1,
+        -1
+      ],
+      "items": {
+        "type": "integer"
+      },
+      "title": "Flip Index",
+      "type": "array"
+    },
+    "gradient_clip_val": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gradient Clip Val"
+    },
+    "index_start": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Index Start",
+      "type": "integer"
+    },
+    "input_height": {
+      "exclusiveMinimum": 0,
+      "title": "Input Height",
+      "type": "integer"
+    },
+    "input_width": {
+      "exclusiveMinimum": 0,
+      "title": "Input Width",
+      "type": "integer"
+    },
+    "is_loss_soft_dice": {
+      "default": false,
+      "title": "Is Loss Soft Dice",
+      "type": "boolean"
+    },
+    "learning_rate": {
+      "default": 0.0001,
+      "exclusiveMinimum": 0,
+      "title": "Learning Rate",
+      "type": "number"
+    },
+    "light_model": {
+      "default": false,
+      "title": "Light Model",
+      "type": "boolean"
+    },
+    "momentum": {
+      "default": 0.9,
+      "exclusiveMaximum": 1,
+      "minimum": 0,
+      "title": "Momentum",
+      "type": "number"
+    },
+    "n_batch": {
+      "default": 1,
+      "minimum": 1,
+      "title": "N Batch",
+      "type": "integer"
+    },
+    "n_classes": {
+      "exclusiveMinimum": 0,
+      "title": "N Classes",
+      "type": "integer"
+    },
+    "n_epochs": {
+      "default": 50,
+      "minimum": 0,
+      "title": "N Epochs",
+      "type": "integer"
+    },
+    "num_workers": {
+      "default": 4,
+      "minimum": 0,
+      "title": "Num Workers",
+      "type": "integer"
+    },
+    "number_of_backgrounds_per_image": {
+      "default": 2,
+      "minimum": 1,
+      "title": "Number Of Backgrounds Per Image",
+      "type": "integer"
+    },
+    "optimizer": {
+      "$ref": "#/$defs/OptimizerType",
+      "default": "adam"
+    },
+    "page2label": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Page2Label"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "patches": {
+      "default": false,
+      "title": "Patches",
+      "type": "boolean"
+    },
+    "patience": {
+      "default": 10,
+      "minimum": 0,
+      "title": "Patience",
+      "type": "integer"
+    },
+    "precision": {
+      "default": "32-true",
+      "enum": [
+        "32",
+        "16",
+        "bf16",
+        "32-true",
+        "16-mixed",
+        "bf16-mixed"
+      ],
+      "title": "Precision",
+      "type": "string"
+    },
+    "pretraining": {
+      "default": false,
+      "title": "Pretraining",
+      "type": "boolean"
+    },
+    "rotation": {
+      "default": false,
+      "title": "Rotation",
+      "type": "boolean"
+    },
+    "rotation_not_90": {
+      "default": false,
+      "title": "Rotation Not 90",
+      "type": "boolean"
+    },
+    "save_visualisation": {
+      "default": true,
+      "title": "Save Visualisation",
+      "type": "boolean"
+    },
+    "scales": {
+      "default": [
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "items": {
+        "type": "number"
+      },
+      "title": "Scales",
+      "type": "array"
+    },
+    "scaling": {
+      "default": false,
+      "title": "Scaling",
+      "type": "boolean"
+    },
+    "scaling_binarization": {
+      "default": false,
+      "title": "Scaling Binarization",
+      "type": "boolean"
+    },
+    "scaling_bluring": {
+      "default": false,
+      "title": "Scaling Bluring",
+      "type": "boolean"
+    },
+    "scaling_flip": {
+      "default": false,
+      "title": "Scaling Flip",
+      "type": "boolean"
+    },
+    "seed": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seed"
+    },
+    "shuffle_indexes": {
+      "default": [
+        [
+          0,
+          2,
+          1
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          1,
+          0,
+          2
+        ],
+        [
+          2,
+          1,
+          0
+        ]
+      ],
+      "items": {
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "title": "Shuffle Indexes",
+      "type": "array"
+    },
+    "task": {
+      "$ref": "#/$defs/TaskType"
+    },
+    "thetha": {
+      "default": [
+        5.0,
+        -5.0
+      ],
+      "items": {
+        "type": "number"
+      },
+      "title": "Thetha",
+      "type": "array"
+    },
+    "transformer": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TransformerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "type_output": {
+      "default": "2d",
+      "enum": [
+        "2d",
+        "3d"
+      ],
+      "title": "Type Output",
+      "type": "string"
+    },
+    "weight_decay": {
+      "default": 1e-06,
+      "minimum": 0,
+      "title": "Weight Decay",
+      "type": "number"
+    },
+    "weighted_loss": {
+      "default": false,
+      "title": "Weighted Loss",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "task",
+    "backbone_type",
+    "n_classes",
+    "input_height",
+    "input_width"
+  ],
+  "title": "SBBConfig",
+  "type": "object"
+}
