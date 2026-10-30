@@ -279,16 +279,12 @@ class ViTResNet50UNet(_ViTBackbone):
         task: TaskType | None = TaskType.SEGMENTATION,
         *,
         pretrained: bool = True,
-        image_fusion: bool | None = None,
-        fusion_channels: int = 32,
-        logits_norm: bool | None = None,
     ) -> None:
         from sbb_pytorch.models.base import (
             RESNET_LEVELS,
             ResNetEncoder,
             SegmentationHead,
             UNetDecoder,
-            resolve_head,
         )
 
         encoder = ResNetEncoder("resnet50", pretrained=pretrained)
@@ -310,16 +306,11 @@ class ViTResNet50UNet(_ViTBackbone):
         self.patch_size_x, self.patch_size_y = patch_size_x, patch_size_y
         self.mlp_head_units = tuple(mlp_head_units)
         self.encoder = encoder
-        self.decoder = UNetDecoder(encoder.channels, (1024, 512, 256, 128, 64), pairing="aligned")
-        # This class is always ``pairing="aligned"``, so both flags resolve exactly as they do on
-        # ``UNet``; the rules live in ``resolve_head``.
-        fused, normalise = resolve_head(image_fusion, "aligned", logits_norm, task)
+        self.decoder = UNetDecoder(encoder.channels, (1024, 512, 256, 128, 64))
         self.head = SegmentationHead(
             self.decoder.output_channels,
             n_classes,
-            image_fusion=fused,
-            fusion_channels=fusion_channels,
-            logits_norm=normalise,
+            logits_norm=task is TaskType.SEGMENTATION,
         )
         self.n_classes = n_classes
         self.input_height, self.input_width = input_height, input_width
@@ -340,8 +331,8 @@ class ViTResNet50UNet(_ViTBackbone):
             self.patch_size_x,
         )
         features[-1] = refined  # the transformer output replaces f5 as the decoder's deepest input
-        # The head sizes its output to ``x`` itself -- with fusion on, that is where the class map
-        # is computed; with it off, the head resizes the decoder's map back to the input.
+        # The head concatenates ``x`` onto the decoder's map, so the class map is computed at the
+        # input's own resolution from the input's own pixels.
         return self.head(self.decoder(features), x)
 
 
@@ -363,9 +354,6 @@ class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
         task: TaskType | None = TaskType.SEGMENTATION,
         *,
         pretrained: bool = True,
-        image_fusion: bool | None = None,
-        fusion_channels: int = 32,
-        logits_norm: bool | None = None,
     ) -> None:
         super().__init__()
         declared = _check_declared(
@@ -391,9 +379,6 @@ class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
             input_width,
             backbone="resnet50",
             pretrained=pretrained,
-            image_fusion=image_fusion,
-            fusion_channels=fusion_channels,
-            logits_norm=logits_norm,
             task=task,
         )
         self.n_classes = n_classes

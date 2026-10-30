@@ -28,6 +28,7 @@ instead of a ``KeyError`` from a half-built module.
 from __future__ import annotations
 
 from sbb_pytorch.models.base import (
+    FUSION_CHANNELS,
     RESNET_LEVELS,
     RESNET_STRIDES,
     AttentionBlock,
@@ -37,7 +38,6 @@ from sbb_pytorch.models.base import (
     UNetDecoder,
     probs,
     resize_to_input,
-    resolve_head,
 )
 from sbb_pytorch.models.heads import (
     EnhancementModel,
@@ -48,7 +48,6 @@ from sbb_pytorch.models.heads import (
 from sbb_pytorch.models.registry import MODEL_REGISTRY, create_model, model_name
 from sbb_pytorch.models.unet import (
     FULL_DECODER_CHANNELS,
-    FUSION_CHANNELS,
     LIGHT_DECODER_CHANNELS,
     ResNet50UNet,
     ResNet50UNetLight,
@@ -98,7 +97,6 @@ __all__ = [
     "patchify",
     "probs",
     "resnet_features",
-    "resolve_head",
     "resize_to_input",
     "unpatch",
 ]

@@ -4,7 +4,8 @@
 classes differing only in their decoder channel list; each rebuilt the encoder from scratch and
 each carried its own (partly broken) decoder. Here both are three lines over a single
 :class:`UNet`, which composes :class:`~sbb_pytorch.models.base.ResNetEncoder`,
-:class:`~sbb_pytorch.models.base.UNetDecoder` and a 1x1 head.
+:class:`~sbb_pytorch.models.base.UNetDecoder` and a
+:class:`~sbb_pytorch.models.base.SegmentationHead`.
 
 Behaviour preserved: the ``n_classes`` / ``input_height`` / ``input_width`` constructor
 signature, ImageNet-pretrained ResNet50 by default, and a ``(B, n_classes, H, W)`` output at the
@@ -16,14 +17,16 @@ Behaviour changed (see ``docs/migration.md``):
 * ``ResNet50UNetLight`` used to return ``softmax`` and ``ResNet50UNet`` raw logits for the same
   task; both now return logits (``output_activation="none"``), because ``CrossEntropyLoss``
   applies ``log_softmax`` itself and feeding it softmaxed values normalises twice.
-* The head is now :class:`~sbb_pytorch.models.base.SegmentationHead`: for
-  ``pairing="aligned"`` it fuses the input image at full resolution through a 32-channel
-  convolution before predicting, which is the stage the port dropped, and it normalises the
-  logits on segmentation tasks the way the upstream head does. ``pairing="legacy"`` keeps the
-  bare ``Conv2d`` its checkpoints were written against.
+* The head is :class:`~sbb_pytorch.models.base.SegmentationHead`: it fuses the input image at
+  full resolution through a 32-channel convolution before predicting -- the stage the port
+  dropped -- and normalises the logits on segmentation tasks, which is what the upstream head
+  does. The old ``head.weight`` is now ``head.classify.weight``.
+* ``pairing="legacy"`` is gone. It existed to load ``models_pytorch.ResNet50UNet`` weights, and
+  there are none, so the off-by-one decoder it built was a second shape standing where the
+  correct one should have been.
 * ``LIGHT_DECODER_CHANNELS`` is ``(512, 512, 256, 128, 64)``: the five widths the upstream light
-  decoder actually has. The old ``(512, 256, 128, 64, 32)`` was copied out of a class that never
-  ran and had merged its full-resolution fusion conv into the last decoder block.
+  decoder actually has. The old ``(512, 256, 128, 64, 32)`` had merged the head's
+  full-resolution fusion conv into the last decoder block and halved everything below the first.
 """
 
 from __future__ import annotations
@@ -34,13 +37,7 @@ import torch
 import torch.nn as nn
 
 from sbb_pytorch.config.models import TaskType
-from sbb_pytorch.models.base import (
-    ResNetEncoder,
-    SegmentationHead,
-    UNetDecoder,
-    probs,
-    resolve_head,
-)
+from sbb_pytorch.models.base import ResNetEncoder, SegmentationHead, UNetDecoder, probs
 
 __all__ = ["ResNet50UNet", "ResNet50UNetLight", "UNet"]
 
@@ -52,39 +49,27 @@ FULL_DECODER_CHANNELS: tuple[int, ...] = (1024, 512, 256, 128, 64)
 #: head's, not a decoder block, so it is not in this list.
 LIGHT_DECODER_CHANNELS: tuple[int, ...] = (512, 512, 256, 128, 64)
 
-#: The width every upstream head uses for its fusion conv, on every model.
-FUSION_CHANNELS: int = 32
-
 Activation = Literal["none", "softmax", "sigmoid"]
 
 
 class UNet(nn.Module):
-    """Segmentation model: ResNet encoder + shared decoder + 1x1 head.
+    """Segmentation model: ResNet encoder + shared decoder + segmentation head.
 
     Args:
         n_classes: Number of output channels (classes).
         input_height: Height the model was configured for. Used for reporting; the output is
-            resized to the *actual* input height so a differently-sized page still lines up.
+            sized to the *actual* input height so a differently-sized page still lines up.
         input_width: Width the model was configured for.
         backbone: Any ResNet in :data:`sbb_pytorch.models.base.RESNET_LEVELS` (``"resnet50"``
             covers both legacy spellings ``RESNET`` and ``NONTRANSFORMER``).
         pretrained: Load ImageNet weights; ``False`` builds the same graph with no network access.
         decoder_channels: Decoder widths, deepest first (see
             :class:`sbb_pytorch.models.base.UNetDecoder`).
-        pairing: ``"aligned"`` for the correct skip pairing, ``"legacy"`` to reproduce
-            ``models_pytorch.ResNet50UNet`` exactly so its checkpoints load.
         attention: Add CBAM attention to each decoder block (the enhancement model's shape).
-        image_fusion: Fuse the input image into the head at full resolution -- the stage the port
-            dropped. ``None`` (default) means ``True`` for ``pairing="aligned"`` and ``False``
-            for ``"legacy"``, whose checkpoint has no fusion weights to fill.
-        fusion_channels: Width of that fusion convolution (``32`` upstream).
-        logits_norm: Batch-normalise the logits, as the upstream segmentation head does. ``None``
-            (default) means ``True`` for a fused head on a segmentation task -- upstream's own
-            rule -- and ``False`` otherwise: an unfused head is the bare ``Conv2d`` a legacy
-            checkpoint was written against, and it has no normalisation weights to fill.
         output_activation: ``"none"`` (default) returns logits; ``"softmax"`` and ``"sigmoid"``
             return probabilities for callers that were trained expecting them.
-        task: Recorded so :meth:`predict_proba` knows whether to use softmax or sigmoid.
+        task: Decides whether the head normalises its logits (upstream: only for segmentation)
+            and is what :meth:`predict_proba` uses to pick softmax or sigmoid.
     """
 
     def __init__(
@@ -96,11 +81,7 @@ class UNet(nn.Module):
         backbone: str = "resnet50",
         pretrained: bool = True,
         decoder_channels: tuple[int, ...] = FULL_DECODER_CHANNELS,
-        pairing: Literal["aligned", "legacy"] = "aligned",
         attention: bool = False,
-        image_fusion: bool | None = None,
-        fusion_channels: int = FUSION_CHANNELS,
-        logits_norm: bool | None = None,
         output_activation: Activation = "none",
         task: TaskType | None = None,
     ) -> None:
@@ -117,18 +98,14 @@ class UNet(nn.Module):
         self.output_activation: Activation = output_activation
 
         self.encoder = ResNetEncoder(backbone, pretrained=pretrained)
-        self.decoder = UNetDecoder(
-            self.encoder.channels, decoder_channels, pairing=pairing, attention=attention
-        )
-        # Both rules come from :func:`~sbb_pytorch.models.base.resolve_head`: only the aligned
-        # head exists upstream, and only a segmentation head is normalised there.
-        fused, normalise = resolve_head(image_fusion, pairing, logits_norm, task)
+        self.decoder = UNetDecoder(self.encoder.channels, decoder_channels, attention=attention)
+        # Upstream normalises the logits exactly when the task is segmentation; that rule is the
+        # head's only per-task behaviour, so it is read from ``task`` rather than repeated at
+        # every call site.
         self.head = SegmentationHead(
             self.decoder.output_channels,
             self.n_classes,
-            image_fusion=fused,
-            fusion_channels=fusion_channels,
-            logits_norm=normalise,
+            logits_norm=task is TaskType.SEGMENTATION,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -158,8 +135,8 @@ class UNet(nn.Module):
 class ResNet50UNet(UNet):
     """The full ResNet50 U-Net (``BackboneType.RESNET`` / ``NONTRANSFORMER``, ``light_model=False``).
 
-    The only legacy variant whose forward pass ran; its decoder pairs skips off-by-one
-    (``[f5, f3, f2, f1, f1]``), so loading its weights needs ``pairing="legacy"``.
+    The only legacy variant whose forward pass ran -- its decoder paired skips off-by-one
+    (``[f5, f3, f2, f1, f1]``), which :class:`UNetDecoder` now builds the upstream way.
     """
 
     def __init__(
@@ -169,10 +146,6 @@ class ResNet50UNet(UNet):
         input_width: int = 224,
         *,
         pretrained: bool = True,
-        pairing: Literal["aligned", "legacy"] = "aligned",
-        image_fusion: bool | None = None,
-        fusion_channels: int = FUSION_CHANNELS,
-        logits_norm: bool | None = None,
         task: TaskType | None = TaskType.SEGMENTATION,
     ) -> None:
         super().__init__(
@@ -182,10 +155,6 @@ class ResNet50UNet(UNet):
             backbone="resnet50",
             pretrained=pretrained,
             decoder_channels=FULL_DECODER_CHANNELS,
-            pairing=pairing,
-            image_fusion=image_fusion,
-            fusion_channels=fusion_channels,
-            logits_norm=logits_norm,
             task=task,
         )
 
@@ -207,10 +176,6 @@ class ResNet50UNetLight(UNet):
         input_width: int = 224,
         *,
         pretrained: bool = True,
-        pairing: Literal["aligned", "legacy"] = "aligned",
-        image_fusion: bool | None = None,
-        fusion_channels: int = FUSION_CHANNELS,
-        logits_norm: bool | None = None,
         task: TaskType | None = TaskType.SEGMENTATION,
     ) -> None:
         super().__init__(
@@ -220,9 +185,5 @@ class ResNet50UNetLight(UNet):
             backbone="resnet50",
             pretrained=pretrained,
             decoder_channels=LIGHT_DECODER_CHANNELS,
-            pairing=pairing,
-            image_fusion=image_fusion,
-            fusion_channels=fusion_channels,
-            logits_norm=logits_norm,
             task=task,
         )
