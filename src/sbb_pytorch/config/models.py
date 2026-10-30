@@ -54,6 +54,7 @@ __all__ = [
     "BackboneType",
     "BlurKind",
     "OptimizerType",
+    "OutputType",
     "TaskType",
     "TransformerConfig",
     "UseCase",
@@ -61,8 +62,33 @@ __all__ = [
     "validate_pair",
 ]
 
-#: Output array shape for generated labels (the legacy ``--type_output`` flag took any string).
-TypeOutput = Literal["2d", "3d"]
+
+class OutputType(str, Enum):
+    """How a label image is written: ``2d`` (class id per pixel) or ``3d`` (RGB).
+
+    The config field used to be ``Literal["2d", "3d"]`` while :mod:`sbb_pytorch.gt.render` kept a
+    second spelling of its own; one definition now serves both, and ``render`` imports it from
+    here. The legacy CLI accepted any string for ``--type_output`` and then fell through both
+    ``if``/``elif`` branches, leaving ``img_poly`` unbound -- an ``UnboundLocalError`` rather than
+    a usage error, which is what ``parse`` replaces.
+    """
+
+    TWO_D = "2d"
+    THREE_D = "3d"
+
+    @classmethod
+    def parse(cls, value: OutputType | str) -> OutputType:
+        """Coerce a CLI string to a member, raising on anything else."""
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(value.strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unknown output type {value!r}; expected '2d' or '3d'") from exc
+
+
+#: The spelling every shipped config and ``config.__init__`` use for the field's type.
+TypeOutput = OutputType
 
 #: What ``train.py --device`` accepted as a free string is now a validated pattern.
 _DEVICE_RE = re.compile(r"^(auto|cpu|mps|cuda(:\d+)?)$")
@@ -118,13 +144,35 @@ class TaskType(str, Enum):
 
 
 class UseCase(str, Enum):
-    """Eynollah page layout use cases, used by the page-to-label mapping."""
+    """What is being labelled -- the one spelling :class:`Page2Label` and
+    :class:`~sbb_pytorch.gt.GroundTruthConfig` share.
 
-    TEXTLINE = "textline"
+    ``gt/generator.py`` used to carry its own seven-member copy while this module shipped five
+    (no ``binarization``, no ``reading_order``), so a value one accepted the other rejected. The
+    generator's set wins: both are real use cases -- ``binarization``'s single class is the print
+    space, and ``reading_order``'s labels come from ``.case`` files -- and the legacy code
+    compared ``config_params['use_case']`` against four string literals with ``or``, then required
+    ``use_case == 'layout'``; any other value fell through both branches and wrote nothing,
+    silently.
+    """
+
     LAYOUT = "layout"
-    PRINTSPACE = "printspace"
-    GLYPH = "glyph"
+    TEXTLINE = "textline"
     WORD = "word"
+    GLYPH = "glyph"
+    PRINTSPACE = "printspace"
+    BINARIZATION = "binarization"
+    READING_ORDER = "reading_order"
+
+    @classmethod
+    def parse(cls, value: UseCase | str) -> UseCase:
+        """Coerce a config string to a member, tolerating case and surrounding whitespace."""
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(value.strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unknown use case {value!r}") from exc
 
 
 class OptimizerType(str, Enum):
@@ -242,6 +290,10 @@ class SBBConfig(BaseModel):
     transformer: TransformerConfig | None = None
     page2label: Page2Label | None = None
     #: Enhancement-task scales (``scales_enhancement.json``), loaded alongside the main config.
+    #: Both legacy repos shipped that file without any code reading it, so the port loads and
+    #: validates it (:func:`~sbb_pytorch.config.loaders.load_scales`) and leaves ``scales`` below
+    #: as the value augmentation actually uses -- folding the two together would move the
+    #: enhancement task away from the numbers the main config declares.
     enhancement_scales: ScalesConfig | None = None
 
     # -------------------------------------------------------------- training
@@ -259,6 +311,11 @@ class SBBConfig(BaseModel):
     gradient_clip_val: float | None = Field(default=None, ge=0)
     precision: Literal["32", "16", "bf16", "32-true", "16-mixed", "bf16-mixed"] = "32-true"
     continue_training: bool = False
+    #: Upstream's checkpoint numbering: ``train.py:178`` asked for the index the next
+    #: ``model_{index}.h5`` should carry when a run continued. ``training/callbacks.py`` names its
+    #: checkpoints ``{stem}-{epoch}-{score}`` instead, so the epoch itself carries that number; the
+    #: field stays because every legacy config file has the key and ``extra="forbid"`` would
+    #: otherwise reject the file outright.
     index_start: int = Field(default=0, ge=0)
     dir_of_start_model: Path | None = None
     weighted_loss: bool = False
@@ -312,7 +369,9 @@ class SBBConfig(BaseModel):
 
     # ------------------------------------------------------------- inference
 
-    type_output: TypeOutput = "2d"
+    type_output: OutputType = OutputType.TWO_D
+    #: ``sbb infer``'s ``--save/--no-save`` default: the flag wins when given, otherwise this
+    #: decides whether predicted images are written at all (see ``cli.infer``).
     save_visualisation: bool = True
 
     @model_validator(mode="before")
@@ -451,10 +510,6 @@ class SBBConfig(BaseModel):
     def from_json(cls, path: str | Path) -> SBBConfig:
         """Read and validate a main config file (``config_params.json`` and friends)."""
         return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
-
-    def json_schema(self) -> dict[str, Any]:
-        """The generated JSON schema -- what ``docs/config-reference.md`` is rendered from."""
-        return type(self).model_json_schema()
 
     def warnings(self) -> list[str]:
         """Advisory problems worth printing before a run: real, but not worth refusing to start.

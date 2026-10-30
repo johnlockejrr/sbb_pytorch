@@ -1,4 +1,4 @@
-"""Run a trained checkpoint on a page: single shot, sliding window, or a directory of files.
+"""Run a trained checkpoint on a page: single shot, or a sliding window of tiles.
 
 The legacy ``SBBPredict`` was one class that read the image differently per entry point, resized
 its own outputs with the wrong interpolation and had two features that were literally ``pass``
@@ -182,7 +182,9 @@ class Predictor:
 
     # ------------------------------------------------------------------ single page
 
-    def predict(self, image: np.ndarray | str | Path, *, patches: bool = False) -> Prediction:
+    def predict(
+        self, image: np.ndarray | str | Path, *, patches: bool = False, overlap: float = 0.5
+    ) -> Prediction:
         """Predict on one page, given as an array or a path.
 
         Args:
@@ -190,27 +192,26 @@ class Predictor:
                 returned prediction so the overlay can be drawn at the page's own resolution.
             patches: Run the sliding-window path instead of downscaling the whole page -- the
                 behaviour ``--patches`` was supposed to have and did not (see :meth:`predict_grid`).
+            overlap: Sliding-window overlap, forwarded to :meth:`predict_grid`; it applies only
+                when ``patches`` is set, which is why ``sbb infer --overlap`` needs ``--patches``.
         """
         path = None if isinstance(image, np.ndarray) else Path(image)
-        page = image if path is None else read_image(path)
-        tensor = self._to_tensor(np.asarray(page))
+        page = np.asarray(image if path is None else read_image(path))
 
-        logits = self._forward(tensor)
-        if patches:  # the whole-page pass above becomes the first tile of a tiled pass
-            logits = self.predict_grid(np.asarray(page))
-        return self._make_prediction(np.asarray(page), logits[0], path)
+        # _forward returns a batch axis to index off; predict_grid returns the (n_classes, H, W)
+        # field directly. The old code ran the whole-page pass, threw that result away when patches
+        # was set, and still indexed [0] off the grid -- the page's first row, not its class axis.
+        if patches:
+            logits = self.predict_grid(page, overlap=overlap)
+        else:
+            logits = self._forward(self._to_tensor(page))[0]
+        return self._make_prediction(page, logits, path)
 
-    def predict_file(self, path: str | Path, *, patches: bool = False) -> Prediction:
-        """``predict(path)`` -- the name the CLI's ``--image`` flag calls."""
-        return self.predict(path, patches=patches)
-
-    def predict_files(self, paths: list[Path]) -> list[Prediction]:
-        """Predict on a whole directory (the CLI renders the rich progress bar around this)."""
-        return [self.predict_file(path) for path in paths]
-
-    def predict_batch(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Raw forward on an already-prepared ``(B, 3, H, W)`` tensor, no post-processing."""
-        return self._forward(tensor.to(self.device))
+    def predict_file(
+        self, path: str | Path, *, patches: bool = False, overlap: float = 0.5
+    ) -> Prediction:
+        """``predict(path)`` -- the name the CLI's ``-i/--input`` loop calls per page."""
+        return self.predict(path, patches=patches, overlap=overlap)
 
     def predict_grid(self, page: np.ndarray, *, overlap: float = 0.5) -> torch.Tensor:
         """Tiled inference: average the logits of overlapping ``input_height x input_width`` tiles.

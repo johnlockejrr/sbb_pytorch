@@ -3,8 +3,9 @@
 * :mod:`sbb_pytorch.config.models` -- the schema (:class:`~sbb_pytorch.config.models.SBBConfig`).
 * :mod:`sbb_pytorch.config.loaders` -- the functions that read a config file.
 
-The equivalent of ``sbb_pytorch.config.json_schema()`` for documenting every field is
-``SBBConfig.model_json_schema()``, which is also dumped to ``docs/config-reference.json``.
+Every field is documented by ``SBBConfig.model_json_schema()``, which
+:func:`~sbb_pytorch.config.loaders.dump_json_schema` writes to
+``docs/config-reference.json`` (``sbb config-schema`` runs it).
 """
 
 from __future__ import annotations

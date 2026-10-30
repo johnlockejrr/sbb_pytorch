@@ -1,19 +1,22 @@
 """Tests for :mod:`sbb_pytorch.gt` -- ALTO/PageXML in, label images out.
 
-The five ``gt`` modules are covered here at unit level; until now they were only reached through
+The six ``gt`` modules are covered here at unit level; until now they were only reached through
 the CLI paths of ``tests/test_cli.py``. Expected values are derived from the geometry or from the
 legacy contract each docstring states rather than read back off the implementation: contour areas
 are ``cv2.contourArea`` arithmetic written out, a rendered label image is compared pixel-for-pixel
 against the derived view it claims to be, and the pair builder is checked against the ``n*(n-1)``
 count its module header promises.
 
-Where the port contradicts its own docstring the test pins what the code does today and carries a
-``# TODO:`` naming it -- a float64 contour OpenCV refuses to measure, a bare-int canvas size
-``mask_of`` documents but cannot parse (and a multi-channel canvas it fills in one channel only), a
-rotated rectangle that collapses for every angle but 90, a class id built from ``hash()`` (which
-CPython randomises per process), a ``Coords/@points`` value that may not be fractional while its
-``<Point>`` twin may, and the ``0`` the renderer uses for background that a page-to-label config
-starting at class ``1`` does not declare.
+The seven behaviours still marked with a ``# TODO(file:line)`` -- asserting what the code did rather
+than what it documented -- are now asserted as correct: a ``float64`` contour is widened before
+OpenCV measures it, ``mask_of`` takes the bare-int canvas its docstring advertises and fills every
+channel of a multi-channel canvas, the rotated rectangle is the inscribed rectangle at every angle
+instead of only at 90, a ``Coords/@points`` value may be fractional like its ``<Point>`` twin, a
+document's own encoding declaration is honoured before the legacy ``iso-8859-5`` fallback, and
+``num_col`` yields the digits up to the next delimiter. Each test names the legacy source the
+expectation was derived from. The two defects that header listed besides them -- the class id built
+on the per-process ``hash()``, now ``zlib.crc32``, and the background id that skipped the range
+check -- had been fixed already, and their tests say so.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import cv2
 import numpy as np
 import pytest
 
-from sbb_pytorch.gt import generator, geometry, parser, reading_order, render
+from sbb_pytorch.gt import generator, geometry, parser, reading_order, render, writer
 
 NS = "http://schema.primaresearch.org/PAGE/gts/schema/v2019.07.24"
 
@@ -276,18 +279,19 @@ def test_parse_coords_points_shapes(raw: str, expected: list[list[int]] | None) 
     assert (None if got is None else got.tolist()) == expected
 
 
-def test_fractional_points_are_rejected_while_point_children_round(tmp_path: Path) -> None:
-    """``@points`` may not hold a fraction, though the ``<Point>`` encoding of the same number can.
+def test_fractional_coords_are_truncated_by_both_encodings(tmp_path: Path) -> None:
+    """``@points`` and ``<Point>`` now share one conversion, so a fraction costs nothing but itself.
 
-    ``_parse_coords_points`` casts the strings with ``np.asarray(..., dtype=np.int32)``, which
-    raises :class:`ValueError` on ``"1.5"`` and escapes :func:`parse_pagexml` uncaught (not even a
-    ``PageXMLError``), while ``_contour_of`` for ``<Point>`` children does ``int(float(x))`` and
-    silently truncates. The second half of the test pins that asymmetry.
+    The port used to write ``np.asarray(pairs, dtype=np.int32)`` for ``@points`` -- which raises
+    :class:`ValueError` on ``"1.5"``, escaping :func:`parse_pagexml` uncaught and costing the whole
+    page -- and ``int(float(x))`` for ``<Point>``, which truncates, exactly as the legacy Point
+    reader did (``gt_gen_utils.py:197``). Both paths are asserted on the same three numbers: the
+    fix was to give ``@points`` the conversion that never loses a page, not to invent a rounding
+    rule either path documents.
     """
-    # TODO(parser.py:145): the @points path raises instead of rounding the way the Point path does,
-    # so a page whose coordinates are floats cannot be labelled at all. Assert current behaviour.
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        parser._parse_coords_points("1.5,2.5 3.5,4.5 5.5,6.5")
+    fractional = parser._parse_coords_points("1.5,2.5 3.5,4.5 5.5,6.5")
+    assert fractional is not None
+    assert fractional.tolist() == [[1, 2], [3, 4], [5, 6]]  # truncated, as `int(float)` does
 
     points = parser.parse_pagexml(
         write_xml(
@@ -364,12 +368,15 @@ def test_missing_file_is_a_page_xml_error_not_an_oserror(tmp_path: Path) -> None
         parser.parse_pagexml(tmp_path / "missing.xml")
 
 
-def test_every_file_is_decoded_as_iso_8859_5(tmp_path: Path) -> None:
-    """The legacy tool read every PageXML as iso-8859-5, and the port keeps that single encoding.
+def test_the_declared_encoding_wins_and_iso_8859_5_is_the_fallback(tmp_path: Path) -> None:
+    """The XML declaration is read first, with ``DEFAULT_XML_ENCODING`` behind it.
 
-    ``DEFAULT_XML_ENCODING`` is the whole policy: an iso-8859-5 file round-trips (first assert),
-    while a UTF-8-authored page -- what a modern editor writes -- arrives as two mojibake
-    characters (second), because the explicit parser encoding wins over ``encoding="UTF-8"``.
+    The legacy readers passed ``ET.XMLParser(encoding='iso-8859-5')`` for every file
+    (``gt_gen_utils.py:145``), and an explicit ``encoding`` *overrides* the declaration instead of
+    reading it -- so a UTF-8-authored page, what a modern editor writes, arrived as two mojibake
+    characters, which is what this test used to pin. Both spellings of the same text now read back
+    as ``Ю``: the iso-8859-5 bytes whose ``encoding="UTF-8"`` declaration cannot decode them, which
+    the fallback rescues, and the UTF-8 bytes that declaration correctly names.
     """
     assert parser.DEFAULT_XML_ENCODING == "iso-8859-5"
     cyrillic = xml_document(
@@ -384,14 +391,10 @@ def test_every_file_is_decoded_as_iso_8859_5(tmp_path: Path) -> None:
         .text
         == "Ю"
     )
-
-    utf8 = parser.parse_pagexml(write_xml(tmp_path, "utf8.xml", cyrillic))  # same text, UTF-8
-    assert utf8.regions[0].text is not None and len(utf8.regions[0].text) == 2
-    assert utf8.regions[0].text != "Ю"
-    # TODO(parser.py:307): the parser encoding is passed explicitly, so a document declaring
-    # encoding="UTF-8" is still decoded as iso-8859-5 and its text arrives mangled. Reading the
-    # declaration (or defaulting to UTF-8, which the XML spec requires) would fix it.
-    (tmp_path / "utf8.xml").unlink()  # keep tmp_path tidy for the sibling assertion below
+    # Same text, same document, UTF-8 bytes: the declaration the file really satisfies.
+    assert parser.parse_pagexml(write_xml(tmp_path, "utf8.xml", cyrillic)).regions[0].text == "Ю"
+    # A document with no declaration takes the XML spec's default, not the legacy codec.
+    assert parser._declared_encoding(b"<PcGts/>") == parser._XML_DEFAULT_ENCODING
 
 
 def test_discover_xml_files_and_image_lookup(tmp_path: Path) -> None:
@@ -436,11 +439,11 @@ def test_discover_xml_files_and_image_lookup(tmp_path: Path) -> None:
         ("<Metadata><Comments/></Metadata>", None),
         ("<Metadata><Labels><Label content='num_col0777'/></Labels></Metadata>", None),
         ("", None),
-        # A two-column page lists both widths; the port concatenates every digit it finds after
-        # the marker instead of stopping at the comma. The shipped tool writes exactly
-        # "#num_col0456, num_col1500" for such a page, so 4561500 is what drives the resize.
-        # TODO(parser.py:345): take the digits between the marker and the next delimiter.
-        ("<Metadata><Comments>#num_col0456, num_col1500</Comments></Metadata>", 4561500),
+        # A two-column page lists both widths, exactly as the shipped tool writes them. The value
+        # is the digit run between the marker and the comma -- what the legacy
+        # `int(text_comments.split('num_col')[1])` (gt_gen_utils.py:164) reads, and what it raised
+        # on for this very string -- where the port read 4561500 by keeping every later digit too.
+        ("<Metadata><Comments>#num_col0456, num_col1500</Comments></Metadata>", 456),
     ],
 )
 def test_columns_width_only_ever_reads_comments(
@@ -596,10 +599,11 @@ def test_page_collection_helpers_and_constants(tmp_path: Path) -> None:
     ("contour", "expected"),
     [
         (RECT, 300.0),  # 20 x 15 closed polygon
-        (RECT.astype(np.float32), 300.0),  # the other dtype OpenCV measures
+        (RECT.astype(np.float32), 300.0),  # the other dtype OpenCV measures natively
         (np.asarray(RECT, dtype=np.uint16), 300.0),
         (np.asarray(RECT, dtype=np.int64), 300.0),
         (np.asarray(RECT, dtype=np.uint8), 300.0),
+        (np.asarray(RECT, dtype=np.float64), 300.0),  # widened, no longer an OpenCV error
         (TRIANGLE, 6.0),  # the 3-4-5 triangle: 4 * 3 / 2
         (COLLINEAR, 0.0),  # three collinear points enclose nothing
         (np.array([[0, 0], [4, 5]], dtype=np.int32), 0.0),  # two points are not a polygon
@@ -609,23 +613,22 @@ def test_page_collection_helpers_and_constants(tmp_path: Path) -> None:
         (np.stack([RECT, RECT]).astype(np.int32), 600.0),  # a stacked pair is measured summed
     ],
 )
-def test_contour_area_accepts_every_shape_but_one_dtype(
-    contour: np.ndarray, expected: float
-) -> None:
-    """``cv2.contourArea`` arithmetic for every accepted shape, and the one dtype it refuses.
-
-    # TODO(geometry.py:91): the whitelist accepts float32 but not float64, the dtype numpy hands
-    # back after almost any arithmetic (``contour * 2.0``, ``cv2.transform`` output promoted, a
-    # JSON round-trip), so measuring a derived contour raises ``cv2.error`` where the closely
-    # related float32 works. Assert current behaviour.
-    """
+def test_contour_area_accepts_every_shape_and_dtype(contour: np.ndarray, expected: float) -> None:
+    """``cv2.contourArea`` arithmetic for every shape and dtype a contour arrives as."""
     assert geometry.contour_area(contour) == pytest.approx(expected)
 
 
-def test_contour_area_rejects_float64() -> None:
-    """A float64 copy of a measurable contour raises ``cv2.error`` (see the TODO above)."""
-    with pytest.raises(cv2.error, match="Assertion failed"):
-        geometry.contour_area(np.asarray(RECT, dtype=np.float64))
+def test_contour_area_widens_float64_instead_of_refusing_it() -> None:
+    """``float64`` -- the dtype almost any numpy arithmetic hands back -- is cast, not refused.
+
+    ``cv2.contourArea`` measures ``int32`` and ``float32`` points only, but the whitelist this test
+    used to pin listed ``float64`` as already measurable and handed it over unconverted, so
+    ``contour * 2.0``, a promoted ``cv2.transform`` output or a JSON round-trip raised ``cv2.error``
+    where the closely related ``float32`` worked. Every dtype now goes through the one narrowing
+    :func:`geometry._as_cv_contour` does for all four OpenCV entry points.
+    """
+    assert geometry.contour_area(np.asarray(RECT, dtype=np.float64)) == pytest.approx(300.0)
+    assert geometry.contour_area(np.asarray(RECT * 2, dtype=np.float64)) == pytest.approx(1200.0)
 
 
 @pytest.mark.parametrize(
@@ -695,45 +698,44 @@ def test_mask_of_rasterises_any_contour_shape(
 @pytest.mark.parametrize(
     "contour", [np.zeros((0, 2), dtype=np.int32), np.asarray(RECT, dtype=np.uint8)]
 )
-def test_mask_of_refuses_the_contours_fillpoly_cannot_take(contour: np.ndarray) -> None:
-    """An empty or uint8 contour escapes as a raw ``cv2.error`` instead of being widened.
+def test_mask_of_widens_the_contours_fillpoly_cannot_take(contour: np.ndarray) -> None:
+    """An empty or ``uint8`` contour is normalised instead of raising ``cv2.error``.
 
-    # TODO(geometry.py:178): ``mask_of`` hands the contour straight to ``cv2.fillPoly``, which
-    # takes ``int32``/``float32`` only, while :func:`contour_area` widens any other dtype first
-    # exactly because of that. A ``np.zeros((0, 2))`` -- which ``contour_area`` reports as 0.0 --
-    # and a uint8 view of a measurable rectangle both raise instead of rasterising.
+    ``cv2.fillPoly`` takes ``int32`` points only -- a rule :func:`geometry.contour_area` applied
+    while ``mask_of`` handed the contour over raw, so a ``uint8`` view of a measurable rectangle and
+    a ``np.zeros((0, 2))`` both raised. The conversion now lives in :func:`geometry._as_cv_contour`,
+    which both call, and a point-less contour paints nothing onto an otherwise blank canvas instead
+    of being handed to ``fillPoly`` at all.
     """
-    with pytest.raises(cv2.error, match="Assertion failed"):
-        geometry.mask_of(contour, (40, 40))
+    mask = geometry.mask_of(contour, (40, 40), fill_value=1)
+    assert mask.dtype == np.uint8
+    assert int((mask > 0).sum()) == (336 if contour.shape[0] else 0)
 
 
-def test_mask_of_accepts_a_one_element_shape_but_not_a_bare_int() -> None:
-    """``shape`` may be ``(40,)`` -- documented as a square -- but not the bare int ``40``.
+def test_mask_of_accepts_the_bare_int_canvas_it_documents() -> None:
+    """``shape`` accepts the bare int ``40`` as well as ``(40,)`` and ``(40, 40)``.
 
-    # TODO(geometry.py:173): ``target = tuple(shape)`` accepts a sequence only, so the plain-int
-    # form the docstring advertises ("``(H, W)``, ``(H, W, C)`` or an int square") raises
-    # ``TypeError: 'int' object is not iterable``. ``render.label_image`` has the same shape
-    # handling and the same gap.
+    ``target = tuple(shape)`` accepted a sequence only, so the plain-int form the docstring
+    advertises raised ``TypeError: 'int' object is not iterable``. ``render._hw`` and
+    ``render.label_image`` take the same form now; see
+    ``test_label_image_is_empty_background_without_entries``.
     """
     assert geometry.mask_of(RECT, (40,)).shape == (40, 40)
-    with pytest.raises(TypeError, match="'int' object is not iterable"):
-        geometry.mask_of(RECT, 40)  # type: ignore[arg-type]
+    assert geometry.mask_of(RECT, 40).shape == (40, 40)
+    assert np.array_equal(geometry.mask_of(RECT, 40), geometry.mask_of(RECT, (40, 40)))
 
 
-def test_mask_of_paints_one_channel_of_a_multichannel_canvas() -> None:
-    """A multi-channel canvas gets its channel 0 only, contradicting "broadcast to all channels".
+def test_mask_of_paints_every_channel_of_a_multichannel_canvas() -> None:
+    """The fill is broadcast across the channels, as the docstring promises it is.
 
-    ``cv2.fillPoly`` with a scalar colour writes the first channel of a multi-channel image, so
-    ``fill_value=7`` on a ``(40, 40, 3)`` canvas paints 2352 in channel 0 and leaves 0 in the
-    other two. The docstring says the fill is broadcast.
-
-    # TODO(geometry.py:178): pass ``(fill_value,) * channels`` (or broadcast afterwards) so every
-    # channel receives the fill the docstring promises.
+    ``cv2.fillPoly`` with a scalar colour writes only the first channel of a multi-channel image,
+    so ``fill_value=7`` on a ``(40, 40, 3)`` canvas used to paint 2352 in channel 0 and leave the
+    other two at 0; the colour is now passed as ``(fill_value,) * channels``.
     """
     canvas = geometry.mask_of(RECT, (40, 40, 3), fill_value=7)
     assert canvas.shape == (40, 40, 3)
     assert int(canvas[..., 0].sum()) == 336 * 7
-    assert int(canvas[..., 1:].sum()) == 0
+    assert int(canvas[..., 1:].sum()) == 2 * 336 * 7  # the two channels the scalar left empty
 
 
 @pytest.mark.parametrize(
@@ -981,23 +983,29 @@ def test_largest_contour_and_the_merged_bounding_box() -> None:
 @pytest.mark.parametrize(
     ("width", "height", "angle", "expected"),
     [
-        (100, 50, 90, [[0, 0], [100, 0], [100, 50], [0, 50]]),  # the only non-degenerate answer
-        (100, 50, 0, [[7, 32], [50, 25], [93, 18], [50, 25]]),  # a collapsed quad, twice vertex 1
-        (100, 50, 180, [[7, 32], [50, 25], [93, 18], [50, 25]]),  # 180 behaves like 0
-        (100, 50, 45, [[-1, -1], [-1, -1], [-1, -1], [-1, -1]]),  # the OpenCV "not a rect" value
-        (100, 50, 30, [[0, 3], [50, 25], [99, 47], [50, 25]]),  # degenerate for 30 as well
-        (0, 50, 30, [[-1, -1], [-1, -1], [-1, -1], [-1, -1]]),  # zero width
+        (100, 50, 0, [[0, 0], [100, 0], [100, 50], [0, 50]]),  # unrotated: the page itself
+        (100, 50, 180, [[0, 0], [100, 0], [100, 50], [0, 50]]),  # 180 is the same rotation
+        # 50 x 100: taller than the page, so the corners leave the canvas.
+        (100, 50, 90, [[25, -25], [75, -25], [75, 75], [25, 75]]),
+        (100, 50, 45, [[32, 7], [68, 7], [68, 43], [32, 43]]),  # the 35.36 x 35.36 square at 45
+        (100, 50, 30, [[25, 11], [75, 11], [75, 39], [25, 39]]),  # 50 x 28.87 at 30
+        (50, 100, 30, [[11, 25], [39, 25], [39, 75], [11, 75]]),  # the same on a portrait page
+        (0, 50, 30, [[-1, -1], [-1, -1], [-1, -1], [-1, -1]]),  # zero width: nothing to inscribe
         (-3, 50, 30, [[-1, -1], [-1, -1], [-1, -1], [-1, -1]]),  # negative width
     ],
 )
 def test_rotated_rect_with_max_area_corner_cases(
     width: int, height: int, angle: int, expected: list[list[int]]
 ) -> None:
-    """An axis-aligned rectangle only measures correctly at 90 degrees.
+    """The rectangle the legacy formula inscribes, at every angle the port used to collapse.
 
-    # TODO(geometry.py:541): for every other angle the port returns a degenerate polygon (either
-    # the ``[-1, -1]`` sentinel or a quad with a repeated vertex) instead of the inscribed
-    # rectangle of that orientation, so the helper is usable only for axis-aligned input.
+    The sizes are :func:`utils.rotatedRectWithMaxArea`'s (``geometry.py`` cited it as the port but
+    computed only 90 degrees; every other angle came back as the ``[-1, -1]`` sentinel or a quad
+    with a repeated vertex) and the placement is the one its caller ``utils.py:346`` used, centred
+    on ``w // 2, h // 2``: 100 x 50 unrotated is the page itself, at 90 it is 50 x 100 -- taller
+    than the page, hence the corners at ``y = -25`` and ``y = 75`` that the legacy negative ``y1``
+    produced -- at 45 the half-constrained ``0.5 * 50 / sin 45`` square, at 30 the
+    ``25 / sin 30`` x ``25 / cos 30`` one. ``[-1, -1]`` survives only where there is no page.
     """
     rect = geometry.rotated_rect_with_max_area(width, height, angle)
     assert rect.dtype == np.int32
@@ -1084,6 +1092,7 @@ def test_label_image_rasterises_any_contour_shape(
 
 def test_label_image_is_empty_background_without_entries() -> None:
     assert render.label_image([], (5, 5)).tolist() == [[0] * 5] * 5
+    assert render.label_image([], 5).shape == (5, 5), "a bare int edge means a square canvas"
     assert render.label_image([], (2, 3), background=4).tolist() == [[4, 4, 4], [4, 4, 4]]
 
 
@@ -2181,3 +2190,111 @@ def test_palette_pins_the_boundary_and_printspace_colours(tmp_path: Path) -> Non
 def test_labelled_contours_pairs_every_contour_with_one_label() -> None:
     assert generator.labelled_contours([RECT, TRIANGLE], np.int64(5)) == [(RECT, 5), (TRIANGLE, 5)]
     assert generator.labelled_contours([], 5) == []
+
+
+# ------------------------------------------------------------------------------------- writer
+
+
+def test_a_parsed_page_written_and_parsed_again_is_the_same_page(tmp_path: Path) -> None:
+    """``parse_pagexml(write_pagexml(page))`` gives back the page it was given, field for field.
+
+    The shared :data:`PAGE_XML` is the fixture the rest of the file shares -- print space, three text
+    regions of two types, one image region, and a reading order deliberately *not* in document order
+    -- so one call exercises every element the writer has to reproduce, including the two it derives
+    rather than stores (``printspace_bbox`` from the contour, ``region_index`` from the
+    ``RegionRefIndexed`` elements) and the ``@ID`` spelling the fixture uses where the schema now
+    spells it ``@id``.
+    """
+    page = standard_page(tmp_path)
+    again = parser.parse_pagexml(writer.write_pagexml(page, tmp_path / f"{page.file_name}.xml"))
+
+    assert again.file_name == page.file_name  # @imageFilename comes from the page, not the new path
+    assert (again.height, again.width) == (page.height, page.width)
+    assert again.columns_width == page.columns_width
+    assert again.printspace_contour.tolist() == page.printspace_contour.tolist()
+    assert again.printspace_bbox == page.printspace_bbox
+    assert again.region_index == page.region_index  # the order survives, unsorted as it is
+    assert [
+        (r.kind, r.type_name, r.region_id, r.contour.tolist(), r.text) for r in again.regions
+    ] == [(r.kind, r.type_name, r.region_id, r.contour.tolist(), r.text) for r in page.regions]
+
+
+@pytest.mark.parametrize(
+    ("name", "document"),
+    [
+        ("000123456-1800", PAGE_XML),
+        (
+            "widths",
+            xml_document(
+                '<TextRegion ID="a" type="header">'
+                '<Coords points="0,0 8,0 8,8 0,8"/>'
+                "<TextEquiv><Unicode>Hallo</Unicode></TextEquiv></TextRegion>",
+                width=40,
+                height=30,
+                metadata="<Metadata><Comments>#num_col0456, num_col1500</Comments></Metadata>",
+            ),
+        ),
+        ("empty", xml_document("", width=10, height=10)),
+        (
+            "noprefix",
+            xml_document(
+                '<TextRegion ID="a"><Coords points="0,0 8,0 8,8 0,8"/></TextRegion>',
+                width=10,
+                height=10,
+                namespace="",
+            ),
+        ),
+        (
+            "pointchildren",
+            xml_document(
+                '<TextRegion ID="p"><Point x="1.5" y="2"/><Point x="3" y="4.9"/>'
+                '<Point x="5" y="6"/></TextRegion>',
+                width=9,
+                height=9,
+            ),
+        ),
+    ],
+)
+def test_a_page_written_twice_is_the_same_bytes(tmp_path: Path, name: str, document: str) -> None:
+    """Byte-identical output, and the written file as a fixed point of the round trip.
+
+    The v3 generator could not make this promise: it stamped ``datetime.now`` into
+    ``Created``/``LastChange`` (``inference.py:791-795``) and named every region from
+    ``uuid.uuid4()`` (``inference.py:766-767``), so two writes of one page were two files and the
+    ids the parser had read were gone. Nothing here reads a clock or a generator, so the second
+    write -- and the write of the page read back from the first -- is the same text, which is what
+    lets :command:`sbb infer --xml-file` annotate a page without churning it.
+    """
+    page = parser.parse_pagexml(write_xml(tmp_path, f"{name}.xml", document))
+    text = writer.to_pagexml(page)
+
+    assert writer.to_pagexml(page) == text  # no timestamp, no uuid: the page decides the bytes
+    assert writer.write_pagexml(page, tmp_path / f"{name}.xml").read_text() == text
+    assert writer.to_pagexml(parser.parse_pagexml(tmp_path / f"{name}.xml")) == text
+
+
+def test_points_attribute_is_the_string_both_readers_expect() -> None:
+    """``"x,y x,y ..."`` -- ``inference.py:842-844`` and the inverse of ``parser.py:159-170``."""
+    assert writer.points_attribute(RECT) == "10,20 30,20 30,35 10,35"
+    assert writer.points_attribute(TRIANGLE) == "0,0 4,0 0,3"
+    # Coordinates are ints by the time the parser stores them (``parser.py:146-156`` truncates the
+    # fractional ones), so widening the dtype here cannot change a single byte of the output.
+    assert writer.points_attribute(np.asarray(RECT, dtype=np.float64)) == "10,20 30,20 30,35 10,35"
+    with pytest.raises(ValueError, match="empty contour"):
+        writer.points_attribute(np.empty((0, 2), dtype=np.int32))
+
+
+def test_write_pagexml_keeps_a_name_that_says_xml_and_otherwise_adds_it(tmp_path: Path) -> None:
+    """``writer.py`` follows ``eynollah/writer.py:34`` (``<stem>.xml``) for a nameless target.
+
+    The two upstream writers disagreed -- eynollah assembled ``<stem>.xml`` from the page, v3 wrote
+    the path the flag held (``inference.py:835-837``) -- so a path that already names a file is used
+    as given and anything else gains the extension, which is also what stops ``--xml-file out`` from
+    writing an extension-less file, and what lets it name a directory.
+    """
+    page = standard_page(tmp_path)
+    assert writer.write_pagexml(page, tmp_path / "copy") == tmp_path / "copy.xml"
+    assert writer.write_pagexml(page, tmp_path / "deep/nested") == tmp_path / "deep/nested.xml"
+    named = tmp_path / "explicit.xml"
+    assert writer.write_pagexml(page, named) == named
+    assert named.read_text() == writer.to_pagexml(page)

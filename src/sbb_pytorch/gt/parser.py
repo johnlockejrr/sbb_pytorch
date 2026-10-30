@@ -19,19 +19,30 @@ The legacy code derived the namespace prefix with ``alltags[0].split('}')[0] + '
 which yields the nonsense prefix ``"PcGts}"`` for a namespace-less document and
 then leaves ``imageHeight``/``imageWidth`` unbound.  :func:`_namespace_prefix`
 derives it from the ``{uri}tag`` convention instead and falls back to no prefix.
+
+The byte encoding is read the same way round: the legacy readers passed
+``ET.XMLParser(encoding='iso-8859-5')``, and an explicit ``encoding`` *overrides* the
+document's own declaration, so a UTF-8-authored page arrived as mojibake.
+:func:`_parse_tree` honours the declaration -- UTF-8 by the XML spec's default when the
+file omits one -- and keeps :data:`DEFAULT_XML_ENCODING` as the fallback that still
+reads the legacy corpus.
 """
 
 from __future__ import annotations
 
+import io
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import takewhile
 from pathlib import Path
 from typing import Final
 
 import numpy as np
 
+from ..exceptions import PageXMLError
 from .geometry import contour_bbox
 
 __all__ = [
@@ -49,15 +60,12 @@ __all__ = [
     "parse_pagexml",
 ]
 
-#: Encoding the legacy tool used for every PageXML file.
+#: Encoding the legacy tool used for every PageXML file, and the fallback here when a
+#: document's own declaration cannot decode it (see :func:`_parse_tree`).
 DEFAULT_XML_ENCODING: Final = "iso-8859-5"
 
 #: A polygon as consumed by OpenCV: ``(N, 2)`` array of ``(x, y)`` pixel coordinates.
 Contour = np.ndarray
-
-
-class PageXMLError(ValueError):
-    """Raised when a file cannot be interpreted as an ALTO/PageXML document."""
 
 
 class RegionKind(str, Enum):
@@ -135,14 +143,31 @@ def _namespace_prefix(root: ET.Element) -> str:
     return root.tag.split("}", 1)[0] + "}" if "}" in root.tag else ""
 
 
+def _coordinate(value: str) -> int:
+    """One coordinate attribute as an ``int``, via ``int(float(value))``.
+
+    The legacy ``<Point>`` reader wrote ``int(float(vv.attrib['x']))``
+    (``gt_gen_utils.py:197``), which truncates the fractional coordinates modern tools
+    emit, while its ``@points`` twin eight lines above wrote ``int(x.split(',')[0])``
+    (``gt_gen_utils.py:191``) and so *raised* on the same ``"1.5"`` -- taking the whole
+    page with it.  One shared conversion removes the asymmetry in favour of the reading
+    that never loses a page.
+    """
+    return int(float(value))
+
+
 def _parse_coords_points(raw: str) -> Contour | None:
-    """Parse a ``Coords/@points`` string into an ``(N, 2)`` int32 contour."""
+    """Parse a ``Coords/@points`` string into an ``(N, 2)`` int32 contour.
+
+    Every value goes through :func:`_coordinate`, so a fractional coordinate is
+    truncated rather than raising, exactly as the ``<Point>`` encoding has always been.
+    """
     pairs = [chunk for chunk in raw.replace(",", " ").split() if chunk]
     if len(pairs) < 2:
         return None
     if len(pairs) % 2:
-        pairs = pairs[:-1]
-    return np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        pairs = pairs[:-1]  # A dangling value is dropped, never padded with a zero.
+    return np.asarray([_coordinate(value) for value in pairs], dtype=np.int32).reshape(-1, 2)
 
 
 def _contour_of(element: ET.Element, prefix: str) -> Contour | None:
@@ -165,7 +190,7 @@ def _contour_of(element: ET.Element, prefix: str) -> Contour | None:
     ]
     if len(points) < 3:
         return None
-    return np.asarray([[int(float(x)), int(float(y))] for x, y in points], dtype=np.int32)
+    return np.asarray([[_coordinate(x), _coordinate(y)] for x, y in points], dtype=np.int32)
 
 
 def _element_contour(element: ET.Element, prefix: str) -> Contour | None:
@@ -288,6 +313,47 @@ class Page:
         ]
 
 
+#: The ``encoding`` pseudo-attribute of an XML declaration, restricted to the characters the
+#: XML spec allows in an encoding name.
+_XML_DECLARATION: Final = re.compile(rb"<\?xml[^>]*?encoding\s*=\s*[\"']([\w.:-]+)[\"']", re.I)
+
+#: The XML spec's default encoding for a document that declares none.
+_XML_DEFAULT_ENCODING: Final = "utf-8"
+
+
+def _declared_encoding(raw: bytes) -> str:
+    """The encoding to decode *raw* with: its declaration, else UTF-8.
+
+    ``ET.XMLParser(encoding=...)`` *overrides* the declaration instead of reading it, so
+    the single-encoding policy of the legacy readers (``gt_gen_utils.py:145``) decoded a
+    UTF-8-authored page as iso-8859-5 and mangled its text.  Reading the declaration
+    first keeps both corpora readable; :func:`_parse_tree` still tries
+    :data:`DEFAULT_XML_ENCODING` afterwards.
+    """
+    match = _XML_DECLARATION.search(raw[:1024])  # The declaration opens the document.
+    return match.group(1).decode("ascii", "replace") if match else _XML_DEFAULT_ENCODING
+
+
+def _parse_tree(path: Path) -> ET.Element:
+    """Parse *path*, preferring the encoding its XML declaration names.
+
+    The declared encoding is tried first and :data:`DEFAULT_XML_ENCODING`, the encoding
+    the legacy tool wrote every file with, second: a legacy page whose declaration lies
+    (an iso-8859-5 file stamped ``encoding="UTF-8"``) decodes either way, while a
+    correctly-stamped modern file no longer arrives as mojibake.  An unknown codec
+    (``LookupError``) and a syntax error (``ParseError``) both become
+    :class:`PageXMLError` rather than escaping as they used to.
+    """
+    raw = path.read_bytes()
+    last_error: Exception = LookupError(f"no candidate encoding for {path}")
+    for encoding in dict.fromkeys((_declared_encoding(raw), DEFAULT_XML_ENCODING)):
+        try:
+            return ET.parse(io.BytesIO(raw), parser=ET.XMLParser(encoding=encoding)).getroot()
+        except (ET.ParseError, ValueError, LookupError) as exc:
+            last_error = exc
+    raise PageXMLError(f"cannot parse {path}: {last_error}") from last_error
+
+
 def parse_pagexml(xml_file: str | Path) -> Page:
     """Parse an ALTO/PageXML file into a :class:`Page`.
 
@@ -303,11 +369,10 @@ def parse_pagexml(xml_file: str | Path) -> Page:
     """
     path = Path(xml_file)
     try:
-        tree = ET.parse(path, parser=ET.XMLParser(encoding=DEFAULT_XML_ENCODING))
-    except (ET.ParseError, OSError, LookupError) as exc:  # LookupError: unknown codec
+        root = _parse_tree(path)
+    except OSError as exc:  # a missing or unreadable file, as before
         raise PageXMLError(f"cannot parse {path}: {exc}") from exc
 
-    root = tree.getroot()
     if _local_name(root.tag) != "pcgts":
         raise PageXMLError(f"{path}: expected a <PcGts> root, found <{root.tag}>")
     prefix = _namespace_prefix(root)
@@ -334,15 +399,23 @@ def parse_pagexml(xml_file: str | Path) -> Page:
 
 
 def _columns_width(root: ET.Element, prefix: str) -> int | None:
-    """Read ``Metadata/Comments`` for the ``num_colNNNN`` marker the tool writes."""
+    """Read ``Metadata/Comments`` for the ``num_colNNNN`` marker the tool writes.
+
+    The value is the digit run *between the marker and the next delimiter*, which is what
+    ``int(text_comments.split('num_col')[1])`` (``gt_gen_utils.py:164``) reads -- the
+    comma that ends the first width stops the number there, even though the legacy line
+    then raised on a two-column page's ``"0456, "``.  Collecting every remaining digit
+    instead turned the tool's own ``"#num_col0456, num_col1500"`` into the width
+    ``4561500``, which the resize step then tried to honour.
+    """
     metadata = root.find(f"{prefix}Metadata")
     if metadata is None:
         return None
     for child in metadata:
         if _local_name(child.tag) != "comments" or not child.text:
             continue
-        _, _, digits = child.text.partition("num_col")
-        digits = "".join(char for char in digits if char.isdigit())
+        _, _, after_marker = child.text.partition("num_col")
+        digits = "".join(takewhile(str.isdigit, after_marker))
         if digits:
             return int(digits)
     return None

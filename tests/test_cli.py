@@ -14,19 +14,25 @@ wanted a cheaper model would have to change the config it is testing.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from click.testing import CliRunner, Result
+from pytorch_lightning.callbacks import Callback, EarlyStopping
 
-from sbb_pytorch import __version__
+from sbb_pytorch import __version__, cli
 from sbb_pytorch.cli import main
-from sbb_pytorch.config import SBBConfig
+from sbb_pytorch.config import SBBConfig, TaskType
+from sbb_pytorch.exceptions import ConfigError
+from sbb_pytorch.gt import contour_bbox, parse_pagexml
+from sbb_pytorch.inference import Prediction
 from sbb_pytorch.models import create_model
 from sbb_pytorch.storage import load_checkpoint, save_checkpoint
 from sbb_pytorch.storage.images import imwrite
+from sbb_pytorch.training.callbacks import build_callbacks, load_callbacks_file
 
 SIZE = 32
 BASE: dict[str, object] = {
@@ -49,6 +55,19 @@ PAGE_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <Page imageFilename="page.png" imageWidth="{size}" imageHeight="{size}">
     <TextRegion ID="r1" type="paragraph">
       <Coords points="4,4 {edge},4 {edge},{edge} 4,{edge}"/>
+    </TextRegion>
+  </Page>
+</PcGts>"""
+
+# Two regions, because a reading-order sample needs a pair to order.
+PAGE_XML_TWO = """<?xml version="1.0" encoding="UTF-8"?>
+<PcGts xmlns="http://schema.primaresearch.org/PAGE/gts/schema/v2019.07.24">
+  <Page imageFilename="page.png" imageWidth="{size}" imageHeight="{size}">
+    <TextRegion ID="r1" type="paragraph">
+      <Coords points="4,4 14,4 14,14 4,14"/>
+    </TextRegion>
+    <TextRegion ID="r2" type="paragraph">
+      <Coords points="18,4 28,4 28,14 18,14"/>
     </TextRegion>
   </Page>
 </PcGts>"""
@@ -177,6 +196,152 @@ def test_device_flag_is_validated_before_any_work(runner: CliRunner, config_file
         assert "cuda" in result.output
 
 
+def test_model_flag_is_documented_as_a_registry_key(runner: CliRunner) -> None:
+    """``--model`` takes an architecture name, not a ``backbone_type``; the help said backbone.
+
+    The value goes to :func:`~sbb_pytorch.models.create_model` as its ``model=`` registry key
+    (``resnet50_unet_light``, ``vit_resnet50_unet``, ...), while ``backbone`` names a config field
+    -- ``resnet50`` or ``vit`` -- that several architectures share.
+    """
+    output = " ".join(invoke(runner, "train", "--help").output.split())  # undo click's wrapping
+    assert "--model TEXT Registry key overriding the architecture" in output
+    assert "backbone" not in output
+
+
+# The two entry spellings the format allows, both naming a class that imports without a GPU.
+CALLBACKS_FILE = json.dumps(
+    [
+        "pytorch_lightning.callbacks.Callback",
+        {
+            "class": "pytorch_lightning.callbacks.EarlyStopping",
+            "init": {"monitor": "val_loss", "patience": 2},
+        },
+    ]
+)
+
+
+def test_a_callbacks_file_adds_to_the_run_it_is_trained_on(tmp_path: Path) -> None:
+    """``--callbacks-file`` names extra callbacks; it never replaces the config's own.
+
+    The flag exists as ``build_trainer``'s ``callbacks=`` (``training/trainer.py:111``, "Callbacks
+    to use as-is instead of the built set") -- which is exactly the danger: handing the trainer the
+    file's list alone would drop the ``ModelCheckpoint``\\ s and the pair of ``EarlyStopping``\\ s
+    :func:`~sbb_pytorch.training.callbacks.build_callbacks` derives from the config, so
+    :func:`build_callbacks` appends and the run keeps what it already had.
+    """
+    path = tmp_path / "callbacks.json"
+    path.write_text(CALLBACKS_FILE)
+    loaded = load_callbacks_file(path)
+    # Both spellings resolve, and the object form hands its ``init`` to the class's __init__.
+    assert [type(callback) for callback in loaded] == [Callback, EarlyStopping]
+    assert (loaded[1].monitor, loaded[1].patience) == ("val_loss", 2)
+
+    # Appended, in order: the config's own callbacks first, then everything the file named. The
+    # comparison is by type because the second call builds fresh instances of the file's classes.
+    config = SBBConfig.model_validate(BASE)
+    directory = tmp_path / "out"
+    directory.mkdir()
+    own = build_callbacks(config, output_dir=directory)
+    with_file = build_callbacks(config, output_dir=directory, callbacks_file=path)
+    assert [type(callback) for callback in with_file] == [type(callback) for callback in own] + [
+        Callback,
+        EarlyStopping,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ("{not json", "is not valid JSON"),
+        ('{"class": "pytorch_lightning.callbacks.Callback"}', "must contain a JSON list"),
+        ("3", "must contain a JSON list, got int"),
+        ('[["x"]]', "entry 0 must be a dotted class path or an object"),
+        (
+            '["pytorch_lightning.callbacks.Callback", 3]',
+            "entry 1 must be a dotted class path or an object",
+        ),
+        (
+            '["pytorch_lightning.callbacks.NoSuchCallback"]',
+            "entry 0: module 'pytorch_lightning.callbacks' has no attribute 'NoSuchCallback'",
+        ),
+        (
+            '["pytorch_lightning.Trainer"]',
+            "entry 0 'pytorch_lightning.Trainer' is a Trainer, not a pytorch_lightning Callback",
+        ),
+        (
+            '[{"class": "pytorch_lightning.callbacks.Callback", "init": {"nope": 1}}]',
+            "entry 0 'pytorch_lightning.callbacks.Callback' cannot be built",
+        ),
+        ('[{"class": "x.y", "monitor": "val_loss"}]', "entry 0 has unknown key(s)"),
+        ('[{"class": "x.y", "init": 3}]', "entry 0 'init' must be a JSON object"),
+        ('["Callback"]', "entry 0 'Callback' is not a dotted import path"),
+    ],
+)
+def test_every_unusable_callbacks_file_names_the_entry_that_is_wrong(
+    tmp_path: Path, document: str, message: str
+) -> None:
+    """Eleven ways the file can be wrong, and the one line each of them becomes.
+
+    Every message carries the file *and* the entry index -- the second row above is why: the failure
+    mode this replaces was a ``ModuleNotFoundError`` traceback from inside ``pl.Trainer`` that named
+    neither, the same late-erroring the module docstring lists for the legacy callbacks. The wording
+    mirrors :func:`~sbb_pytorch.config.loaders.load_config` so both config-shaped files refuse a
+    bad file in the same voice.
+    """
+    path = tmp_path / "callbacks.json"
+    path.write_text(document)
+    with pytest.raises(ConfigError) as error:
+        load_callbacks_file(path)
+    assert str(path) in str(error.value)
+    assert message in str(error.value)
+
+
+def test_train_runs_with_a_callbacks_file(
+    runner: CliRunner, tmp_path: Path, data_root: Path
+) -> None:
+    """The flag reaches ``build_trainer``'s ``callbacks=``: the dry run still trains and says so.
+
+    The file names a bare ``Callback``, not ``CALLBACKS_FILE``'s ``EarlyStopping``: Lightning gives
+    every stateful callback a key of ``ClassName-monitor-mode``
+    (``callbacks/early_stopping.py:154-155``) and refuses two of the same key on one Trainer, so a
+    second ``monitor="val_loss"`` stopper -- whatever its patience -- is the trainer's error rather
+    than this flag's, and the run's own pair already covers that metric.
+    """
+    config = Path(tmp_path / "cfg.json")
+    config.write_text(
+        json.dumps(
+            {
+                **BASE,
+                "dir_train": str(data_root),
+                "dir_eval": str(data_root),
+                "dir_output": str(tmp_path / "out"),
+                "data_is_provided": True,
+            }
+        )
+    )
+    callbacks = tmp_path / "callbacks.json"
+    callbacks.write_text(json.dumps(["pytorch_lightning.callbacks.Callback"]))
+    result = invoke(
+        runner, "train", config, "--dry-run", "--no-logger", "--callbacks-file", callbacks
+    )
+    assert result.exit_code == 0, result.output
+    assert "dry run finished" in result.output
+
+
+def test_train_reports_a_callbacks_file_it_cannot_use(
+    runner: CliRunner, config_file: Path, tmp_path: Path
+) -> None:
+    """The file is read before the run starts, so a typo costs seconds instead of an hour."""
+    broken = tmp_path / "callbacks.json"
+    broken.write_text("{not json")
+    result = invoke(
+        runner, "train", config_file, "--dry-run", "--no-logger", "--callbacks-file", broken
+    )
+    assert result.exit_code == 1
+    assert "Error: " in result.output
+    assert "callbacks file is not valid JSON" in result.output
+
+
 # ----------------------------------------------------------------------------- sbb infer
 
 
@@ -200,6 +365,52 @@ def test_infer_without_save_writes_nothing_and_reports_it(
     result = invoke(runner, "infer", run_dir, str(page), "--no-save")
     assert result.exit_code == 0, result.output
     assert "nothing saved" in result.output
+
+
+def test_infer_save_default_is_the_configs_save_visualisation(
+    runner: CliRunner, tmp_path: Path, light_model: torch.nn.Module
+) -> None:
+    """``save_visualisation`` was a config field nothing read; it is now ``--save``'s default.
+
+    The flag still wins in both directions -- ``--save`` on a run whose config says false writes the
+    image, exactly as ``--patches`` overrides the config's ``patches``.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    quiet = tmp_path / "quiet-run"
+    save_checkpoint(
+        quiet / "model.pt",
+        light_model,
+        task="segmentation",
+        epoch=1,
+        step=1,
+        config={**BASE, "save_visualisation": False},
+    )
+
+    result = invoke(runner, "infer", str(quiet), str(page))
+    assert result.exit_code == 0, result.output
+    assert "nothing saved" in result.output
+    assert not list((quiet / "predictions").glob("*.png"))
+
+    forced = invoke(runner, "infer", str(quiet), str(page), "--save")
+    assert forced.exit_code == 0, forced.output
+    assert (quiet / "predictions" / "page_prediction.png").exists()
+
+
+def test_infer_save_logits_writes_the_tensor_the_prediction_keeps(
+    runner: CliRunner, tmp_path: Path, run_dir: Path
+) -> None:
+    """``Prediction.logits`` was documented as kept "for ``--save-logits`` style debugging".
+
+    The flag did not exist, so nothing could reach the tensor. It is now ``torch.save``d next to the
+    images and survives the round trip at the model's own output size, not the resized image's.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    result = invoke(runner, "infer", run_dir, str(page), "--save-logits")
+    assert result.exit_code == 0, result.output
+    saved = torch.load(run_dir / "predictions" / "page_logits.pt", map_location="cpu")
+    assert saved.ndim == 3, "(n_classes, H, W) -- the logits, not a rendered image"
 
 
 def test_infer_writes_a_json_answer_for_a_label_only_task(
@@ -242,6 +453,180 @@ def test_infer_reads_the_architecture_from_the_checkpoint_unless_overridden(
     bad = invoke(runner, "infer", run_dir, str(page), "--architecture", "resnet50_classifier")
     assert bad.exit_code == 1  # a Conv/Linear state dict cannot load into the light UNet
     assert "Error:" in bad.output
+
+
+def test_infer_overlap_reaches_the_sliding_window(
+    runner: CliRunner, tmp_path: Path, run_dir: Path
+) -> None:
+    """``--overlap`` was only settable in Python; it is now a flag, checked before the run.
+
+    ``--patches`` asked for and ``--overlap`` given is a coherent pair, while an overlap without
+    ``--patches`` windows nothing -- so it is refused rather than quietly ignored.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    assert invoke(runner, "infer", run_dir, page, "--patches", "--overlap", "0.25").exit_code == 0
+
+    outside = invoke(runner, "infer", run_dir, page, "--patches", "--overlap", "1.5")
+    assert outside.exit_code == 2 and "overlap must be in [0, 1)" in outside.output
+    unused = invoke(runner, "infer", run_dir, page, "--no-patches", "--overlap", "0.25")
+    assert unused.exit_code == 2 and "--overlap tunes the --patches window" in unused.output
+
+
+def test_infer_ground_truth_prints_the_numbers_it_used_to_throw_away(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, data_root: Path
+) -> None:
+    """``--ground_truth`` computed an IoU in the legacy script and never showed it; now it prints."""
+    result = invoke(
+        runner,
+        "infer",
+        run_dir,
+        data_root / "images" / "page_0.png",
+        "--ground-truth",
+        data_root / "labels",
+    )
+    assert result.exit_code == 0, result.output
+    assert "page_0.png" in result.output
+    assert "miou=" in result.output and "accuracy=" in result.output and "dice=" in result.output
+
+
+def test_infer_ground_truth_refuses_a_task_with_no_mask(runner: CliRunner, tmp_path: Path) -> None:
+    """A classification page answers with a label, and a confusion matrix cannot compare one."""
+    config = {**BASE, "task": "classification", "n_classes": 2}
+    directory = tmp_path / "run"
+    directory.mkdir()
+    save_checkpoint(
+        directory / "model.pt",
+        create_model(SBBConfig.model_validate(config), pretrained=False),
+        task="classification",
+        config=config,
+    )
+    pages, labels = tmp_path / "pages", tmp_path / "labels"
+    pages.mkdir()
+    labels.mkdir()
+    imwrite(pages / "page.png", np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    imwrite(labels / "page.png", np.zeros((SIZE, SIZE), dtype=np.uint8))
+
+    result = invoke(runner, "infer", directory, pages / "page.png", "--ground-truth", labels)
+    assert result.exit_code == 1
+    assert "gave no mask for task=classification" in result.output
+
+
+def _stub_predictor(monkeypatch: pytest.MonkeyPatch, prediction: Prediction) -> None:
+    """Answer every page with *prediction*, so the assertion is about the XML and not the weights.
+
+    The ``--xml-file`` tests need to know the mask to know the regions a run should write, and the
+    session's model is untrained -- its mask would say nothing about the writer. The stub mirrors
+    the two methods the command calls (:meth:`~sbb_pytorch.inference.Predictor.from_checkpoint` and
+    :meth:`~sbb_pytorch.inference.Predictor.predict_file`) and nothing else, so a signature change
+    on the real predictor breaks these exactly as it breaks the other ``infer`` tests.
+    """
+
+    class Stub:
+        config = SBBConfig.model_validate(BASE)
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        @classmethod
+        def from_checkpoint(cls, *_args: object, **_kwargs: object) -> Stub:
+            return cls()
+
+        def predict_file(self, path: str | Path, **_kwargs: object) -> Prediction:
+            return replace(prediction, path=Path(path))
+
+    monkeypatch.setattr(cli, "Predictor", Stub)
+
+
+def test_infer_xml_file_writes_the_regions_the_prediction_found(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One page, one file: the answer replaces that page's XML, which is what upstream promised.
+
+    ``inference.py:731-735``: "xml file with layout coordinates that reading order detection will
+    be implemented on. The result will be written in the same xml file." The rewrite keeps what the
+    file knew -- ``@imageFilename``, the declared size -- and gains one region per predicted contour
+    (:func:`sbb_pytorch.cli._mask_regions`), which is all the port's flat
+    :class:`~sbb_pytorch.gt.Page` can express; v3's ``TextLine``-under-``TextRegion`` nesting has no
+    place to live and is flattened the way :mod:`sbb_pytorch.gt.writer` documents.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    source = tmp_path / "labels" / "page.xml"
+    source.parent.mkdir()
+    source.write_text(PAGE_XML.format(size=SIZE, edge=28))
+
+    mask = np.zeros((SIZE, SIZE), dtype=np.uint8)
+    mask[4:12, 4:28], mask[16:24, 4:28] = 1, 2
+    _stub_predictor(monkeypatch, Prediction(task=TaskType.SEGMENTATION, mask=mask))
+
+    result = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", source)
+    assert result.exit_code == 0, result.output
+    assert "1 PageXML file(s) written" in result.output
+
+    written = parse_pagexml(source)
+    assert (written.width, written.height, written.file_name) == (SIZE, SIZE, "page")
+    assert [
+        (region.region_id, region.type_name, contour_bbox(region.contour, (SIZE, SIZE)))
+        for region in written.regions
+    ] == [("page_1_0", "class_1", (4, 4, 24, 8)), ("page_2_0", "class_2", (4, 16, 24, 8))]
+
+
+def test_infer_xml_file_names_one_file_per_page_when_the_run_has_several(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several pages cannot share the one file the flag names, so the directory plus each stem wins.
+
+    That pairing rule is the one the port already uses for every per-page artefact
+    (:func:`sbb_pytorch.data.dataset.label_path_for`), and it is the half of upstream's
+    ``--page-xml`` (``inference.py:736-740``) that ``--xml_file`` never had to answer.
+    """
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    for name in ("a", "b"):
+        imwrite(pages / f"{name}.png", np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    mask = np.zeros((SIZE, SIZE), dtype=np.uint8)
+    mask[4:12, 4:28] = 1
+    _stub_predictor(monkeypatch, Prediction(task=TaskType.SEGMENTATION, mask=mask))
+
+    result = invoke(
+        runner, "infer", run_dir, pages, "--no-save", "--xml-file", tmp_path / "out/run.xml"
+    )
+    assert result.exit_code == 0, result.output
+    assert sorted(path.name for path in (tmp_path / "out").glob("*.xml")) == ["a.xml", "b.xml"]
+    assert "2 PageXML file(s) written" in result.output
+
+
+def test_infer_xml_file_reports_a_page_it_cannot_describe(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing file for a label answer, and a junk file for a mask answer: each is one line.
+
+    ``--xml-file`` takes ``exists=False`` because the file is usually the one being created -- that
+    is what upstream's ``--page-xml`` did -- so the cases where nothing *can* be written have to say
+    so instead of writing a stub over a page. A label answers with an order stamped onto an existing
+    page, so a page with no XML has nothing to order; a file that is not PageXML raises
+    :class:`~sbb_pytorch.exceptions.PageXMLError` from the read, printed once and left unread, in the
+    same voice ``--ground-truth`` uses above.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+
+    _stub_predictor(monkeypatch, Prediction(task=TaskType.CLASSIFICATION, label="class_1"))
+    missing = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", tmp_path / "x.xml")
+    assert missing.exit_code == 1
+    assert "--xml-file has no page to order: page.png" in missing.output
+    assert not (tmp_path / "x.xml").exists()  # reported, not silently written over
+
+    junk = tmp_path / "junk.xml"
+    junk.write_text("<not-a-page/>")
+    mask = np.zeros((SIZE, SIZE), dtype=np.uint8)
+    mask[4:12, 4:28] = 1
+    _stub_predictor(monkeypatch, Prediction(task=TaskType.SEGMENTATION, mask=mask))
+    unreadable = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", junk)
+    assert unreadable.exit_code == 1
+    assert "expected a <PcGts> root" in unreadable.output
+    assert junk.read_text() == "<not-a-page/>"
 
 
 # ----------------------------------------------------------------------------- sbb export
@@ -312,6 +697,22 @@ def test_config_schema_writes_the_generated_reference(runner: CliRunner, tmp_pat
     assert json.loads(destination.read_text())["title"] == "SBBConfig"
 
 
+def test_config_schema_default_is_absolute_not_the_current_directory(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``-o`` the schema used to land in ``./docs``, wherever the caller happened to stand.
+
+    The default is now derived from the package (``DEFAULT_SCHEMA_PATH``), so an omitted ``-o``
+    still means "the reference beside the code it documents".
+    """
+    destination = tmp_path / "beside-the-package.json"
+    assert cli.DEFAULT_SCHEMA_PATH.is_absolute()
+    monkeypatch.setattr(cli, "DEFAULT_SCHEMA_PATH", destination)
+    result = invoke(runner, "config-schema")
+    assert result.exit_code == 0, result.output
+    assert destination.exists() and "SBBConfig" in destination.read_text()
+
+
 # ------------------------------------------------------------------------------ sbb gt
 
 
@@ -371,3 +772,69 @@ def test_gt_generate_needs_a_use_case_or_a_config(
         config_file,
     )
     assert both.exit_code == 2 and "not both" in both.output
+
+
+def test_gt_generate_min_area_overrides_the_config_value(
+    runner: CliRunner, tmp_path: Path, xml_dir: Path
+) -> None:
+    """``--min-area`` next to ``--config`` used to be refused; the flag now overrides the field."""
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(json.dumps({"use_case": "textline", "min_area": 0.25}))
+    result = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        xml_dir,
+        "-o",
+        tmp_path / "gt",
+        "--config",
+        gt_config,
+        "--min-area",
+        "0.01",
+        "--dry-run",
+    )
+    assert result.exit_code == 0, result.output
+    assert "page.xml" in result.output
+
+
+def test_gt_enhance_writes_a_degraded_page_and_its_label_per_scale(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``image_enhancement`` from ``generate_gt_for_training.py``, and its pairing by filename."""
+    images = tmp_path / "images"
+    images.mkdir()
+    imwrite(images / "page.png", np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    scales = tmp_path / "scales.json"
+    scales.write_text(json.dumps({"scales": [0.5, 0.25]}))
+    out = tmp_path / "enhanced"
+
+    dry = invoke(runner, "gt", "enhance", "-i", images, "-o", out, "--scales", scales, "--dry-run")
+    assert dry.exit_code == 0, dry.output
+    assert "2 page(s) x 2 scale(s)" in dry.output or "1 page(s) x 2 scale(s)" in dry.output
+    assert not out.exists()
+
+    result = invoke(runner, "gt", "enhance", "-i", images, "-o", out, "--scales", scales)
+    assert result.exit_code == 0, result.output
+    names = ["page_0.png", "page_1.png"]
+    assert sorted(p.name for p in out.glob("*.png")) == names
+    # the label half: the untouched original, under the same name as each degraded page
+    assert sorted(p.name for p in (tmp_path / "enhanced_labels").glob("*.png")) == names
+
+
+def test_gt_reading_order_writes_the_pairwise_samples(runner: CliRunner, tmp_path: Path) -> None:
+    """``machine_based_reading_order`` became ``sbb gt reading-order``: a pair per region order."""
+    xml = tmp_path / "xml"
+    xml.mkdir()
+    (xml / "page.xml").write_bytes(PAGE_XML_TWO.format(size=SIZE).encode("utf-8"))
+    out = tmp_path / "reading_order"
+
+    dry = invoke(runner, "gt", "reading-order", "--xml", xml, "-o", out, "--dry-run")
+    assert dry.exit_code == 0, dry.output
+    assert "2 pair(s) would be written" in dry.output
+    assert not (out / "classes").exists()
+
+    result = invoke(runner, "gt", "reading-order", "--xml", xml, "-o", out)
+    assert result.exit_code == 0, result.output
+    assert len(list(out.glob("*.png"))) == 2  # the two ordered pairs of one page
+    assert len(list((out / "classes").glob("*.npy"))) == 2

@@ -3,8 +3,10 @@
 Replaces ``inference_pytorch.py``. Two pieces, one job each:
 
 * :class:`~sbb_pytorch.inference.predictor.Predictor` -- build the model from a run directory
-  (weights *and* the config recorded beside them), then predict on a file, an array, a directory,
-  or a sliding grid of tiles. It returns a :class:`~sbb_pytorch.inference.predictor.Prediction`.
+  (weights *and* the config recorded beside them), then predict on one page given as a file or an
+  array, either whole-page or through a sliding grid of tiles. It returns a
+  :class:`~sbb_pytorch.inference.predictor.Prediction`. A directory of pages is the CLI's loop
+  over ``predict_file``, not a method on the predictor.
 * :mod:`~sbb_pytorch.inference.visualize` -- every rendering the CLI writes (overlay, colourised
   layout, binarised page, enhanced page) from the one palette the ``gt`` package also uses.
 """

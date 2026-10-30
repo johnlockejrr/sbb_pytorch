@@ -25,10 +25,21 @@ Pruning is handled twice, correctly, in both places that need it: pytorch-lightn
 :func:`~sbb_pytorch.storage.checkpoint.prune_checkpoints` orders the step files numerically (the
 legacy ``sorted(glob("..._epoch_*.pth"))`` put ``epoch_10`` before ``epoch_2`` and deleted the
 newest files).
+
+:command:`sbb train --callbacks-file` -- the flag ``build_trainer`` names at
+``training/trainer.py:111`` ("Callbacks to use as-is instead of the built set") -- is
+:func:`load_callbacks_file`. Neither legacy repository had anything like it: ``train.py`` and
+``training.py`` both hard-coded their callback lists in Python (the pair of ``ModelCheckpoint``\\s
+and pair of ``EarlyStopping``\\s described above), so this package defines the format -- and
+:func:`build_callbacks` *appends* what the file names to the set above instead of standing in for
+it, which is what the flag has always been for: adding the one callback a run needs, not
+re-deriving the checkpointing the config already describes.
 """
 
 from __future__ import annotations
 
+import importlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +48,7 @@ from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from torch import Tensor
 
 from sbb_pytorch.config.models import SBBConfig
+from sbb_pytorch.exceptions import ConfigError
 from sbb_pytorch.storage.checkpoint import Checkpoint, prune_checkpoints
 from sbb_pytorch.training.module import SBBLightningModule
 
@@ -46,6 +58,7 @@ __all__ = [
     "build_callbacks",
     "checkpoint_for",
     "early_stopping_for",
+    "load_callbacks_file",
     "metric_mode",
     "metric_snapshot",
     "monitor_metrics",
@@ -212,6 +225,104 @@ class StepCheckpoint(Callback):
         prune_checkpoints(self.directory, keep_last_n=self.keep_last_n)
 
 
+def _build_entry(entry: object, *, path: Path, index: int) -> Callback:
+    """One entry of a callbacks file, imported and instantiated.
+
+    An entry is either a dotted import path (``"pytorch_lightning.callbacks.Callback"``) or an
+    object naming the class and, optionally, the kwargs its ``__init__`` takes::
+
+        {"class": "pytorch_lightning.callbacks.ModelCheckpoint", "init": {"monitor": "val_loss"}}
+
+    Anything else is refused *by position* -- a typo inside an object used to survive parsing and
+    fail inside ``pl.Trainer``, which is the same late-erroring the module docstring lists for the
+    legacy callbacks. Every message names both the file and the entry, so a seven-entry file with
+    one bad line says which one.
+
+    Raises:
+        ConfigError: the entry is neither spelling, ``init`` is not an object, the module or class
+            cannot be imported, the attribute is not a ``pl.Callback`` subclass, or ``init`` does
+            not fit the class's ``__init__``.
+    """
+    if isinstance(entry, str):
+        dotted, init = entry, {}
+    elif isinstance(entry, dict) and isinstance(entry.get("class"), str):
+        dotted = str(entry["class"])
+        unknown = sorted(set(entry) - {"class", "init"})
+        if unknown:
+            raise ConfigError(
+                f"{path}: entry {index} has unknown key(s) {unknown}; expected 'class' and 'init'"
+            )
+        raw_init = entry.get("init", {})
+        if not isinstance(raw_init, dict):
+            raise ConfigError(
+                f"{path}: entry {index} 'init' must be a JSON object, got {type(raw_init).__name__}"
+            )
+        init = dict(raw_init)
+    else:
+        raise ConfigError(
+            f"{path}: entry {index} must be a dotted class path or an object naming "
+            f"'class' and 'init', got {entry!r}"
+        )
+
+    module_name, _, attribute = dotted.rpartition(".")
+    if not module_name:
+        raise ConfigError(
+            f"{path}: entry {index} {dotted!r} is not a dotted import path (name the module too)"
+        )
+    try:
+        candidate = getattr(importlib.import_module(module_name), attribute)
+    except ImportError as exc:
+        raise ConfigError(f"{path}: entry {index} cannot import {module_name!r}: {exc}") from exc
+    except AttributeError as exc:
+        raise ConfigError(
+            f"{path}: entry {index}: module {module_name!r} has no attribute {attribute!r}"
+        ) from exc
+    if not isinstance(candidate, type):
+        raise ConfigError(
+            f"{path}: entry {index} {dotted!r} is a {type(candidate).__name__}, not a class"
+        )
+    if not issubclass(candidate, Callback):
+        raise ConfigError(
+            f"{path}: entry {index} {dotted!r} is a {candidate.__name__}, not a "
+            f"pytorch_lightning Callback"
+        )
+    try:
+        return candidate(**init)
+    except TypeError as exc:  # the kwargs the class does not take -- a config error, not a crash
+        raise ConfigError(f"{path}: entry {index} {dotted!r} cannot be built: {exc}") from exc
+
+
+def load_callbacks_file(path: str | Path) -> list[Callback]:
+    """Build the callbacks ``sbb train --callbacks-file`` points at.
+
+    The file is a JSON **list**; each entry is a dotted import path or a ``{"class": ..., "init":
+    {...}}`` object (see :func:`_build_entry`), and an empty list is legal -- it adds nothing, which
+    is how a config-controlled run turns the feature off without deleting the file. Everything that
+    can be wrong with the file itself -- unreadable, malformed, a non-list, an unusable entry --
+    comes back as :class:`~sbb_pytorch.exceptions.ConfigError`, the type the CLI prints as one
+    ``Error:`` line instead of a traceback, worded like
+    :func:`sbb_pytorch.config.loaders.load_config` so both config-shaped files say it the same way.
+
+    Raises:
+        ConfigError: the file cannot be read, is not valid JSON, does not hold a list, or names a
+            class that cannot be built (see :func:`_build_entry`).
+    """
+    file = Path(path)
+    try:
+        raw = file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"callbacks file could not be read ({file}): {exc}") from exc
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"callbacks file is not valid JSON ({file}): {exc}") from exc
+    if not isinstance(entries, list):
+        raise ConfigError(
+            f"callbacks file must contain a JSON list, got {type(entries).__name__} ({file})"
+        )
+    return [_build_entry(entry, path=file, index=index) for index, entry in enumerate(entries)]
+
+
 def build_callbacks(
     config: SBBConfig,
     module: SBBLightningModule | None = None,
@@ -220,6 +331,7 @@ def build_callbacks(
     top_k: int = DEFAULT_TOP_K,
     every_n_steps: int | None = None,
     early_stopping: bool = True,
+    callbacks_file: str | Path | None = None,
 ) -> list[Callback]:
     """The callback list for a run: the checkpoint pair, the early-stopping pair, optional steps.
 
@@ -234,6 +346,11 @@ def build_callbacks(
             ``--save-interval`` the legacy CLI passed to ``SaveWeightsAfterSteps``.
         early_stopping: ``False`` to train without the early-stopping pair (the legacy
             ``--no-early-stop`` equivalent).
+        callbacks_file: ``--callbacks-file``: a JSON list of extra callback classes
+            (:func:`load_callbacks_file`), *appended* to the set this function builds. It never
+            replaces it -- ``build_trainer``'s ``callbacks=`` argument is what replaces the built
+            set, and :command:`sbb train` passes the finished list through that argument so the
+            config's own callbacks survive the file.
     """
     callbacks: list[Callback] = []
     if module is None:
@@ -249,4 +366,6 @@ def build_callbacks(
             callbacks.append(early_stopping_for(config, metric, mode=mode))
     if every_n_steps is not None:
         callbacks.append(StepCheckpoint(config, every_n_steps=every_n_steps, output_dir=output_dir))
+    if callbacks_file is not None:
+        callbacks.extend(load_callbacks_file(callbacks_file))
     return callbacks

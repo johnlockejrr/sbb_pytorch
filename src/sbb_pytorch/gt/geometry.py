@@ -80,16 +80,17 @@ DEFAULT_MIN_AREA_PIXELS: Final = 5.0
 def contour_area(contour: np.ndarray) -> float:
     """Area of *contour* in pixels, via :func:`cv2.contourArea`.
 
-    Accepts ``(N, 2)``, ``(N, 1, 2)`` or ``(K, N, 2)`` of any numeric dtype;
-    ``cv2.contourArea`` needs ``int32`` or ``float32``, so anything else is widened
-    rather than raising.  The legacy ``find_new_features_of_contours`` wrapped this
-    in ``try/except`` to work around exactly that dtype/shape variety.
+    Accepts ``(N, 2)``, ``(N, 1, 2)`` or ``(K, N, 2)`` of any numeric dtype; the dtype and
+    shape normalisation is :func:`_as_cv_contour` alone.  Its earlier whitelist listed
+    ``float64`` as already-measurable, and since ``cv2.contourArea`` accepts ``int32`` and
+    ``float32`` only, that one dtype -- the one almost every numpy operation hands back,
+    from ``contour * 2.0`` to a JSON round-trip -- raised ``cv2.error``.  The legacy
+    ``find_new_features_of_contours`` wrapped this in ``try/except`` to work around
+    exactly that dtype/shape variety.
     """
     array = np.asarray(contour)
     if array.size == 0:
         return 0.0
-    if array.dtype not in (np.int32, np.float32, np.float64):
-        array = array.astype(np.int32)
     if array.ndim == 2 and array.shape[0] < 3:
         return 0.0  # A polygon cannot have fewer than three points.
     return float(cv2.contourArea(_as_cv_contour(array)))
@@ -130,26 +131,33 @@ def contour_centroid(contour: np.ndarray) -> tuple[float, float]:
 
 
 def _as_cv_contour(array: np.ndarray) -> np.ndarray:
-    """Return *array* as the ``(N, 1, 2)`` shape every OpenCV build accepts.
+    """Return *array* as the ``(N, 1, 2)`` ``int32`` array every OpenCV build accepts.
 
-    OpenCV accepts ``(N, 2)`` on most builds but insists on ``(N, 1, 2)`` on others;
-    normalising once here removes the ``np.expand_dims`` and the ``if len(shape)==3:
-    c = c[0]`` unwrapping repeated at six legacy call sites.  A ``(K, N, 2)`` batch
-    collapses to ``(K*N, 1, 2)``, which is what the legacy ``fillPoly`` calls were
-    handed anyway.
+    Two normalisations in one place, because every OpenCV entry point demands both and
+    every legacy call site did only one of them:
+
+    * *shape* -- ``(N, 2)`` works on most builds, ``(N, 1, 2)`` on all of them, so the
+      ``np.expand_dims`` and the ``if len(shape)==3: c = c[0]`` unwrapping repeated at six
+      legacy call sites collapse into one reshape; a ``(K, N, 2)`` batch becomes
+      ``(K*N, 1, 2)``, which is what the legacy ``fillPoly`` calls were handed anyway.
+    * *dtype* -- ``cv2.contourArea`` takes ``int32``/``float32`` and ``cv2.fillPoly``
+      ``int32`` only, so a ``float64``, ``uint8`` or ``int64`` contour has to be cast
+      before either call, not merely at one of them.  Truncating matches the parser's
+      ``int(float(x))`` and OpenCV's own internal narrowing.
     """
+    array = np.asarray(array)
+    if array.dtype != np.int32:
+        array = array.astype(np.int32)
     if array.ndim == 3 and array.shape[1] == 1:
         return array
-    if array.ndim == 1:
-        array = array.reshape(-1, 2)
-    if array.ndim == 3:
+    if array.ndim in (1, 3):
         array = array.reshape(-1, 2)
     return np.ascontiguousarray(array.reshape(-1, 1, 2))
 
 
 def mask_of(
     contours: Iterable[np.ndarray] | np.ndarray,
-    shape: Sequence[int],
+    shape: Sequence[int] | int,
     *,
     fill_value: int = 255,
 ) -> np.ndarray:
@@ -163,19 +171,27 @@ def mask_of(
     Parameters
     ----------
     contours:
-        One contour, a list of contours, or a stacked ``(K, N, 2)`` batch.
+        One contour, a list of contours, or a stacked ``(K, N, 2)`` batch.  Each is
+        normalised through :func:`_as_cv_contour` first, so a ``uint8`` or ``float64``
+        contour rasterises instead of raising, and a point-less one paints nothing.
     shape:
-        ``(height)``, ``(height, width)`` or ``(height, width, channels)``.  A bare
-        height is expanded to a square canvas; a 3-tuple allocates that many channels.
+        ``(height)``, ``(height, width)`` or ``(height, width, channels)``, or the bare
+        ``int`` height the one-element form abbreviates.
     fill_value:
-        Value painted inside the contours (broadcast to all channels).
+        Value painted inside the contours.  On a multi-channel canvas it is repeated
+        across the channels -- ``cv2.fillPoly`` with a scalar colour would otherwise
+        write channel 0 and leave the rest of the canvas black.
     """
-    target = tuple(shape)
+    target = (shape, shape) if isinstance(shape, int | np.integer) else tuple(shape)
     if len(target) == 1:
         target = (target[0], target[0])
     canvas = np.zeros(target, dtype=np.uint8)
+    channels = target[2] if len(target) == 3 else 1
+    colour = int(fill_value) if channels == 1 else (int(fill_value),) * channels
     for contour in _iter_contours(contours):
-        cv2.fillPoly(canvas, [contour], int(fill_value))
+        if contour.shape[0] == 0:
+            continue  # fillPoly rejects a point-less contour; there is nothing to paint.
+        cv2.fillPoly(canvas, [contour], colour)
     return canvas
 
 
@@ -189,7 +205,8 @@ def _iter_contours(contours: Iterable[np.ndarray] | np.ndarray) -> Iterable[np.n
     if isinstance(contours, np.ndarray):
         array = np.asarray(contours)
         if array.ndim == 3 and array.shape[1] != 1:
-            yield from array  # ``(K, N, 2)`` batch.
+            for contour in array:  # ``(K, N, 2)`` batch: every row normalised, not just one.
+                yield _as_cv_contour(contour)
             return
         yield _as_cv_contour(array)
         return
@@ -538,56 +555,73 @@ def _tight_shape(contours: Sequence[np.ndarray]) -> tuple[int, int]:
     return (int(y + h), int(x + w))
 
 
+def _max_inscribed_size(width: int, height: int, alpha: float) -> tuple[float, float]:
+    """``(width, height)`` of the largest axis-aligned rectangle that fits inside a
+    ``width x height`` rectangle rotated by *alpha* radians
+    (:func:`utils.rotatedRectWithMaxArea`, ``utils.py:318``).
+
+    The legacy helper answers with a *size*, never with corners, and takes radians -- the
+    wrapper below converts.  Two cases cover every angle, because the answer for
+    ``angle``, ``-angle`` and ``180 - angle`` is identical and only the first quadrant has
+    to be measured: the *half-constrained* one, where two corners of the inner rectangle
+    touch the long side and the other two rest on the mid-line parallel to it, and the
+    *fully constrained* one, where the inner rectangle touches all four sides.  The
+    ``abs(sin_a - cos_a) < 1e-10`` test is the 45-degree corner of the first case, the one
+    angle at which the second case's ``cos(2a)`` divisor vanishes.
+    """
+    width_is_longer = width >= height
+    longer, shorter = (width, height) if width_is_longer else (height, width)
+    sin_alpha, cos_alpha = abs(float(np.sin(alpha))), abs(float(np.cos(alpha)))
+
+    half_constrained = shorter <= 2.0 * sin_alpha * cos_alpha * longer or (
+        abs(sin_alpha - cos_alpha) < 1e-10
+    )
+    if half_constrained:
+        half = 0.5 * shorter
+        return (
+            (half / sin_alpha, half / cos_alpha)
+            if width_is_longer
+            else (half / cos_alpha, half / sin_alpha)
+        )
+
+    cos_2a = cos_alpha * cos_alpha - sin_alpha * sin_alpha
+    return (
+        (width * cos_alpha - height * sin_alpha) / cos_2a,
+        (height * cos_alpha - width * sin_alpha) / cos_2a,
+    )
+
+
 def rotated_rect_with_max_area(width: int, height: int, angle_degrees: float) -> np.ndarray:
     """Four ``(x, y)`` corners of the largest axis-aligned rectangle that fits inside
     a ``width x height`` rectangle rotated by *angle_degrees*.
 
-    Port of ``rotatedRectWithMaxArea`` from ``utils.py``, used to render a deskewed
-    page's usable area without black corners.  Returns an int32 ``(4, 2)`` array,
-    with ``(-1, -1)`` corners signalling a degenerate angle, as the original did.
+    Port of ``rotatedRectWithMaxArea`` (``utils.py:318``), used to render a deskewed
+    page's usable area without black corners.  The size comes from
+    :func:`_max_inscribed_size` and the placement from its caller
+    :func:`utils.rotate_max_area` (``utils.py:346``), which crops that size out of the
+    rotated image centred on ``w // 2, h // 2``; the corners below are that crop, as an
+    int32 ``(4, 2)`` ring running top-left, top-right, bottom-right, bottom-left.
+
+    The first port collapsed the trigonometry to identities that only survived the
+    right-angle cases -- every other angle came back as the ``(-1, -1)`` sentinel or a
+    quad with a repeated vertex, so the helper could describe an axis-aligned page and
+    nothing else.  Corner coordinates may now leave the ``width x height`` canvas, exactly
+    as the legacy slice did: a ``100 x 50`` page turned 90 degrees is a ``50 x 100`` shape
+    whose top edge sits at ``y = -25``.  A page with no area still has no rectangle to
+    inscribe, and keeps the ``(-1, -1)`` corners.
     """
     if width <= 0 or height <= 0:
         return np.full((4, 2), -1, dtype=np.int32)
 
-    alpha = float(np.deg2rad(angle_degrees))
-    if np.isclose(np.cos(alpha), 0.0):
-        # A 90-degree rotation swaps the extents; the original returned the corners of
-        # the unrotated rectangle here, which is what this branch reproduces.
-        return np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.int32)
-
-    tan_alpha = float(np.tan(alpha))
-    denominator = 1.0 - tan_alpha**2
-    if np.isclose(denominator, 0.0):
-        return np.full((4, 2), -1, dtype=np.int32)
-    if np.sin(alpha) * np.cos(alpha) > 0:
-        side = (height - width * tan_alpha) / denominator
-        beta = np.arctan((height - side) / width)
-    else:
-        side = (height + width * tan_alpha) / denominator
-        beta = np.arctan((height + side) / width)
-
-    if np.isclose(beta, 0.0) and np.isclose(side, 0.0):
-        return np.full((4, 2), -1, dtype=np.int32)
-
-    diagonal_sq = float(width) ** 2 + float(height) ** 2
-    length = np.sqrt(diagonal_sq - 4 * side**2) if diagonal_sq > 4 * side**2 else 0.0
-    sin_beta, cos_beta = float(np.sin(beta)), float(np.cos(beta))
-    offset_x, offset_y = length * cos_beta / 2.0, length * sin_beta / 2.0
-    centre_x, centre_y = width / 2.0, height / 2.0
-    half = abs(side) * np.sqrt(2.0) / 2.0
-    left_x, left_y = centre_x - offset_x, centre_y - offset_y
-    right_x, right_y = centre_x + offset_x, centre_y + offset_y
-    side_x, side_y = half * sin_beta, half * cos_beta
-    span_x, span_y = length * cos_beta / 2.0, length * sin_beta / 2.0
+    size_x, size_y = _max_inscribed_size(width, height, float(np.deg2rad(angle_degrees)))
+    left, top = width / 2.0 - size_x / 2.0, height / 2.0 - size_y / 2.0
     corners = np.array(
         [
-            [left_x - side_x, left_y + side_y],
-            [left_x + span_x, left_y + span_y],
-            [right_x + side_x, right_y - side_y],
-            [right_x - span_x, right_y - span_y],
+            [left, top],
+            [left + size_x, top],
+            [left + size_x, top + size_y],
+            [left, top + size_y],
         ],
         dtype=np.float64,
     )
-    corners[:, 0] = np.clip(corners[:, 0], 0, max(width - 1, 0))
-    corners[:, 1] = np.clip(corners[:, 1], 0, max(height - 1, 0))
     return np.rint(corners).astype(np.int32)

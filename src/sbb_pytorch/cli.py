@@ -40,39 +40,64 @@ from pathlib import Path
 from typing import Any
 
 import click
+import numpy as np
+import torch
 
 from sbb_pytorch import __version__
 from sbb_pytorch.config import (
     SBBConfig,
+    UseCase,
     apply_overrides,
     dump_json_schema,
     load_config,
     load_page2label,
+    load_scales,
     validate_pair,
 )
+from sbb_pytorch.data.dataset import label_path_for
 from sbb_pytorch.device import resolve_device
 from sbb_pytorch.exceptions import CheckpointError, SBBError
 from sbb_pytorch.gt import (
     GroundTruthConfig,
-    # gt's own UseCase, not config.models.UseCase: the generator's has seven members
-    # (binarization and reading_order among them) and GroundTruthConfig.use_case needs one.
-    UseCase,
+    Page,
+    Region,
+    RegionKind,
+    contour_bbox,
+    contours_of_image,
     discover_xml_files,
     generate_ground_truth,
+    generate_pairs,
     parse_pagexml,
     render_page,
     write_image,
+    write_pagexml,
+    write_pair,
 )
 from sbb_pytorch.inference import Prediction, Predictor
 from sbb_pytorch.logging import get_logger, set_level
+from sbb_pytorch.metrics import accuracy, dice_score, mean_iou
 from sbb_pytorch.storage import latest_checkpoint, load_checkpoint
-from sbb_pytorch.storage.images import list_images
+from sbb_pytorch.storage.images import (
+    downscale_upscale,
+    imwrite,
+    list_images,
+    read_image,
+    read_mask,
+    resize_mask,
+)
 from sbb_pytorch.training import SBBLightningModule, fit
-from sbb_pytorch.training.callbacks import metric_snapshot
+from sbb_pytorch.training.callbacks import build_callbacks, metric_snapshot
 
 __all__ = ["main"]
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
+
+# Where ``sbb config-schema`` writes when ``-o`` is left out. The old default was the relative
+# ``docs/config-reference.json``, so the generated reference landed in whatever directory the
+# caller happened to stand in. The file it generates is the repository root's
+# ``docs/config-reference.json``, and the schema describes this package, so the path is derived
+# from the installed package (the ``src`` layout puts ``cli.py`` two levels under the root).
+DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "docs" / "config-reference.json"
 
 
 # ----------------------------------------------------------------------- click plumbing
@@ -191,6 +216,21 @@ def _device_value(_ctx: Any, _param: Any, value: str | None) -> str | None:
         raise click.BadParameter(str(exc)) from exc
 
 
+def _overlap_value(_ctx: Any, _param: Any, value: float | None) -> float | None:
+    """Validate ``--overlap`` at parse time; ``None`` keeps :meth:`Predictor.predict_grid`'s 0.5.
+
+    The window overlap was only reachable through the Python API: ``predict_grid`` accepts
+    ``[0, 1)`` and raises ``ValueError`` outside it, which after a checkpoint has been loaded
+    costs a model build to learn what click could have said. Same rule as
+    :func:`_device_value` -- a flag that parses is a flag that runs.
+    """
+    if value is None:
+        return None
+    if not 0.0 <= value < 1.0:
+        raise click.BadParameter(f"overlap must be in [0, 1), got {value}")
+    return float(value)
+
+
 def _collect_inputs(paths: Iterable[Path | str], *, limit: int | None = None) -> list[Path]:
     """Expand a mix of files and directories into the images to predict on, in sorted order."""
     files: list[Path] = []
@@ -219,6 +259,8 @@ def main(ctx: click.Context, verbose: bool) -> None:
       sbb train configs/textline.json            train from a config
       sbb infer runs/textline -i pages/          predict with a run's weights
       sbb gt generate --xml pages/ -o gt/        ground truth from ALTO/PageXML
+      sbb gt enhance -i pages/ -o gt/            write the degraded enhancement pages
+      sbb gt reading-order --xml pages/           pairwise reading-order samples
       sbb gt visualize page.xml -o page.png      render one XML page
       sbb export runs/textline/model.pt          rewrite a legacy checkpoint
       sbb validate configs/textline.json         check a config without running it
@@ -239,7 +281,7 @@ def main(ctx: click.Context, verbose: bool) -> None:
     "--model",
     "model_name",
     default=None,
-    help="Architecture from the registry, overriding the config's own backbone.",
+    help="Registry key overriding the architecture the config implies.",
 )
 @click.option(
     "--pretrained/--no-pretrained",
@@ -274,6 +316,14 @@ def main(ctx: click.Context, verbose: bool) -> None:
     default=None,
     help="Also save a checkpoint every N batches (the old --save-interval).",
 )
+@click.option(
+    "--callbacks-file",
+    "callbacks_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON list of extra callback classes to add to the run's own (see "
+    "sbb_pytorch.training.callbacks.load_callbacks_file).",
+)
 @click.option("--logger/--no-logger", default=True, help="Write TensorBoard (or CSV) logs.")
 @click.option("--progress-bar/--no-progress-bar", default=True)
 @click.option(
@@ -298,6 +348,7 @@ def train(
     page2label: Path | None,
     scales: Path | None,
     every_n_steps: int | None,
+    callbacks_file: Path | None,
     logger: bool,
     progress_bar: bool,
     dry_run: bool,
@@ -307,6 +358,14 @@ def train(
     The config is loaded, the flags are applied over it, and the advisories :command:`sbb
     validate` would print are printed *before* the run starts -- they used to be discovered as a
     crash halfway through the first epoch.
+
+    ``--callbacks-file`` adds callback classes to the ones the config implies rather than replacing
+    them: a JSON list of dotted import paths or ``{"class": ..., "init": {...}}`` objects, read by
+    :func:`~sbb_pytorch.training.callbacks.load_callbacks_file`. The finished list goes to
+    ``build_trainer``'s own ``callbacks=`` slot, which is the argument its docstring named the flag
+    for (``training/trainer.py:111``); ``every_n_steps`` moves into the same call because
+    ``build_trainer`` only derives the built set -- and so only reads that flag -- when it is given
+    no callbacks.
     """
     state: GlobalState = ctx.obj
     resolved = load_config(config, page2label_path=page2label, scales_path=scales)
@@ -326,6 +385,21 @@ def train(
     state.logger.debug("resolved config: %s", resolved.model_dump(mode="json"))
 
     module = SBBLightningModule(resolved, model_name=model_name, pretrained=pretrained)
+    # With a callbacks file the list is built here and handed over whole; without one the trainer
+    # builds it, which is the path every existing run takes and stays byte-identical to.
+    trainer_kwargs: dict[str, Any] = (
+        {"every_n_steps": every_n_steps}
+        if callbacks_file is None
+        else {
+            "callbacks": build_callbacks(
+                resolved,
+                module,
+                output_dir=output_dir,
+                every_n_steps=every_n_steps,
+                callbacks_file=callbacks_file,
+            )
+        }
+    )
     trainer = fit(
         resolved,
         module=module,
@@ -335,7 +409,7 @@ def train(
         save_final=not dry_run,
         logger="auto" if logger else False,
         enable_progress_bar=progress_bar,
-        every_n_steps=every_n_steps,
+        **trainer_kwargs,
         **({"fast_dev_run": 1} if dry_run else {}),
     )
 
@@ -376,11 +450,43 @@ def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -
 @click.option("-o", "--output-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option(
     "--save/--no-save",
-    default=True,
-    help="Write the image (or, for label-only tasks, the JSON answer).",
+    default=None,
+    help="Write the image (or, for label-only tasks, the JSON answer). Default: the config's "
+    "save_visualisation, the field that used to be read by nothing.",
 )
 @click.option("--save-layout/--no-save-layout", default=False, help="Also write the label map.")
+@click.option(
+    "--save-logits/--no-save-logits",
+    "save_logits",
+    default=False,
+    help="Also write the raw logits as <stem>_logits.pt beside the images -- the tensor "
+    "Prediction keeps for exactly this, which nothing used to serialise.",
+)
 @click.option("--patches/--no-patches", "patches", default=None, help="Default: the config's.")
+@click.option(
+    "--overlap",
+    type=float,
+    default=None,
+    callback=_overlap_value,
+    help="Sliding-window overlap for --patches; default the API's 0.5.",
+)
+@click.option(
+    "--ground-truth",
+    "ground_truth",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Label file or directory to score the pages against (the legacy --ground_truth, whose "
+    "IoU was computed and thrown away).",
+)
+@click.option(
+    "--xml-file",
+    "xml_file",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    default=None,
+    help="Write each page's answer back as PageXML (the legacy --xml_file, "
+    '"the result will be written in the same xml file"). One page: this file. Several: '
+    "<its directory>/<page stem>.xml. An existing file is read first so its metadata survives.",
+)
 @click.option(
     "-c",
     "--config",
@@ -405,9 +511,13 @@ def infer(
     inputs: tuple[Path, ...],
     extra_inputs: tuple[Path, ...],
     output_dir: Path | None,
-    save: bool,
+    save: bool | None,
     save_layout: bool,
+    save_logits: bool,
     patches: bool | None,
+    overlap: float | None,
+    ground_truth: Path | None,
+    xml_file: Path | None,
     config_path: Path | None,
     architecture: str | None,
     device: str | None,
@@ -419,6 +529,13 @@ def infer(
     ``-c`` says otherwise, which is what lets ``sbb infer runs/textline -i pages/`` work without
     repeating every option the training run used -- the legacy script needed
     ``--config --model --input --output`` every single time.
+
+    ``--ground-truth`` adds the per-page IoU/accuracy/Dice the legacy script computed and never
+    printed; ``--overlap`` tunes the sliding window ``--patches`` builds. Without ``--save`` or
+    ``--no-save``, the config's ``save_visualisation`` decides what gets written. ``--xml-file``
+    writes each page's answer back as PageXML, the way ``--xml_file`` and ``--page-xml`` did
+    upstream; see :func:`_page_xml_for` for which file that is and :func:`_write_page_xml` for what
+    goes in it.
     """
     state: GlobalState = ctx.obj
     checkpoint = _resolve_model_path(model)
@@ -435,25 +552,64 @@ def infer(
     destination = Path(output_dir if output_dir is not None else checkpoint.parent / "predictions")
     destination.mkdir(parents=True, exist_ok=True)
     use_patches = predictor.config.patches if patches is None else bool(patches)
+    # The same flag-or-config rule as --patches: save_visualisation decides, --save/--no-save wins.
+    should_save = predictor.config.save_visualisation if save is None else bool(save)
+    if overlap is not None and not use_patches:
+        raise click.BadParameter("--overlap tunes the --patches window; give --patches, or drop it")
 
     written = 0
+    xml_written = 0
+    scores: list[tuple[Path, dict[str, float]]] = []
     with _progress(len(files), "predict") as advance:
         for path in files:
-            prediction = predictor.predict_file(path, patches=use_patches)
-            written += _save_prediction(
-                prediction, path, destination, save=save, save_layout=save_layout
+            prediction = predictor.predict_file(
+                path,
+                patches=use_patches,
+                **({"overlap": overlap} if overlap is not None else {}),
             )
+            written += _save_prediction(
+                prediction,
+                path,
+                destination,
+                save=should_save,
+                save_layout=save_layout,
+                save_logits=save_logits,
+            )
+            if xml_file is not None:
+                xml_written += _write_page_xml(
+                    prediction,
+                    path,
+                    _page_xml_for(path, xml_file, single_page=len(files) == 1),
+                    predictor.config,
+                )
+            if ground_truth is not None:
+                scores.append((path, _score_prediction(prediction, path, ground_truth)))
             advance(path)
     state.logger.debug("predictor built from %s", checkpoint)
-    click.secho(
-        f"{len(files)} page(s) predicted from {checkpoint}"
-        + (f", {written} file(s) written to {destination}" if written else ", nothing saved"),
-        fg="green",
+    summary = f"{len(files)} page(s) predicted from {checkpoint}" + (
+        f", {written} file(s) written to {destination}" if written else ", nothing saved"
     )
+    if xml_written:
+        # Its own clause, not part of the image count: ``--xml-file`` often names a file somewhere
+        # else, so the number beside ``destination`` would be about a directory it did not write to.
+        summary += f", {xml_written} PageXML file(s) written"
+    click.secho(summary, fg="green")
+    # Same table shape ``sbb train`` prints, one row per scored page.
+    for path, values in scores:
+        click.echo(
+            f"  {path.name:<24} "
+            + " ".join(f"{name}={value:.6f}" for name, value in sorted(values.items()))
+        )
 
 
 def _save_prediction(
-    prediction: Prediction, source: Path, destination: Path, *, save: bool, save_layout: bool
+    prediction: Prediction,
+    source: Path,
+    destination: Path,
+    *,
+    save: bool,
+    save_layout: bool,
+    save_logits: bool = False,
 ) -> int:
     """Write whatever this prediction actually produced; return the number of files written.
 
@@ -463,10 +619,21 @@ def _save_prediction(
     rather than pretend otherwise, and the legacy script wrote nothing at all -- so their answer
     goes to ``<stem>_prediction.json``. Without this, ``sbb infer`` on a classification checkpoint
     failed on its own default ``--save``.
+
+    ``--save-logits`` is counted here rather than inside ``Prediction.save`` because the logits are
+    not an image: :class:`~sbb_pytorch.inference.predictor.Prediction` documents them as kept "for
+    metrics and ``--save-logits`` style debugging", and this is the only place that can write them
+    (``torch.save`` of the ``(n_classes, H, W)`` tensor, so a checkpoint's own output size survives
+    the resize the image goes through). They are written even when ``--no-save`` suppresses images,
+    since asking for the logits *is* the request.
     """
+    written = 0
+    if save_logits and prediction.logits is not None:
+        torch.save(prediction.logits.cpu(), destination / f"{source.stem}_logits.pt")
+        written = 1
     if prediction.mask is None and prediction.image is None:
         if not save or prediction.label is None:
-            return 0
+            return written
         target = destination / f"{source.stem}_prediction.json"
         target.write_text(
             json.dumps(
@@ -482,15 +649,194 @@ def _save_prediction(
             ),
             encoding="utf-8",
         )
-        return 1
+        return written + 1
     if not (save or save_layout):
-        return 0
-    return len(
+        return written
+    return written + len(
         prediction.save(
             save=str(destination / f"{source.stem}_prediction.png") if save else None,
             save_layout=(str(destination / f"{source.stem}_layout.png") if save_layout else None),
         )
     )
+
+
+def _page_xml_for(source: Path, xml_file: Path, *, single_page: bool) -> Path:
+    """Which PageXML file *source*'s answer goes into, given ``--xml-file``.
+
+    The flag names one file, which is what upstream's meant (``inference.py:731-735``: "xml file
+    with layout coordinates that reading order detection will be implemented on. The result will be
+    written in the same xml file") and is only well defined for one page. Over several pages -- the
+    case ``-i/--input`` has always allowed and the sibling ``--page-xml``
+    (``inference.py:736-740``, "save PAGE-XML file with detected regions and lines") never resolved
+    either -- the file's *directory* plus the page's stem is the pairing rule the port already uses
+    for every other per-page artefact (:func:`sbb_pytorch.data.dataset.label_path_for`: same
+    directory, same stem, extension from the artefact instead of the task-dependent ``.png`` it
+    picks for a label). An omitted ``--xml-file`` writes no PageXML at all, even where a sibling
+    exists: overwriting a hand-authored page is not something to do by accident, which is why the
+    option -- like ``--save``, whose default is the config's -- has to be asked for.
+    """
+    return xml_file if single_page else xml_file.parent / f"{source.stem}.xml"
+
+
+def _class_name(config: SBBConfig, label: int) -> str:
+    """The name a class id answers with: page2label's, else the ``class_<id>`` fallback.
+
+    The same rule :meth:`sbb_pytorch.inference.predictor.Predictor._class_names` applies to a
+    classification answer, so a region written from a mask and a ``_prediction.json`` written from a
+    label name the same class the same way.
+    """
+    mapping = config.page2label.class_ids() if config.page2label else {}
+    return ", ".join(sorted(mapping[label])) if mapping.get(label) else f"class_{label}"
+
+
+def _mask_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+    """The regions a mask answer describes: one per contour of every class on the page.
+
+    v3 built one ``TextRegion`` per class from that class's contours and put each contour in as a
+    ``TextLine`` (``inference.py:615-673``); :class:`~sbb_pytorch.gt.Page` models no parent/child
+    relation (``gt/parser.py:257-287``), so each contour becomes a region of its own, with the id
+    ``<page stem>_<class>_<n>`` and the class name :func:`_class_name` gives it. The area floor is
+    off because :data:`~sbb_pytorch.gt.DEFAULT_MIN_AREA_PIXELS` exists to shed JPEG noise, and a
+    predicted textline one pixel wide has an OpenCV area of zero.
+    """
+    regions: list[Region] = []
+    for label in (int(value) for value in np.unique(mask) if int(value) != 0):
+        # One raster per class, because ``cv2.findContours`` cannot segment a labelled field: the
+        # port's own gt pipeline masks per class the same way (gt/generator.py builds its label map
+        # first and asks geometry for the contours of one region at a time).
+        contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
+        for index, contour in enumerate(contours):
+            regions.append(
+                Region(
+                    kind=RegionKind.TEXT,
+                    type_name=_class_name(config, label),
+                    region_id=f"{source.stem}_{label}_{index}",
+                    contour=contour,
+                )
+            )
+    return regions
+
+
+def _ordered_ids(page: Page, label: str) -> dict[str, int]:
+    """``Page.region_index`` for a page whose answer is the class name *label*.
+
+    A label names a class, not a sequence of regions, and a PageXML order can only reference regions
+    that exist: the regions whose ``@type`` the label covers -- a multi-name class is exactly the
+    comma string ``Prediction.label`` carries (``inference/predictor.py:285-289``) -- are ordered
+    top-to-bottom then left-to-right, and the regions it does not cover keep no index instead of
+    vanishing, which is how :func:`sbb_pytorch.gt.reading_order.ordered_regions` treats the ones a
+    min-area filter rejected. The order itself is the page's geometry rather than the model's,
+    because a single class label carries no ordering information to keep.
+    """
+    covered = {name.strip() for name in label.split(",") if name.strip()}
+    ranked = sorted(
+        (region for region in page.regions if region.region_id and region.type_name in covered),
+        key=lambda region: (
+            *contour_bbox(region.contour, (page.height, page.width))[:2],
+            region.region_id,
+        ),
+    )
+    return {region.region_id: index for index, region in enumerate(ranked)}
+
+
+def _page_from_prediction(
+    source: Path, prediction: Prediction, config: SBBConfig, existing: Page | None
+) -> Page:
+    """The page *source* is now that it has a prediction, keeping what the file already knew.
+
+    Three shapes, the same three :class:`~sbb_pytorch.inference.predictor.Prediction` can hold:
+
+    a ``mask`` (segmentation, binarization)
+        The regions come from the prediction (:func:`_mask_regions`) -- the ``--page-xml`` half of
+        upstream -- while the declared size and the ``Metadata`` column count come from *existing*
+        when the file was readable and from the mask itself when it was not. The old reading order
+        goes with the old regions: its ids named regions that are no longer there, and the new ones
+        name classes.
+    a ``label`` (classification, reading order)
+        The answer is an ordering, so the page keeps every region it had (``dataclasses.replace``)
+        and gains the order :func:`_ordered_ids` builds. With no file to order there is nothing to
+        write: ``--xml-file`` then says so in one line rather than writing an empty page that would
+        overwrite the description it could not read.
+    neither (this port's enhancement page: ``image`` and logits, never a mask, where v3's
+        ``--xml_file`` only ever ran the segmentation branch -- ``inference.py:753`` literally
+        hardcoded ``task = 'segmentation'``)
+        Reported the way ``--ground-truth`` reports the same shape, instead of writing a page whose
+        regions came from nowhere.
+    """
+    if prediction.mask is not None:
+        height, width = prediction.mask.shape[:2]
+        return Page(
+            path=source,
+            file_name=source.stem,
+            height=existing.height if existing else int(height),
+            width=existing.width if existing else int(width),
+            columns_width=existing.columns_width if existing else None,
+            regions=_mask_regions(source, config, prediction.mask),
+        )
+    if prediction.label is not None:
+        if existing is None:
+            raise click.ClickException(
+                f"--xml-file has no page to order: {source.name} has no PageXML beside it, and "
+                f"task={prediction.task.value} answers with a label, which is an order stamped onto "
+                f"an existing page"
+            )
+        return replace(existing, region_index=_ordered_ids(existing, prediction.label or ""))
+    raise click.ClickException(
+        f"--xml-file cannot describe {source.name}: task={prediction.task.value} produced neither a "
+        f"mask nor a label, so there are no regions or order to write"
+    )
+
+
+def _write_page_xml(prediction: Prediction, source: Path, target: Path, config: SBBConfig) -> int:
+    """Fold one page's answer into its PageXML and write the file; returns 1.
+
+    An existing *target* is parsed before anything is written, because upstream's promise was that
+    the result goes into *the same file* (``inference.py:731-735``), not that the file is replaced
+    with a stub -- and a file that is not readable PageXML raises
+    :class:`~sbb_pytorch.exceptions.PageXMLError`, which ``SBBGroup`` prints as one ``Error:`` line,
+    rather than being overwritten unread. A *missing* target is not an error for a task that answers
+    with regions (that is what ``--page-xml`` created, and why ``exists=False``): the file is built
+    from the prediction and written. ``--no-save`` still writes the XML: asking for it *is* the
+    request, the way ``--save-logits`` is.
+    """
+    existing = parse_pagexml(target) if target.is_file() else None
+    write_pagexml(_page_from_prediction(source, prediction, config, existing), target)
+    return 1
+
+
+def _score_prediction(prediction: Prediction, source: Path, ground_truth: Path) -> dict[str, float]:
+    """Score one page against its ground-truth label -- the IoU ``inference_pytorch.py`` discarded.
+
+    The legacy script ran ``calculate_iou(gt, pred)`` whenever ``--ground_truth`` was given and
+    never printed the number. The metrics come from :mod:`sbb_pytorch.metrics` and the label from
+    :func:`~sbb_pytorch.data.dataset.label_path_for` (a label file directly, or the ``<stem>.png``
+    in the given directory). Only a task that answers per pixel can be scored: a classification
+    page has a label and an enhancement page an image, neither of which the confusion-matrix
+    metrics can compare, so those raise instead of printing a number that would mean nothing.
+    """
+    if prediction.mask is None:
+        raise click.ClickException(
+            f"--ground-truth scores a per-pixel prediction; {source.name} gave no mask "
+            f"for task={prediction.task.value}"
+        )
+    label_path = (
+        ground_truth
+        if ground_truth.is_file()
+        else label_path_for(source, ground_truth, task=prediction.task)
+    )
+    try:
+        # Both sides at the prediction's own grid: the metric compares the two sample-for-sample,
+        # and ``resize_mask`` is the same nearest-neighbour resizer the predictor used for its logits.
+        label = resize_mask(read_mask(label_path), *prediction.mask.shape[:2])
+        predicted, target = torch.from_numpy(prediction.mask)[None], torch.from_numpy(label)[None]
+        n_classes = prediction.logits.shape[0] if prediction.logits is not None else None
+        return {
+            "miou": mean_iou(predicted, target, n_classes),
+            "accuracy": accuracy(predicted, target, n_classes),
+            "dice": dice_score(predicted, target, n_classes),
+        }
+    except ValueError as exc:  # e.g. a label id outside the config's class range
+        raise click.ClickException(f"cannot score {source.name}: {exc}") from exc
 
 
 def _resolve_model_path(model: Path) -> Path:
@@ -545,7 +891,7 @@ def validate(
 
 @main.group()
 def gt() -> None:
-    """Ground truth: generate training images from ALTO/PageXML, or render one page."""
+    """Ground truth from ALTO/PageXML: generate, enhance, reading-order, or render one page."""
 
 
 @gt.command("generate")
@@ -580,7 +926,10 @@ def gt() -> None:
 )
 @click.option("--images-output-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option(
-    "--min-area", type=float, default=None, help="Smallest contour kept, as a page fraction."
+    "--min-area",
+    type=float,
+    default=None,
+    help="Smallest contour kept, as a page fraction; overrides the --config value.",
 )
 @click.option("--limit", type=int, default=None, help="Process only the first N XML files.")
 @click.option("--dry-run", is_flag=True, help="List what would be generated and stop.")
@@ -610,16 +959,17 @@ def gt_generate(
     if config_path is None and use_case_raw is None:
         raise click.BadParameter("give --config or --use-case")
 
-    gt_config: GroundTruthConfig | Path = (
-        config_path
+    # ``--min-area`` next to ``--config`` used to be refused outright ("it is set in the file"),
+    # which made a config file the only place to change one number. The field is overridden in
+    # place now -- the flag-then-file precedence ``sbb train`` already uses for its own config --
+    # and the config is parsed here so an unreadable file fails before the XML folder is walked.
+    gt_config = (
+        GroundTruthConfig.parse(config_path)
         if config_path is not None
-        else GroundTruthConfig(
-            use_case=UseCase(use_case_raw or "layout"),
-            **({"min_area": min_area} if min_area is not None else {}),
-        )
+        else GroundTruthConfig(use_case=UseCase(use_case_raw or "layout"))
     )
-    if config_path is not None and min_area is not None:
-        raise click.BadParameter("--min-area is set in the --config file")
+    if min_area is not None:
+        gt_config = replace(gt_config, min_area=min_area)
 
     xml_files = discover_xml_files(xml_dir)
     if limit is not None:
@@ -699,6 +1049,177 @@ def gt_visualize(
     click.secho(f"wrote {written}", fg="green")
 
 
+@gt.command("enhance")
+@click.option(
+    "-i",
+    "--images",
+    required=True,
+    multiple=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Source pages: files and/or directories (the legacy ``--dir_imgs``).",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+    help="Where the degraded pages go (``--dir_out_images``).",
+)
+@click.option(
+    "--labels-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Where the originals are written as enhancement labels (``--dir_out_labels``); "
+    "default ``<output-dir>_labels``, the sibling the legacy command asked for.",
+)
+@click.option(
+    "-s",
+    "--scales",
+    "scales_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="``scales_enhancement.json``; its ``scales`` list is the degradation set.",
+)
+@click.option("--limit", type=int, default=None, help="Stop after N pages.")
+@click.option("--dry-run", is_flag=True, help="List the pages and stop.")
+def gt_enhance(
+    images: tuple[Path, ...],
+    output_dir: Path,
+    labels_dir: Path | None,
+    scales_path: Path,
+    limit: int | None,
+    dry_run: bool,
+) -> None:
+    """Write each page degraded to every scale -- the legacy ``image_enhancement`` command.
+
+    ``generate_gt_for_training.py``'s ``image_enhancement`` read ``scales_enhancement.json``,
+    resized every page down and back up once per scale, and wrote the pair: the degraded page as
+    the image, the original as the label. That is
+    :func:`~sbb_pytorch.storage.images.downscale_upscale` (the function the port keeps for it)
+    plus :func:`~sbb_pytorch.config.load_scales`, one page and one scale at a time.
+    """
+    scales = load_scales(scales_path).scales
+    pages = _collect_inputs(images, limit=limit)
+    if not pages:
+        raise click.BadParameter("no images to degrade (give a file, a directory, or --images)")
+    labels_out = Path(labels_dir) if labels_dir is not None else Path(f"{output_dir}_labels")
+    if dry_run:
+        for path in pages:
+            click.echo(path.name)
+        click.secho(
+            f"{len(pages)} page(s) x {len(scales)} scale(s) would produce "
+            f"{len(pages) * len(scales)} image/label pair(s) in {output_dir}",
+            fg="green",
+        )
+        return
+
+    written = 0
+    with _progress(len(pages), "enhance") as advance:
+        for path in pages:
+            image = read_image(path)
+            for index, scale in enumerate(scales):
+                # One pair per scale, named like the legacy ``<stem>_<i>.<ext>``: the loader matches
+                # an enhancement image to its label by filename, so both halves need the same name.
+                name = f"{path.stem}_{index}{path.suffix}"
+                imwrite(output_dir / name, downscale_upscale(image, scale))
+                imwrite(labels_out / name, image)
+                written += 2
+            advance(path)
+    click.secho(f"{written} file(s) written to {output_dir} and {labels_out}", fg="green")
+
+
+@gt.command("reading-order")
+@click.option(
+    "--xml",
+    "xml_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Folder of ALTO/PageXML files (the legacy ``--dir_xml``).",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+    help="Where the modal images go (``--dir_out_modal_image``).",
+)
+@click.option(
+    "--classes-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Where the ``.npy`` class labels go (``--dir_out_classes``); default "
+    "``<output-dir>/classes``.",
+)
+@click.option(
+    "--size", nargs=2, type=int, default=None, metavar="H W", help="Rasters at this size."
+)
+@click.option(
+    "--min-area", type=float, default=None, help="Smallest region paired (``--min_area_size``)."
+)
+@click.option("--max-area", type=float, default=None, help="Largest region paired.")
+@click.option(
+    "--min-area-early",
+    type=float,
+    default=None,
+    help="The second threshold the legacy command took, ``--min_area_early``: regions under it "
+    "are still paired, but marked ``_missed``.",
+)
+@click.option(
+    "--index-start", type=int, default=0, help="First counter value, for appending to a dataset."
+)
+@click.option("--limit", type=int, default=None, help="Process only the first N XML files.")
+@click.option("--dry-run", is_flag=True, help="Count the pairs without writing them.")
+def gt_reading_order(
+    xml_dir: Path,
+    output_dir: Path,
+    classes_dir: Path | None,
+    size: tuple[int, int] | None,
+    min_area: float | None,
+    max_area: float | None,
+    min_area_early: float | None,
+    index_start: int,
+    limit: int | None,
+    dry_run: bool,
+) -> None:
+    """Write the pairwise samples of ``--xml`` -- the legacy ``machine_based_reading_order`` command.
+
+    The old script read the XML inline and emitted one ``.png`` + ``.npy`` pair per ordered region
+    pair; :func:`~sbb_pytorch.gt.reading_order.generate_pairs` is that code ported and
+    :func:`~sbb_pytorch.gt.reading_order.write_pair` keeps its file contract, ``_missed`` marker
+    included.
+    """
+    xml_files = discover_xml_files(xml_dir)
+    if limit is not None:
+        xml_files = xml_files[: int(limit)]
+    if not xml_files:
+        raise click.BadParameter(f"no ALTO/PageXML files in {xml_dir}")
+    classes_out = Path(classes_dir) if classes_dir is not None else output_dir / "classes"
+    sizes = {"input_height": size[0], "input_width": size[1]} if size else {}
+    areas = {
+        name: value
+        for name, value in (
+            ("min_area", min_area),
+            ("max_area", max_area),
+            ("min_area_early", min_area_early),
+        )
+        if value is not None
+    }
+
+    written = 0
+    with _progress(len(xml_files), "reading order") as advance:
+        for xml_file in xml_files:
+            pairs = generate_pairs(
+                parse_pagexml(xml_file), **sizes, **areas, index_start=index_start
+            )
+            for pair in pairs:
+                if not dry_run:
+                    write_pair(pair, output_dir, classes_out)
+                written += 1
+            advance(xml_file)
+    verb = "would be written" if dry_run else "were written"
+    click.secho(f"{len(xml_files)} page(s) in {xml_dir}: {written} pair(s) {verb}", fg="green")
+
+
 # ----------------------------------------------------------------------------- sbb export
 
 
@@ -749,11 +1270,11 @@ def export(checkpoint: Path, dest: Path | None) -> None:
     "dest",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Where to write; default docs/config-reference.json.",
+    help=f"Where to write; default {DEFAULT_SCHEMA_PATH}.",
 )
 def config_schema(dest: Path | None) -> None:
     """Write the JSON schema of ``SBBConfig`` -- the generated config reference."""
-    written = dump_json_schema(Path(dest) if dest is not None else "docs/config-reference.json")
+    written = dump_json_schema(Path(dest) if dest is not None else DEFAULT_SCHEMA_PATH)
     click.secho(f"wrote {written}", fg="green")
 
 

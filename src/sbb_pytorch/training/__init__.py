@@ -15,8 +15,10 @@ Module                      Replaces
 :mod:`~sbb_pytorch.training.callbacks`
                             ``train.py``'s ``SaveWeightsAfterSteps`` (wrong hook signature, never
                             ran), ``training.py``'s ``ModelCheckpoint`` (unread ``self.model``,
-                            crashed on first save), and ``train.py``'s unconditional checkpoint and
-                            early-stopping pairs
+                            crashed on first save), ``train.py``'s unconditional checkpoint and
+                            early-stopping pairs, and ``load_callbacks_file`` behind
+                            ``sbb train --callbacks-file`` (nothing legacy could add a callback
+                            without editing the file)
 :mod:`~sbb_pytorch.training.trainer`
                             ``train.py``'s ``pl.Trainer(...)`` call, its ``torch.save`` of the final
                             model, and ``training.py``'s hand-written ``Trainer`` class with its
@@ -42,6 +44,7 @@ from sbb_pytorch.training.callbacks import (
     build_callbacks,
     checkpoint_for,
     early_stopping_for,
+    load_callbacks_file,
     metric_mode,
     metric_snapshot,
     monitor_metrics,
@@ -89,6 +92,7 @@ __all__ = [
     "fit",
     "init_weights",
     "kaiming_init",
+    "load_callbacks_file",
     "metric_mode",
     "metric_snapshot",
     "monitor_metrics",

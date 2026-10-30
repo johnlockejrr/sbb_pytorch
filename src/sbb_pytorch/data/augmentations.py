@@ -128,6 +128,12 @@ def geometric_transforms(config: SBBConfig, *, training: bool = True) -> list[A.
     the former cropped a random region scaled by ``scale``, the latter resized exactly. The
     config's own ``scaling`` flag decides now -- with ``scaling`` on, ``RandomResizedCrop`` at
     ``(min(scales), 1.0)``; without it, a plain ``Resize`` to the configured size.
+
+    ``scaling_flip`` and ``scaling_bluring`` are absent on purpose. In the legacy code both live
+    in the patch-writing branch only (``utils.py:1033`` and ``utils.py:1048``, each emitting one
+    file per scale/blurring or scale/flip combination, which :mod:`sbb_pytorch.data.patches`
+    reproduces at ``patches.py:646`` and ``patches.py:681``); neither has a runtime-augmentation
+    meaning, so this function ignores them rather than inventing one.
     """
     height, width = config.image_size
     if not training:
@@ -150,10 +156,6 @@ def geometric_transforms(config: SBBConfig, *, training: bool = True) -> list[A.
         transforms.append(
             A.Rotate(limit=(min(angles), max(angles)), p=DEFAULT_PROBABILITY, border_mode=0)
         )
-    if config.scaling_flip or config.scaling_bluring:
-        # The two "scale and then X" flags have no albumentation equivalent beyond a crop-scale
-        # sweep; RandomResizedCrop above already covers the scaling half of both.
-        pass
     if config.channels_shuffling:
         transforms.append(A.ChannelShuffle(p=DEFAULT_PROBABILITY))
     return transforms

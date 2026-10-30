@@ -95,6 +95,37 @@ def test_predict_accepts_an_array_and_a_path_equally(tmp_path: Path, page) -> No
     assert from_array.path is None
 
 
+def test_predict_runs_the_forward_pass_its_result_comes_from(tmp_path: Path, page) -> None:
+    """One whole-page forward without ``--patches``; with it, exactly the tiles and nothing more.
+
+    ``predict`` used to run the whole-page forward and then replace ``logits`` with
+    :meth:`Predictor.predict_grid`, still indexing ``[0]`` -- discarding the pass it had just paid
+    for and handing ``_make_prediction`` the page's first *row* where it wanted the class axis. The
+    two branches now each compute the field they return.
+    """
+    path, array = page
+    single = StubModel(torch.zeros(1, 3, 8, 8))
+    assert Predictor(single, make()).predict(path).mask is not None
+    assert single.calls == 1
+
+    patched = StubModel(torch.zeros(1, 3, 8, 8))
+    prediction = Predictor(patched, make()).predict(path, patches=True)
+    assert patched.calls == 9  # the 4x4-step grid over the 16x16 page, and nothing else
+    assert prediction.mask is not None and prediction.mask.shape == array.shape[:2]
+
+
+def test_predict_threads_overlap_to_the_grid(tmp_path: Path, page) -> None:
+    """``sbb infer --overlap`` is what reaches :meth:`Predictor.predict_grid`'s window step."""
+    path, _ = page
+    quarter = StubModel(torch.zeros(1, 3, 8, 8))
+    Predictor(quarter, make()).predict_file(path, patches=True, overlap=0.75)
+    assert quarter.calls == 25  # step 2 over a 16x16 page: five rows of five tiles
+
+    whole = StubModel(torch.zeros(1, 3, 8, 8))
+    Predictor(whole, make()).predict_file(path, patches=True, overlap=0.0)
+    assert whole.calls == 4  # step 8: two rows of two tiles
+
+
 def test_save_writes_the_overlay_at_full_page_resolution(tmp_path: Path, page) -> None:
     """The overlay used to shrink the page to the model's output size and save a thumbnail."""
     path, array = page

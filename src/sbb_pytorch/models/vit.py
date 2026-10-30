@@ -29,13 +29,15 @@ both numbers in the message instead of at forward time with ``shape`` tuples.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from sbb_pytorch.config.models import TaskType
 from sbb_pytorch.exceptions import ModelBuildError
-from sbb_pytorch.models.base import RESNET_STRIDES
+from sbb_pytorch.models.base import RESNET_STRIDES, probs
 from sbb_pytorch.models.unet import UNet
 
 __all__ = [
@@ -185,25 +187,49 @@ class PatchDecoder(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block (identical maths to the legacy one; relocated for reuse)."""
+    """Pre-norm transformer block (identical maths to the legacy one; relocated for reuse).
+
+    ``mlp_units`` is the block's own MLP -- one ``Linear -> GELU -> Dropout`` per entry, the
+    legacy ``mlp(x, hidden_units, dropout_rate)`` loop (``training/models.py:109-113``) that
+    ``transformer_block`` ran with the config's ``transformer_mlp_head_units``. The two ViT
+    variants used to accept ``mlp_head_units``, store it on ``self`` and build something else.
+
+    Its output is added back onto the attention output, so the chain always ends at ``dim``:
+    upstream got that for free because its last unit *was* ``projection_dim``, which left any
+    config that shrinks one without shrinking the other (every test config here shrinks
+    ``projection_dim`` to 8 and keeps ``[128, 64]``) unbuildable in Keras and in this port
+    alike. The declared widths are therefore the *hidden* layers and ``dim`` closes the chain --
+    with the legacy ``[128, 64]`` at ``projection_dim=64`` that is exactly upstream's two
+    ``Dense`` layers. ``mlp_ratio`` stays as the fallback for callers that pass no units.
+    """
 
     def __init__(
-        self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        mlp_units: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         if dim % num_heads:
             raise ModelBuildError(f"dim {dim} is not divisible by num_heads {num_heads}")
+        declared = (
+            (int(dim * mlp_ratio),) if mlp_units is None else tuple(int(unit) for unit in mlp_units)
+        )
+        if not declared or min(declared) < 1:
+            raise ModelBuildError(f"mlp units {declared} must all be positive")
+        units = declared if declared[-1] == dim else (*declared, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
+        self.mlp_units = units
+        layers: list[nn.Module] = []
+        in_features = dim
+        for width in units:
+            layers.extend([nn.Linear(in_features, width), nn.GELU(), nn.Dropout(dropout)])
+            in_features = width
+        self.mlp = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         normed = self.norm1(x)
@@ -214,12 +240,22 @@ class TransformerBlock(nn.Module):
 class TransformerTower(nn.Module):
     """``layers`` stacked :class:`TransformerBlock`s -- the piece both ViT variants duplicated."""
 
-    def __init__(self, dim: int, num_heads: int, layers: int = 8, mlp_ratio: float = 4.0) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        layers: int = 8,
+        mlp_ratio: float = 4.0,
+        mlp_units: Sequence[int] | None = None,
+    ) -> None:
         super().__init__()
         if layers < 1:
             raise ModelBuildError(f"transformer layers must be >= 1, got {layers}")
         self.blocks = nn.ModuleList(
-            [TransformerBlock(dim, num_heads, mlp_ratio) for _ in range(layers)]
+            [
+                TransformerBlock(dim, num_heads, mlp_ratio, mlp_units=mlp_units)
+                for _ in range(layers)
+            ]
         )
         self.norm = nn.LayerNorm(dim)
 
@@ -245,10 +281,13 @@ class _ViTBackbone(nn.Module):
         projection_dim: int,
         transformer_layers: int,
         num_heads: int,
+        mlp_units: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         self.patch_encoder = PatchEncoder(feature_dim, projection_dim, num_patches)
-        self.tower = TransformerTower(projection_dim, num_heads, transformer_layers)
+        self.tower = TransformerTower(
+            projection_dim, num_heads, transformer_layers, mlp_units=mlp_units
+        )
         self.patch_decoder = PatchDecoder(projection_dim, feature_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -302,6 +341,7 @@ class ViTResNet50UNet(_ViTBackbone):
             projection_dim,
             transformer_layers,
             num_heads,
+            mlp_units=tuple(mlp_head_units),
         )
         self.patch_size_x, self.patch_size_y = patch_size_x, patch_size_y
         self.mlp_head_units = tuple(mlp_head_units)
@@ -334,6 +374,17 @@ class ViTResNet50UNet(_ViTBackbone):
         # The head concatenates ``x`` onto the decoder's map, so the class map is computed at the
         # input's own resolution from the input's own pixels.
         return self.head(self.decoder(features), x)
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Probabilities for the metrics and inference, from this class's own ``forward``.
+
+        Every registry entry answers ``predict_proba``; the two ViT classes assemble their heads by
+        hand rather than through ``UNet``, so each spells the rule out here instead of inheriting it.
+        """
+        return probs(
+            self.forward(x),
+            task_binary=self.task in (TaskType.BINARIZATION, TaskType.ENHANCEMENT),
+        )
 
 
 class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
@@ -372,6 +423,7 @@ class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
             projection_dim,
             transformer_layers,
             num_heads,
+            mlp_units=tuple(mlp_head_units),
         )
         self.unet = UNet(
             n_classes,
@@ -389,7 +441,19 @@ class ViTResNet50UNetTransformerBeforeCNN(nn.Module):
         reconstructed = unpatch(
             self.transformer(tokens), x.shape[-2], x.shape[-1], self.patch_size_y, self.patch_size_x
         )
-        return self.unet(reconstructed)
+        # The encoder consumes the transformer's output, but the head fuses the *page*: upstream
+        # hands ``inputs`` to ``unet_decoder`` (``models.py:427``) and only ``encoded_patches`` to
+        # the ResNet (``:425``). ``self.unet(reconstructed)`` would show the head a reconstruction
+        # of the page instead of the page, quietly changing the head's input.
+        logits = self.unet.head(self.unet.decoder(self.unet.encoder(reconstructed)), x)
+        return self.unet.activate(logits)
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Probabilities through this class's own ``forward``, not the wrapped U-Net's."""
+        return probs(
+            self.forward(x),
+            task_binary=self.task in (TaskType.BINARIZATION, TaskType.ENHANCEMENT),
+        )
 
 
 def _stage_spatial(height: int, width: int, stage: int) -> tuple[int, int]:

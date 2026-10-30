@@ -154,10 +154,12 @@ def apply_overrides(config: SBBConfig, **overrides: Any) -> SBBConfig:
 
 
 def dump_json_schema(dest: str | Path = "docs/config-reference.json") -> Path:
-    """Write the generated JSON schema -- the source of ``docs/config-reference.md``.
+    """Write ``docs/config-reference.json`` -- the generated schema, and the only config doc.
 
     The pre-refactor configs were documented by a hand-written table that had already drifted
-    from the code; this file is generated, so it cannot drift.
+    from the code; this file is generated from :class:`SBBConfig`, so it cannot drift, and there
+    is no second copy to keep in step (a Markdown reference used to be named here while only the
+    JSON one existed).
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)

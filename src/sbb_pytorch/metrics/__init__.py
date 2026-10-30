@@ -92,6 +92,7 @@ from typing import Any
 
 from torch import Tensor
 
+from sbb_pytorch.exceptions import UnsupportedTaskError
 from sbb_pytorch.metrics import enhance, functional, segmentation
 from sbb_pytorch.metrics.enhance import (
     PSNRMetric,
@@ -218,14 +219,15 @@ def get_metrics(task: str, n_classes: int | None = None, **kwargs: Any) -> dict[
 
     Raises:
         ValueError: an unknown task, or a missing ``n_classes`` where one is required.
-        NotImplementedError: ``reading_order``, which has no pixel-wise metric -- machine reading
-            order is validated through :mod:`sbb_pytorch.gt` instead.
+        UnsupportedTaskError: ``reading_order``, which has no pixel-wise metric -- machine reading
+            order is validated through :mod:`sbb_pytorch.gt` instead. It subclasses
+            ``NotImplementedError``, which is what ``training.module._metrics_for`` catches.
     """
     # str() of an Enum member is "TaskType.SEGMENTATION"; the value is what we mean.
     name = str(getattr(task, "value", task)).lower()
 
     if name == "reading_order":
-        raise NotImplementedError(
+        raise UnsupportedTaskError(
             "reading_order has no pixel-wise metric; order is validated via sbb_pytorch.gt"
         )
     if name == "enhancement":

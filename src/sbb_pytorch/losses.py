@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from sbb_pytorch.exceptions import UnsupportedTaskError
 from sbb_pytorch.metrics import enhance, functional
 from sbb_pytorch.metrics.functional import (
     DEFAULT_FOCAL_ALPHA,
@@ -536,13 +537,15 @@ def get_loss_function(
 
     Raises:
         ValueError: an unknown task or loss name.
-        NotImplementedError: ``reading_order``, which has no trainable loss in this port -- the
-            task is inference-only (machine reading order comes from the GT pipeline).
+        UnsupportedTaskError: ``reading_order``, which has no trainable loss in this port -- the
+            task is inference-only (machine reading order comes from the GT pipeline). It is also
+            a ``NotImplementedError``, and being an ``SBBError`` is what lets ``sbb train`` answer
+            in one line instead of a traceback.
     """
     # str() of an Enum member is "TaskType.SEGMENTATION"; the value is what we mean.
     name = str(getattr(task, "value", task)).lower()
     if name == "reading_order":
-        raise NotImplementedError(
+        raise UnsupportedTaskError(
             f"task={task!r} has no trainable loss in this port; it is served by inference "
             "(see sbb_pytorch.gt for the ground-truth ordering)"
         )

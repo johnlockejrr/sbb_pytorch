@@ -14,6 +14,8 @@ are defined on the reconstructed image itself rather than on logits.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torchvision.models as tv_models
@@ -48,18 +50,33 @@ def resnet_features(backbone: str = "resnet50", pretrained: bool = True) -> tupl
 
 
 class _MLPHead(nn.Module):
-    """``Linear -> ReLU -> Dropout -> Linear``, the hidden layer both classification heads share."""
+    """``[Linear -> ReLU -> Dropout] * hidden_units -> Linear``, the head both models share.
+
+    Every width in ``hidden_units`` becomes a layer -- not just the first one. The reading-order
+    model declares ``(256, 256)`` because upstream has two 256-unit dense layers with a dropout
+    after each (``training/models.py:462-466``), and building a single layer from that tuple left
+    the argument accepted and ignored, which is the exact defect class this refactor set out to
+    remove. ``hidden_units`` is now a tuple of widths rather than "a width and a lie".
+    """
 
     def __init__(
-        self, feature_dim: int, hidden: int, out_features: int, dropout: float = 0.2
+        self,
+        feature_dim: int,
+        hidden_units: Sequence[int],
+        out_features: int,
+        dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.body = nn.Sequential(
-            nn.Linear(feature_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, out_features),
-        )
+        hidden = [int(width) for width in hidden_units]
+        if not hidden or any(width < 1 for width in hidden):
+            raise ModelBuildError(f"hidden_units must be positive widths, got {hidden!r}")
+        layers: list[nn.Module] = []
+        width = int(feature_dim)
+        for next_width in hidden:
+            layers += [nn.Linear(width, next_width), nn.ReLU(inplace=True), nn.Dropout(dropout)]
+            width = next_width
+        layers.append(nn.Linear(width, out_features))
+        self.body = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.body(x)
@@ -94,7 +111,7 @@ class ResNet50Classifier(nn.Module):
         self.n_classes = int(n_classes)
         self.input_height, self.input_width = int(input_height), int(input_width)
         self.features, feature_dim = resnet_features(backbone, pretrained)
-        self.head = _MLPHead(feature_dim, hidden_units[0], self.n_classes, dropout)
+        self.head = _MLPHead(feature_dim, hidden_units, self.n_classes, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, 3, H, W)`` -> ``(B, n_classes)`` logits."""
@@ -134,7 +151,7 @@ class MachineBasedReadingOrderModel(nn.Module):
         self.input_height, self.input_width = int(input_height), int(input_width)
         self.multi_label = multi_label
         self.features, feature_dim = resnet_features(backbone, pretrained)
-        self.head = _MLPHead(feature_dim, hidden_units[0], self.n_classes, dropout)
+        self.head = _MLPHead(feature_dim, hidden_units, self.n_classes, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, 3, H, W)`` -> ``(B, n_classes)`` logits."""

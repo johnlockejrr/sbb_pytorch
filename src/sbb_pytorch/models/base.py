@@ -42,7 +42,7 @@ Three more cross-cutting fixes live here:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -66,9 +66,10 @@ __all__ = [
 FUSION_CHANNELS: int = 32
 
 #: ``{variant: (channels per level, shallowest -> deepest)}`` for the supported ResNets.
-#: Level 0 is ``conv1 -> bn -> relu``, level 1 ``maxpool -> layer1`` and levels 2-4 the remaining
-#: residual stages -- the tap points the upstream model uses, so ``layer1``'s parameters live at
-#: ``levels.1.1.*`` rather than the ``levels.1.*`` a plain torchvision stem would give them.
+#: Level 0 is ``conv1`` alone and level 1 ``bn1 -> relu -> maxpool -> layer1``, which is exactly
+#: where ``training/models.py:207-218`` taps ``f1`` and ``f2``; the torchvision grouping would put
+#: ``bn1`` in level 0 and give ``layer1``'s parameters the name ``levels.1.0.*`` instead of the
+#: ``levels.1.3.*`` they have here.
 RESNET_LEVELS: dict[str, tuple[int, ...]] = {
     "resnet18": (64, 64, 128, 256, 512),
     "resnet34": (64, 64, 128, 256, 512),
@@ -255,16 +256,17 @@ class ResNetEncoder(nn.Module):
         # per-class constructors (``models.resnet50(...)``), which are deprecated aliases of it.
         resnet = builder(weights=weights)
 
-        # The levels follow the upstream tap points rather than torchvision's grouping. Upstream
-        # takes ``f1`` from ``conv1 -> bn -> relu`` at ``H/2``, *before* the pool -- the only way
-        # the decoder's last block can sit at ``H/2`` and upsample exactly once into the
-        # full-resolution head -- and ``f2`` from ``maxpool -> layer1`` at ``H/4``. torchvision
-        # keeps the pool inside the stem, so this split moves layer1's parameters one level
-        # deeper (``levels.1.*`` -> ``levels.1.1.*``).
+        # The levels are upstream's tap points, not torchvision's grouping. ``f1`` is the raw
+        # ``conv1`` output at ``H/2``: ``models.py:210`` reads ``f1 = x`` between the conv (208)
+        # and its ``BatchNormalization`` (212), so upstream's f1 skip is neither normalised nor
+        # rectified, and taking it after them -- torchvision's stem -- quietly changes that skip.
+        # ``f2`` is everything from ``bn1`` through ``maxpool`` into ``layer1``, at ``H/4``, so
+        # layer1's parameters land at ``levels.1.3.*``; the tensors reaching ``f3``-``f5`` are the
+        # same either way, because level 1's input is level 0's output in both groupings.
         self.levels = nn.ModuleList(
             [
-                nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu),
-                nn.Sequential(resnet.maxpool, resnet.layer1),
+                nn.Sequential(resnet.conv1),
+                nn.Sequential(resnet.bn1, resnet.relu, resnet.maxpool, resnet.layer1),
                 resnet.layer2,
                 resnet.layer3,
                 resnet.layer4,
@@ -290,9 +292,15 @@ class UNetDecoder(nn.Module):
             upstream lists are written in, ``(1024, 512, 256, 128, 64)`` for the full model and
             ``(512, 512, 256, 128, 64)`` for the light one. Length must match ``encoder_channels``.
         attention: Add an :class:`AttentionBlock` to each block (the enhancement model did this).
+        skip_projections: ``{encoder_level: width}`` for any skip the model passes through a 1x1
+            ``ConvBlock`` *before* concatenating it. Most decoders fuse a skip at its own width and
+            pass ``{}``; the light ResNet50 model also normalises ``f4`` down to 512 first
+            (``training/models.py:256-260``), which is what ``ResNet50UNetLight`` passes. The
+            deepest level cannot appear here: its block *is* that level's 1x1 projection.
 
     Raises:
-        ValueError: if the two channel lists differ in length or a channel count is not positive.
+        ValueError: if the two channel lists differ in length, a channel count is not positive, or
+            ``skip_projections`` names a level the decoder does not have (or the deepest one).
     """
 
     def __init__(
@@ -300,6 +308,8 @@ class UNetDecoder(nn.Module):
         encoder_channels: Sequence[int] = (64, 256, 512, 1024, 2048),
         decoder_channels: Sequence[int] = (1024, 512, 256, 128, 64),
         attention: bool = False,
+        *,
+        skip_projections: Mapping[int, int] | None = None,
     ) -> None:
         super().__init__()
         enc = tuple(int(c) for c in encoder_channels)
@@ -312,6 +322,15 @@ class UNetDecoder(nn.Module):
             )
         if any(c <= 0 for c in dec):
             raise ValueError(f"decoder_channels must be positive integers, got {dec}")
+        projections = {int(level): int(w) for level, w in (skip_projections or {}).items()}
+        for level, width in projections.items():
+            if not 0 <= level < len(enc) - 1:
+                raise ValueError(
+                    f"skip_projections level {level} is not a fusable level (0-{len(enc) - 2}); "
+                    f"the deepest level's projection is its own decoder block"
+                )
+            if width < 1:
+                raise ValueError(f"skip_projections[{level}] must be >= 1, got {width}")
 
         self.encoder_channels = enc
         self.decoder_channels = dec
@@ -321,16 +340,29 @@ class UNetDecoder(nn.Module):
         # weights that were never trained, so the model built it as a second shape rather than
         # fixing the first.
         self.skip_indices = list(reversed(range(len(enc))))
+        self.skip_projections = nn.ModuleDict(
+            {
+                str(level): ConvBlock(enc[level], width, kernel_size=1)
+                for level, width in projections.items()
+            }
+        )
+        # The width each level offers the block that fuses it: its own channels, or the projection
+        # width where upstream projects the skip first.
+        self.skip_widths = tuple(projections.get(level, enc[level]) for level in range(len(enc)))
 
         # Channel count of every block input, and therefore the exact Conv2d it needs.
         # The deepest block is a 1x1 projection (a projection, not a convolution over space);
         # every other block is 3x3, and every conv in front of a BatchNorm is unbiased.
         blocks = nn.ModuleList()
-        previous = enc[-1]  # the deepest level feeds the deepest block
+        previous = self.skip_widths[-1]  # the deepest level feeds the deepest block
         for position, (skip_index, out_channels) in enumerate(
             zip(self.skip_indices, dec, strict=False)
         ):
-            in_channels = enc[skip_index] if position == 0 else previous + enc[skip_index]
+            in_channels = (
+                self.skip_widths[skip_index]
+                if position == 0
+                else previous + self.skip_widths[skip_index]
+            )
             block: list[nn.Module] = [
                 ConvBlock(
                     in_channels,
@@ -379,8 +411,15 @@ class UNetDecoder(nn.Module):
         for block, skip_index in zip(self.blocks, self.skip_indices, strict=False):
             skip = features[skip_index]
             if skip is not x:
-                # Sized to the skip rather than doubled: in a ResNet, f1 and f2 share a
-                # resolution, so a fixed scale_factor=2 is wrong for one of them.
+                # ``ModuleDict`` has no ``get`` (nn.Module.__getattr__ answers first), so ask first.
+                key = str(skip_index)
+                if key in self.skip_projections:
+                    # A 1x1 leaves the spatial size alone, so projecting the skip here is the same
+                    # graph as upstream's ``f4 = Conv2D(512, (1, 1))`` before the ``concatenate``.
+                    skip = self.skip_projections[key](skip)
+                # Sized to the skip rather than doubled by a fixed factor: every level's size
+                # comes from the encoder's own pyramid (see ``RESNET_STRIDES``), and a page whose
+                # height is not a power of two has no exact factor at all.
                 x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=True)
                 x = torch.cat((x, skip), dim=1)
             x = block(x)

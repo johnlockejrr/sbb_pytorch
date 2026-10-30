@@ -21,6 +21,7 @@ from sbb_pytorch.models import (
     LIGHT_DECODER_CHANNELS,
     MODEL_REGISTRY,
     RESNET_STRIDES,
+    TransformerBlock,
     UNetDecoder,
     create_model,
     expected_patch_count,
@@ -261,11 +262,19 @@ def test_every_decoder_conv_is_sized_from_its_real_input() -> None:
 
 
 def test_light_decoder_input_is_computed_instead_of_guessed() -> None:
-    """The light model fed 2048+1024 channels into a ``Conv2d(512, ...)``; the size is now derived."""
+    """Every light width, including the ``f4`` skip upstream projects before fusing it.
+
+    ``f4 = Conv2D(512, (1,1)) + BN + ReLU`` (``training/models.py:256-260``) is upstream's own fix
+    for the width the legacy light class got wrong, so block 1 sees ``512 + 512`` rather than the
+    ``512 + 1024`` an unprojected ``f4`` would hand it.
+    """
     decoder = build("resnet50_unet_light").decoder
     assert tuple(decoder.blocks[0][0].conv.weight.shape) == (512, 2048, 1, 1)
+    assert tuple(decoder.skip_projections["3"].conv.weight.shape) == (512, 1024, 1, 1)
+    assert tuple(decoder.blocks[1][0].conv.weight.shape) == (512, 1024, 3, 3)
     assert decoder.decoder_channels == LIGHT_DECODER_CHANNELS
     assert FULL_DECODER_CHANNELS == (1024, 512, 256, 128, 64)
+    assert len(build("resnet50_unet").decoder.skip_projections) == 0, "only light projects a skip"
 
 
 def test_decoder_rejects_features_from_a_different_encoder() -> None:
@@ -286,10 +295,11 @@ def test_encoder_strides_match_the_feature_maps_it_produces() -> None:
     assert [IMAGE.shape[-1] // f.shape[-1] for f in features] == list(RESNET_STRIDES)
     assert RESNET_STRIDES == (2, 4, 8, 16, 32), "f1 is conv1's H/2 output, taken before the pool"
     assert [f.shape[1] for f in features] == [64, 256, 512, 1024, 2048]
-    # The pool belongs to level 1, as it does upstream: conv1 keeps the level-0 keys and layer1
-    # moves one container deeper, which is the rename section 3.2 records.
+    # Level 0 is ``conv1`` alone and level 1 is ``bn1 -> relu -> maxpool -> layer1``, which is where
+    # upstream taps f1 and f2; layer1's weights therefore sit under ``levels.1.3.*`` -- the rename
+    # section 3.2 records.
     keys = encoder.state_dict()
-    assert "levels.0.0.weight" in keys and "levels.1.1.0.conv1.weight" in keys
+    assert "levels.0.0.weight" in keys and "levels.1.3.0.conv1.weight" in keys
 
 
 # ----------------------------------------------------------------------- patch math
@@ -360,6 +370,45 @@ def test_only_a_segmentation_task_gets_normalised_logits() -> None:
     """``if task == "segmentation": BatchNormalization`` -- the sigmoid tasks skip it, so a
     binarization model built on the same weights must not grow one."""
     assert build("resnet50_unet", task=TaskType.BINARIZATION).head.norm is None
+
+
+def test_reading_order_head_builds_every_declared_hidden_layer() -> None:
+    """``hidden_units=(256, 256)`` built one 256-unit layer and silently dropped the second.
+
+    Upstream's reading-order head is ``Dense(256) -> Dropout -> Dense(256) -> Dropout ->
+    Dense(n_classes)`` (``training/models.py:462-468``), so the tuple has to be read in full.
+    """
+    head = build("machine_based_reading_order").head
+    linears = [module for module in head.body if isinstance(module, nn.Linear)]
+    assert [tuple(module.weight.shape) for module in linears] == [(256, 2048), (256, 256), (3, 256)]
+
+
+def test_vit_blocks_build_the_mlp_the_config_declares() -> None:
+    """``mlp_head_units`` was stored on both ViT classes and never built: ``mlp_ratio`` chose the
+    width instead, so the config's number decided nothing.
+
+    Upstream's block MLP is ``mlp(x3, hidden_units=mlp_head_units)`` -- one
+    ``Dense(units, gelu) + Dropout`` per entry, ending at the block width because the result is
+    added back onto the attention output (``training/models.py:109-113``, called at ``:356``).
+    """
+    at_upstream_width = TransformerBlock(dim=64, num_heads=4, mlp_units=(128, 64))
+    assert [tuple(m.weight.shape) for m in at_upstream_width.mlp if isinstance(m, nn.Linear)] == [
+        (128, 64),
+        (64, 128),
+    ], "Dense(128) then Dense(64), the two Dense layers upstream builds"
+    assert TransformerBlock(dim=64, num_heads=4).mlp_units == (256, 64), "mlp_ratio is the fallback"
+    with pytest.raises(ModelBuildError, match="must all be positive"):
+        TransformerBlock(dim=64, num_heads=4, mlp_units=(128, 0))
+
+    # The test configs shrink projection_dim to 8, so the chain closes at 8 rather than 64.
+    for name, tower in (
+        ("vit_resnet50_unet", build("vit_resnet50_unet").tower),
+        (
+            "vit_resnet50_unet_transformer_before_cnn",
+            build("vit_resnet50_unet_transformer_before_cnn").transformer.tower,
+        ),
+    ):
+        assert tower.blocks[0].mlp_units == (128, 64, 8), f"{name} ignores its mlp_head_units"
 
 
 def test_every_segmentation_model_shares_one_head_type() -> None:

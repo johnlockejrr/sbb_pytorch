@@ -24,8 +24,10 @@ replacement.
   anywhere; the empty root `__init__.py` that made the source tree an accidental module is gone.
 - `sbb`, one `click` group, replacing three argument-parsing styles (`argparse` in `train.py`, a
   bare `click.command` in `inference_pytorch.py`, its own `click.group` in
-  `generate_gt_for_training.py`): `train`, `infer`, `gt generate`, `gt visualize`, `export`,
-  `validate`, `config-schema`.
+  `generate_gt_for_training.py`): `train`, `infer`, `gt generate`, `gt visualize`, `gt enhance`,
+  `gt reading-order`, `export`, `validate`, `config-schema` -- every command the legacy scripts
+  had, including `image_enhancement` and `machine_based_reading_order`, which were ported as code
+  first and given flags in this batch.
 - `SBBConfig`, `Page2Label` and `ScalesConfig` as pydantic v2 models, replacing eight dataclasses
   and the stateful `ConfigLoader` class. Every field has a type, a default and, where meaningful,
   a constraint; `dump_json_schema` writes `docs/config-reference.json`, replacing the
@@ -58,18 +60,36 @@ replacement.
   file handler, replacing the `train.py` logger that appended a fresh `FileHandler` on every call
   and the ~200 `print()` calls spread across the old modules.
 - The `tests/` suite: fourteen modules covering config, models, data, augmentations, metrics,
-  losses, storage, inference, training (plus the training factory) and ground truth.
-  `tests/test_gt.py` is the last to land and the largest -- 2183 lines, 111 test functions, 241
-  collected cases over `parser`, `geometry`, `render`, `reading_order` and `generator`, none of
-  which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`. Its expected
-  values are derived from the geometry or from the legacy contract each docstring states rather
-  than read back off the implementation. Eleven of its assertions disagreed with the code they
+  losses, storage, inference, training (plus the training factory) and ground truth -- 806
+  collected cases as of this batch.
+  `tests/test_gt.py` is the last to land and the largest -- 2300 lines, 115 test functions, 251
+  collected cases over `parser`, `geometry`, `render`, `reading_order`, `generator` and `writer`,
+  none of which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`. Its
+  expected values are derived from the geometry or from the legacy contract each docstring states
+  rather than read back off the implementation. Eleven of its assertions disagreed with the code
+  they covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
+  assertion, and the eleven fixes are listed in
+  [docs/migration.md](docs/migration.md) section 3.8 and under **Fixed** below.
   covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
   assertion, and the eleven fixes are listed in
   [docs/migration.md](docs/migration.md) section 3.8 and under **Fixed** below.
 - `configs/`: six ready-made configs (textline, layout, binarization, enhancement,
   classification, reading_order). The first two carry the values of `config_train_textline.json`
   and `config_params.json`; the other four tasks had no legacy config at all.
+- `gt/writer.py`: `to_pagexml` / `write_pagexml` / `points_attribute`, the counterpart of
+  `gt/parser.py` that the rewrite had never needed. It serialises exactly what `Page` models, in
+  the order the parser reads it, so parse → write → parse is byte-stable, and it is deterministic
+  on purpose: no `Created`/`LastChange` timestamp and no `uuid4()` ids, both of which the two
+  upstream writers stamped on every file.
+- `training.callbacks.load_callbacks_file` and `sbb train --callbacks-file`: a JSON list of dotted
+  callback paths (or `{"class": ..., "init": {...}}` objects) imported, validated as
+  `pl.Callback` subclasses and *appended* to the run's own set. Every legacy script hard-coded its
+  callback list, so adding one meant editing the file.
+- Four `sbb infer` flags the code behind them mostly had: `--save-logits/--no-save-logits` (the
+  `.pt` form of the logits every `Prediction` already carries), `--overlap` (the sliding-window
+  overlap, previously reachable only through the Python API), `--ground-truth` (the legacy
+  `--ground_truth`, whose IoU the old script computed and threw away) and `--xml-file` (writes the
+  answer back as PageXML through `gt.writer`, the legacy `--xml_file`).
 
 ### Changed
 
@@ -113,6 +133,24 @@ replacement.
   the repository the package is published from.
 - README license section corrected from MIT to Apache-2.0, which is what `LICENSE` has always
   contained, and `pyproject.toml` declares `license = "Apache-2.0"`.
+- **`UseCase` and `OutputType` are declared once each.** `config/models.py` and `gt/generator.py`
+  both defined a `UseCase` -- five members in the schema, seven in the generator, so
+  `sbb gt generate --use-case binarization` was refused by the schema the same command reads --
+  and `type_output` was a `Literal["2d", "3d"]` in the schema with a second, equivalent enum in
+  `gt/render.py`. `config.models.UseCase` and `config.models.OutputType` are now the only
+  definitions (with `TypeOutput` kept as an alias and `gt.render.OutputType` still importable), and
+  `SBBConfig.json_schema()` -- a wrapper around `model_json_schema()` whose docstring named a
+  `docs/config-reference.md` that had never existed -- is gone. `docs/config-reference.json` is
+  regenerated from the schema, as `sbb config-schema` has always written it.
+- **`configs/layout.json` sets `adding_rgb_background` and `adding_rgb_foreground` to `false`.**
+  They were `true` on a config that names no `dir_rgb_backgrounds` or `dir_rgb_foregrounds`. The
+  consequence is in [docs/migration.md](docs/migration.md) section 3.4: layout pages stop being
+  composited onto random RGB backgrounds, and setting the two directories plus the flags back to
+  `true` restores them.
+- **`sbb infer --save/--no-save` now consults `save_visualisation`** when neither side of the flag
+  is given. The field existed on `SBBConfig` and was read by nothing, so a config asking not to
+  save images saved them anyway; passing `--save` or `--no-save` still wins, as it does for
+  `--patches`.
 
 ### Fixed
 
@@ -132,11 +170,13 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `head.norm.*` where the port had only `head.weight`/`head.bias` -- and
   `LIGHT_DECODER_CHANNELS` takes the widths the light decoder really has now that its 32-channel
   conv has moved back into the head.
-- **The encoder's tap points.** `ResNetEncoder` takes `f1` from `conv1 -> bn -> relu` at `H/2` and
-  lets `maxpool` begin level 1, as upstream does, rather than putting the pool in the stem: the
-  pyramid is now the clean `2, 4, 8, 16, 32`, which is what lets the head's upsample be a real 2x.
-  `layer1`'s parameters move from `levels.1.*` to `levels.1.1.*`, and no checkpoint of ours exists
-  to invalidate.
+- **The encoder's tap points.** `ResNetEncoder` takes `f1` from the **raw `conv1`** at `H/2` --
+  upstream reads `f1 = x` between the conv and its own `BatchNormalization`, so the skip upstream
+  hands the decoder is neither normalised nor rectified -- and lets `bn1 -> relu -> maxpool ->
+  layer1` be level 1, which is what lets the head's upsample be a real 2x. `layer1`'s parameters
+  move from `levels.1.*` to `levels.1.3.*`; an earlier version of this entry said `levels.1.1.*`,
+  which described the pool-in-stem tap that came before it, and no checkpoint of ours exists for
+  either.
 - **Training.** `torch.save({... "val_acc": trainer.callback_metrics["val_acc"]})` raised `KeyError`
   *after* a full run for any task that does not log it, throwing away the result.
   `config.precision`, `config.accumulate_grad_batches` and `config.gradient_clip_val` were read by
@@ -215,6 +255,29 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   included) require -- the legacy files they were built from said `3` and `2` against a mapping
   whose ids reach `6` -- and `configs/layout.json`'s `n_epochs` is `50` instead of the ported `0`,
   which asks Lightning for a run that trains nothing.
+- **A second pass over the same code, found by reading it against the upstream sources rather than
+  by the tests.** Every row is in [docs/migration.md](docs/migration.md) section 3; the headings
+  repeat the ones above so the two documents line up.
+  - *Models*: `ResNet50UNetLight` fused an unprojected `f4` where upstream runs a `Conv2D(512,
+    (1,1))` first, repeating the width error that stopped that class from running at all
+    (`UNetDecoder` gained `skip_projections`); `_MLPHead` built `hidden_units[0]` and discarded the
+    rest, so the reading-order model's two 256-unit dense layers became one; both ViT classes
+    stored `mlp_head_units` and built the MLP from `mlp_ratio` instead; and
+    `ViTResNet50UNetTransformerBeforeCNN` showed its head a *reconstruction* of the page where
+    upstream shows it the page.
+  - *Inference*: `Predictor.predict(patches=True)` computed a whole-page forward pass, threw the
+    result away and then indexed `[0]` off the tiled field -- which has no batch axis, so a patched
+    prediction was one class wide instead of a page.
+  - *Data*: `PatchConfig.from_sbb` forwarded eight of the eleven flags it has, and
+    `augmentations.geometric_transforms` carried a branch that read `scaling_flip` and
+    `scaling_bluring` and did `pass`.
+  - *Ground truth*: `Coords/@points` raised on the fractional coordinates its own `<Point>` twin
+    truncated; `ET.XMLParser(encoding=...)` overrode each document's XML declaration and decoded
+    UTF-8 pages as iso-8859-5; `Metadata/Comments` turned the tool's `"#num_col0456, num_col1500"`
+    into the width `4561500`; `float64` contours raised in `cv2.contourArea` although the module
+    claimed to widen them; a scalar `fillPoly` colour painted one channel of a three-channel
+    canvas; and `rotated_rect_with_max_area` had been collapsed to identities that only held at
+    right angles.
 
 ### Removed
 

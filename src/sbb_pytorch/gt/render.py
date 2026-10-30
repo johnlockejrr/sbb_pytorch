@@ -25,7 +25,6 @@ keeping the same order keeps the rendered colours identical to the old output.
 
 from __future__ import annotations
 
-import enum
 import zlib
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -34,6 +33,7 @@ from typing import Final
 import cv2
 import numpy as np
 
+from ..config.models import OutputType
 from .geometry import BoundingBox, contour_area, mask_of
 from .parser import Page, Region, RegionKind
 
@@ -112,28 +112,8 @@ Palette = Mapping[int, tuple[int, int, int]] | tuple[tuple[int, int, int], ...]
 LabelledContour = tuple[np.ndarray, int]
 
 
-class OutputType(str, enum.Enum):
-    """How a label image is written: ``2d`` (class id per pixel) or ``3d`` (RGB)."""
-
-    TWO_D = "2d"
-    THREE_D = "3d"
-
-    @classmethod
-    def parse(cls, value: OutputType | str) -> OutputType:
-        """Coerce a CLI string to a member, raising on anything else.
-
-        The legacy CLI accepted any string for ``--type_output`` and then fell through
-        both ``if``/``elif`` branches, leaving ``img_poly`` unbound — an
-        ``UnboundLocalError`` rather than a usage error.
-        """
-        if isinstance(value, cls):
-            return value
-        try:
-            return cls(value.strip().lower())
-        except ValueError as exc:
-            raise ValueError(f"unknown output type {value!r}; expected '2d' or '3d'") from exc
-
-
+#: The ``2d``/``3d`` enum lives in the config schema now (``config.models.OutputType``, aliased
+#: there as ``TypeOutput``); this module's copy was the second spelling of it.
 def label_color(label: int, palette: Palette = DEFAULT_LABEL_PALETTE) -> tuple[int, int, int]:
     """Colour for *label*, wrapping around the palette.
 
@@ -153,12 +133,15 @@ def label_color(label: int, palette: Palette = DEFAULT_LABEL_PALETTE) -> tuple[i
     return colors[int(label) % len(colors)]
 
 
-def _hw(shape: Sequence[int]) -> tuple[int, int]:
-    """``(height, width)`` from a shape tuple of rank 1, 2 or 3.
+def _hw(shape: Sequence[int] | int) -> tuple[int, int]:
+    """``(height, width)`` from a shape tuple of rank 1, 2 or 3 -- or a bare square edge.
 
     Accepting rank 1 and 3 as well as the plain ``(h, w)`` removes the ``shape[:2]`` /
-    ``shape[0], shape[1]`` variants the legacy call sites each wrote their own way.
+    ``shape[0], shape[1]`` variants the legacy call sites each wrote their own way. A bare ``int``
+    means ``square``, which is the same reading :func:`geometry.mask_of` gives it.
     """
+    if isinstance(shape, int):
+        return shape, shape
     if len(shape) == 1:
         return int(shape[0]), int(shape[0])
     return int(shape[0]), int(shape[1])
@@ -166,7 +149,7 @@ def _hw(shape: Sequence[int]) -> tuple[int, int]:
 
 def label_image(
     entries: Iterable[LabelledContour],
-    shape: Sequence[int],
+    shape: Sequence[int] | int,
     *,
     background: int = 0,
 ) -> np.ndarray:

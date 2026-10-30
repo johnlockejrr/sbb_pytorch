@@ -62,7 +62,9 @@ def default_criterion(config: SBBConfig, *, weights: Tensor | None = None) -> nn
     fields the legacy code had but only ever honoured in the ``segmentation`` branch.
 
     Raises:
-        NotImplementedError: ``task=reading_order``, which has no trainable loss in this port.
+        UnsupportedTaskError: ``task=reading_order``, which has no trainable loss in this port.
+            Also a ``NotImplementedError``, so callers written against the old signature still
+            catch it.
         ValueError: an unknown task, or an empty ``dir_train`` when ``weighted_loss`` is set.
     """
     if config.weighted_loss and weights is None:

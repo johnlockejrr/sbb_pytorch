@@ -9,11 +9,13 @@ Dependency direction inside the subpackage (no cycles):
 ::
 
     geometry  <-  parser  <-  render  <-  generator
-        ^                      ^             ^
-        └──────────────┬───────┘             │
-                       └── reading_order ─────┘
+        ^          ┌──┴──┐                    ^
+        │          │     └──  writer          │
+        └──────────┼──────────────────────────┘
+                   └──  reading_order
 
-Modules here depend only on the standard library, ``numpy`` and ``cv2``.  The legacy
+Modules here depend only on the standard library, ``numpy`` and ``cv2``; :mod:`.writer`
+needs nothing beyond the standard library's ``xml.etree``.  The legacy
 ``gt_gen_utils.py`` additionally imported ``shapely`` and ``matplotlib``; neither is
 needed (see :mod:`.geometry` and :mod:`.render`), and ``click`` lives in the package's
 single CLI entry point, never in a library module.
@@ -107,6 +109,14 @@ from .render import (
     to_uint8_bgr,
     write_image,
 )
+from .writer import (
+    CREATOR,
+    PAGE_NAMESPACE,
+    SCHEMA_LOCATION,
+    points_attribute,
+    to_pagexml,
+    write_pagexml,
+)
 
 __all__ = [
     # parser — ALTO/PageXML schema
@@ -192,4 +202,11 @@ __all__ = [
     "generate_ground_truth",
     "labelled_contours",
     "output_stem",
+    # writer — PageXML serialisation
+    "CREATOR",
+    "PAGE_NAMESPACE",
+    "SCHEMA_LOCATION",
+    "points_attribute",
+    "to_pagexml",
+    "write_pagexml",
 ]

@@ -31,6 +31,15 @@
       "title": "OptimizerType",
       "type": "string"
     },
+    "OutputType": {
+      "description": "How a label image is written: ``2d`` (class id per pixel) or ``3d`` (RGB).\n\nThe config field used to be ``Literal[\"2d\", \"3d\"]`` while :mod:`sbb_pytorch.gt.render` kept a\nsecond spelling of its own; one definition now serves both, and ``render`` imports it from\nhere. The legacy CLI accepted any string for ``--type_output`` and then fell through both\n``if``/``elif`` branches, leaving ``img_poly`` unbound -- an ``UnboundLocalError`` rather than\na usage error, which is what ``parse`` replaces.",
+      "enum": [
+        "2d",
+        "3d"
+      ],
+      "title": "OutputType",
+      "type": "string"
+    },
     "Page2Label": {
       "additionalProperties": false,
       "description": "``custom_config_page2label.json`` -- which XML element names map to which class ids.\n\nThe legacy ``validate_configs`` required *exactly one* text region for the textline use\ncase; the shipped file defines three (``rest_as_paragraph``, ``header``, ``heading``,\n``marginalia``) so the rule contradicted the project's own config and is dropped. The\nduplicate value (both ``header`` and ``heading`` map to ``2``) is reported by\n:meth:`SBBConfig.warnings` rather than rejected, because it is present in the shipped file.",
@@ -191,13 +200,15 @@
       "type": "object"
     },
     "UseCase": {
-      "description": "Eynollah page layout use cases, used by the page-to-label mapping.",
+      "description": "What is being labelled -- the one spelling :class:`Page2Label` and\n:class:`~sbb_pytorch.gt.GroundTruthConfig` share.\n\n``gt/generator.py`` used to carry its own seven-member copy while this module shipped five\n(no ``binarization``, no ``reading_order``), so a value one accepted the other rejected. The\ngenerator's set wins: both are real use cases -- ``binarization``'s single class is the print\nspace, and ``reading_order``'s labels come from ``.case`` files -- and the legacy code\ncompared ``config_params['use_case']`` against four string literals with ``or``, then required\n``use_case == 'layout'``; any other value fell through both branches and wrote nothing,\nsilently.",
       "enum": [
-        "textline",
         "layout",
-        "printspace",
+        "textline",
+        "word",
         "glyph",
-        "word"
+        "printspace",
+        "binarization",
+        "reading_order"
       ],
       "title": "UseCase",
       "type": "string"
@@ -620,13 +631,8 @@
       "default": null
     },
     "type_output": {
-      "default": "2d",
-      "enum": [
-        "2d",
-        "3d"
-      ],
-      "title": "Type Output",
-      "type": "string"
+      "$ref": "#/$defs/OutputType",
+      "default": "2d"
     },
     "weight_decay": {
       "default": 1e-06,

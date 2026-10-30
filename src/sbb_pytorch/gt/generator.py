@@ -23,13 +23,13 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any, Final
 
 import cv2
 import numpy as np
 
+from ..config.models import UseCase
 from ..storage.images import IMAGE_SUFFIXES
 from .geometry import (
     DEFAULT_MIN_AREA_FRACTION,
@@ -71,33 +71,9 @@ __all__ = [
 ]
 
 
-class UseCase(str, Enum):
-    """What is being labelled, from the config's ``use_case`` key."""
-
-    LAYOUT = "layout"
-    TEXTLINE = "textline"
-    WORD = "word"
-    GLYPH = "glyph"
-    PRINTSPACE = "printspace"
-    BINARIZATION = "binarization"
-    READING_ORDER = "reading_order"
-
-    @classmethod
-    def parse(cls, value: UseCase | str) -> UseCase:
-        """Coerce a config string to a member.
-
-        The legacy code compared ``config_params['use_case']`` against four string
-        literals with ``or`` and then required ``use_case == 'layout'``; any other
-        value fell through both branches and wrote nothing, silently.
-        """
-        if isinstance(value, cls):
-            return value
-        try:
-            return cls(value.strip().lower())
-        except ValueError as exc:
-            raise ValueError(f"unknown use case {value!r}") from exc
-
-
+#: ``UseCase`` is declared once, in :mod:`sbb_pytorch.config.models`, and re-exported here: the
+#: schema and ``gt`` used to ship two copies with different members.
+#:
 #: Use cases where every annotated element shares one class (the legacy single-class
 #: branch), as opposed to :attr:`UseCase.LAYOUT`, where each region type has its own.
 SINGLE_CLASS_USE_CASES: Final[frozenset[UseCase]] = frozenset(

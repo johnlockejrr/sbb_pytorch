@@ -31,6 +31,7 @@ Behaviour changed (see ``docs/migration.md``):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 import torch
@@ -49,6 +50,13 @@ FULL_DECODER_CHANNELS: tuple[int, ...] = (1024, 512, 256, 128, 64)
 #: head's, not a decoder block, so it is not in this list.
 LIGHT_DECODER_CHANNELS: tuple[int, ...] = (512, 512, 256, 128, 64)
 
+#: Upstream's light decoder projects one more skip before fusing it: ``f4`` goes through
+#: ``Conv2D(512, (1,1)) + BN + ReLU`` (``training/models.py:256-260``), so the block above it sees
+#: ``512 + 512`` channels rather than the ``512 + 1024`` an unprojected ``f4`` would hand over.
+#: Without this the light model repeats, in miniature, the width error that stopped the legacy
+#: ``ResNet50UNetLight`` from running at all.
+LIGHT_SKIP_PROJECTIONS: Mapping[int, int] = {3: 512}
+
 Activation = Literal["none", "softmax", "sigmoid"]
 
 
@@ -66,6 +74,9 @@ class UNet(nn.Module):
         decoder_channels: Decoder widths, deepest first (see
             :class:`sbb_pytorch.models.base.UNetDecoder`).
         attention: Add CBAM attention to each decoder block (the enhancement model's shape).
+        skip_projections: Skips the decoder projects with a 1x1 before fusing them, passed
+            straight to :class:`sbb_pytorch.models.base.UNetDecoder`; only the light model has
+            one (``LIGHT_SKIP_PROJECTIONS``).
         output_activation: ``"none"`` (default) returns logits; ``"softmax"`` and ``"sigmoid"``
             return probabilities for callers that were trained expecting them.
         task: Decides whether the head normalises its logits (upstream: only for segmentation)
@@ -82,6 +93,7 @@ class UNet(nn.Module):
         pretrained: bool = True,
         decoder_channels: tuple[int, ...] = FULL_DECODER_CHANNELS,
         attention: bool = False,
+        skip_projections: Mapping[int, int] | None = None,
         output_activation: Activation = "none",
         task: TaskType | None = None,
     ) -> None:
@@ -98,7 +110,12 @@ class UNet(nn.Module):
         self.output_activation: Activation = output_activation
 
         self.encoder = ResNetEncoder(backbone, pretrained=pretrained)
-        self.decoder = UNetDecoder(self.encoder.channels, decoder_channels, attention=attention)
+        self.decoder = UNetDecoder(
+            self.encoder.channels,
+            decoder_channels,
+            attention=attention,
+            skip_projections=skip_projections,
+        )
         # Upstream normalises the logits exactly when the task is segmentation; that rule is the
         # head's only per-task behaviour, so it is read from ``task`` rather than repeated at
         # every call site.
@@ -112,7 +129,15 @@ class UNet(nn.Module):
         """``(B, 3, H, W)`` in, ``(B, n_classes, H, W)`` out -- same H, W as the input."""
         if x.ndim != 4:
             raise ValueError(f"expected a (B, C, H, W) batch, got shape {tuple(x.shape)}")
-        logits = self.head(self.decoder(self.encoder(x)), x)
+        return self.activate(self.head(self.decoder(self.encoder(x)), x))
+
+    def activate(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply ``output_activation`` to raw logits.
+
+        Split out of ``forward`` because the ViT variant that patchifies the input assembles the
+        encoder, decoder and head by hand -- its head consumes a *different* image than its encoder
+        does -- and still has to honour the same activation rule as every other model.
+        """
         if self.output_activation == "softmax":
             return probs(logits, task_binary=False)
         if self.output_activation == "sigmoid":
@@ -167,6 +192,10 @@ class ResNet50UNetLight(UNet):
     block's real input width. The widths are now the upstream ones (``512, 512, 256, 128, 64``);
     the ``512, 256, 128, 64, 32`` this class declared had shifted the upstream head's
     32-channel conv into the last decoder block and halved everything below the first.
+
+    Upstream dodges the very concatenation the legacy class attempted by projecting ``f4`` to 512
+    first (``training/models.py:256-260``), so this class passes ``LIGHT_SKIP_PROJECTIONS`` -- the
+    same width mistake, one level shallower, now fixed where upstream fixes it.
     """
 
     def __init__(
@@ -185,5 +214,6 @@ class ResNet50UNetLight(UNet):
             backbone="resnet50",
             pretrained=pretrained,
             decoder_channels=LIGHT_DECODER_CHANNELS,
+            skip_projections=LIGHT_SKIP_PROJECTIONS,
             task=task,
         )

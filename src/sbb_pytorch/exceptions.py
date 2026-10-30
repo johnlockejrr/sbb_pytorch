@@ -12,8 +12,10 @@ __all__ = [
     "ConfigError",
     "ImageReadError",
     "ModelBuildError",
+    "PageXMLError",
     "SBBError",
     "TrainingError",
+    "UnsupportedTaskError",
 ]
 
 
@@ -60,6 +62,28 @@ class ModelBuildError(SBBError):
     Covers the pre-refactor class of error where a decoder block was handed a channel count
     its ``Conv2d`` did not declare (``RuntimeError`` at the first forward pass rather than at
     construction), which is now checked when the model is built.
+    """
+
+
+class PageXMLError(SBBError, ValueError):
+    """A file could not be interpreted as an ALTO/PageXML document.
+
+    ``sbb_pytorch.gt.parser`` defined this as a bare ``ValueError``, outside the hierarchy
+    above, so ``sbb gt visualize`` on a malformed page printed a traceback instead of the
+    one-line error the rest of the CLI prints -- ``cli.SBBGroup.invoke`` only catches
+    ``SBBError``. It still subclasses ``ValueError`` because that is the type callers and
+    ``tests/test_gt.py`` already catch.
+    """
+
+
+class UnsupportedTaskError(SBBError, NotImplementedError):
+    """A task is valid in :class:`~sbb_pytorch.config.models.SBBConfig` but has no implementation.
+
+    ``build_loss`` and ``get_metrics`` raised a bare ``NotImplementedError`` for
+    ``task=reading_order``, which the CLI's ``except SBBError`` could not see -- ``sbb train
+    configs/reading_order.json --dry-run`` answered with a traceback. Subclassing both keeps
+    ``pytest.raises(NotImplementedError)`` and ``training.module._metrics_for`` working while
+    letting the CLI answer in one line.
     """
 
 
