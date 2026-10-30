@@ -29,7 +29,7 @@ from typing import Any, Final
 import cv2
 import numpy as np
 
-from ..config.models import UseCase
+from ..config.models import OutputType, UseCase
 from ..storage.images import IMAGE_SUFFIXES
 from .geometry import (
     DEFAULT_MIN_AREA_FRACTION,
@@ -48,7 +48,6 @@ from .render import (
     ARTIFICIAL_CLASS_COLOR,
     DEFAULT_LABEL_PALETTE,
     PRINTSPACE_CLASS_COLOR,
-    OutputType,
     crop_to,
     label_image,
     label_map_to_image,
@@ -165,9 +164,19 @@ class GroundTruthConfig:
         Column count -> canonical page width, for the column-normalising resize.
     min_area, max_area:
         Region size bounds as fractions of the page area.
+    type_output:
+        How each label image is written -- ``2d`` (class id per pixel, replicated across the
+        three channels) or ``3d`` (RGB from the palette).  The field the schema always had and
+        ``sbb gt generate --config`` never read: the command passed its own ``--type-output``
+        flag, which defaulted to ``3d``, straight to
+        :func:`~sbb_pytorch.gt.generate_ground_truth`, so a config asking for ``2d`` got an RGB
+        rendering -- and ``sbb train`` then refused that rendering as a label, because
+        :func:`~sbb_pytorch.storage.images.remap_mask` found ``255`` where a class id belongs.
+        ``sbb infer --save-layout`` and ``config.models.TypeOutput`` read the same value.
     """
 
     use_case: UseCase = UseCase.LAYOUT
+    type_output: OutputType = OutputType.THREE_D
     textregions: dict[str, int] = field(default_factory=dict)
     graphicregions: dict[str, int] = field(default_factory=dict)
     imageregion: int | None = None
@@ -218,6 +227,11 @@ class GroundTruthConfig:
         data = {**data, **section} if isinstance(section, dict) else data
         return cls(
             use_case=UseCase.parse(data.get("use_case", UseCase.LAYOUT)),
+            # Read from the top level, where an SBBConfig keeps it (the merge above keeps
+            # surrounding keys unless the page2label section repeats them). It used to stop here
+            # unread, which is why `sbb gt generate --config configs/x.json` wrote a 3d label for
+            # a config whose own type_output said 2d.
+            type_output=OutputType.parse(data.get("type_output", OutputType.THREE_D)),
             textregions=_int_map(data.get("textregions")),
             graphicregions=_int_map(data.get("graphicregions")),
             imageregion=_int_or_none(data.get("imageregion")),

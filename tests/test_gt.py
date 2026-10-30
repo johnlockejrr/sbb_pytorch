@@ -1828,6 +1828,23 @@ def test_from_dict_normalises_the_integer_tables() -> None:
     )
 
 
+def test_from_dict_reads_type_output_instead_of_defaulting_to_three_channel_rgb() -> None:
+    """``type_output`` was in both the JSON schema and ``config.models.OutputType`` while
+    ``GroundTruthConfig`` had no such field, so ``sbb gt generate --config`` had nothing to read and
+    fell back to its own ``3d`` flag -- and ``sbb train`` then refused the RGB label it wrote. The
+    field exists now, and an ``SBBConfig`` file is read through the same unwrap as the region
+    tables."""
+    assert generator.GroundTruthConfig().type_output is generator.OutputType.THREE_D
+    two_d = generator.GroundTruthConfig.from_dict(
+        {"use_case": "textline", "page2label": {"use_case": "layout", "type_output": "2D"}}
+    )
+    assert two_d.type_output is generator.OutputType.TWO_D  # the section wins, as above
+    top_level = generator.GroundTruthConfig.from_dict({"use_case": "layout", "type_output": "2d"})
+    assert top_level.type_output is generator.OutputType.TWO_D
+    with pytest.raises(ValueError, match="unknown output type 'grey'"):
+        generator.GroundTruthConfig.from_dict({"type_output": "grey"})
+
+
 def test_case_label_defaults_to_one_not_to_the_boundary_class() -> None:
     """``case_label`` is the legacy single-class label: omitted means ``1``, and the boundary
     class is a separate field that used to be borrowed as its fallback

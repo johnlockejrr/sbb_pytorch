@@ -221,6 +221,12 @@ def to_label_map(label_map: np.ndarray) -> np.ndarray:
     costs three times the memory to store one number per pixel.  Writing a single
     channel is the correct representation; the three-channel copy is kept because the
     existing training data and every downstream consumer read a 3-channel PNG.
+
+    The shape is upstream's own, not an artefact of the port: ``gt_gen_utils.py:289`` fills
+    a ``np.zeros((y_len, x_len, 3))`` even on the ``2d`` branch, and the legacy CLI said so
+    outright -- ``--type_output``'s help in ``generate_gt_for_training.py:45`` reads "2D
+    image array is 3d but only information of one channel would be enough since all
+    channels have the same values."  A ``(H, W)`` label would be the deviation.
     """
     array = label_map if label_map.ndim == 2 else label_map[..., 0]
     return np.repeat(array[..., None], 3, axis=2)

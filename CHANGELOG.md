@@ -60,11 +60,12 @@ replacement.
   file handler, replacing the `train.py` logger that appended a fresh `FileHandler` on every call
   and the ~200 `print()` calls spread across the old modules.
 - The `tests/` suite: fourteen modules covering config, models, data, augmentations, metrics,
-  losses, storage, inference, training (plus the training factory) and ground truth -- 806
+  losses, storage, inference, training (plus the training factory) and ground truth -- 809
   collected cases as of this batch.
-  `tests/test_gt.py` is the last to land and the largest -- 2300 lines, 115 test functions, 251
+  `tests/test_gt.py` is the last to land and the largest -- 2300 lines, 116 test functions, 252
   collected cases over `parser`, `geometry`, `render`, `reading_order`, `generator` and `writer`,
-  none of which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`. Its
+  none of which had ever been tested outside the `--dry-run` CLI paths of `tests/test_cli.py`
+  (the two `--type-output` cases below are the first to run `sbb gt generate` for real there). Its
   expected values are derived from the geometry or from the legacy contract each docstring states
   rather than read back off the implementation. Eleven of its assertions disagreed with the code
   they covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
@@ -278,6 +279,18 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
     claimed to widen them; a scalar `fillPoly` colour painted one channel of a three-channel
     canvas; and `rotated_rect_with_max_area` had been collapsed to identities that only held at
     right angles.
+- **`sbb gt generate --type-output` overruled the config it was handed, and the config could not
+  answer it anyway.** The flag's own `3d` default went straight to `generate_ground_truth` while
+  `GroundTruthConfig` had no `type_output` field at all, so a config asking for `2d` -- which is
+  what `configs/textline.json` does -- still wrote the palette rendering, and `sbb train` on the
+  result failed with `no class id configured for label values [255] in 7-class setup`: the label
+  reader takes channel 0 for a class id and found class 1's colour there. `GroundTruthConfig`
+  carries the field now, the flag defaults to `None` and falls back to it (naming the flag still
+  wins, the precedence `sbb infer --save` set for `save_visualisation`), and the first tests to run
+  `sbb gt generate` without `--dry-run` pin both directions. The three-channel shape of a `2d`
+  label is upstream's own -- `gt_gen_utils.py:289` fills a `(H, W, 3)` array on that branch and
+  `generate_gt_for_training.py:45` says one channel would do -- so `render.to_label_map` keeps it
+  and now cites both.
 
 ### Removed
 

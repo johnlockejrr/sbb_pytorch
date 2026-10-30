@@ -45,6 +45,7 @@ import torch
 
 from sbb_pytorch import __version__
 from sbb_pytorch.config import (
+    OutputType,
     SBBConfig,
     UseCase,
     apply_overrides,
@@ -919,7 +920,15 @@ def gt() -> None:
     default=None,
     help="Required unless --config is given.",
 )
-@click.option("--type-output", "output_type", type=click.Choice(["2d", "3d"]), default="3d")
+@click.option(
+    "--type-output",
+    "output_type",
+    type=click.Choice([member.value for member in OutputType]),
+    default=None,
+    help="Label format: 2d (class id per pixel, replicated across the channels) or 3d (RGB). "
+    "Default: the config's own ``type_output``, which ``--config`` used to ignore; 3d when "
+    "--use-case is given, as the legacy command wrote it.",
+)
 @click.option("--printspace/--no-printspace", default=False)
 @click.option(
     "--images-dir", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None
@@ -940,7 +949,7 @@ def gt_generate(
     output_dir: Path,
     config_path: Path | None,
     use_case_raw: str | None,
-    output_type: str,
+    output_type: str | None,
     printspace: bool,
     images_dir: Path | None,
     images_output_dir: Path | None,
@@ -953,6 +962,10 @@ def gt_generate(
     Give either ``--config`` (a :class:`~sbb_pytorch.gt.GroundTruthConfig` JSON, the old
     ``custom_config_page2label.json`` shape) or ``--use-case`` -- the legacy script made you edit
     the constants in ``generate_gt_for_training.py`` instead.
+
+    ``--type-output`` falls back to the config's own ``type_output`` when it is not given, so
+    ``sbb gt generate -c configs/textline.json`` builds the format that file asks for; with
+    ``--use-case`` there is no file to ask, and it is ``3d`` as the legacy command wrote it.
     """
     if config_path is not None and use_case_raw is not None:
         raise click.BadParameter("give --config or --use-case, not both")
@@ -970,6 +983,11 @@ def gt_generate(
     )
     if min_area is not None:
         gt_config = replace(gt_config, min_area=min_area)
+    # ``--type-output`` and the config's ``type_output`` answer one question, and the flag used to
+    # settle it with its own ``3d`` default even when the file said ``2d`` -- the same outranking
+    # ``sbb infer --save`` once had over ``save_visualisation``. The flag has no default now, so
+    # leaving it out asks the file; naming it still wins. The legacy option had no default either.
+    resolved_output_type = OutputType.parse(output_type) if output_type else gt_config.type_output
 
     xml_files = discover_xml_files(xml_dir)
     if limit is not None:
@@ -988,7 +1006,7 @@ def gt_generate(
             gt_config,
             xml_dir,
             output_dir,
-            output_type=output_type,
+            output_type=resolved_output_type,
             printspace=printspace,
             images_dir=images_dir,
             images_output_dir=images_output_dir,

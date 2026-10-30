@@ -31,7 +31,7 @@ from sbb_pytorch.gt import contour_bbox, parse_pagexml
 from sbb_pytorch.inference import Prediction
 from sbb_pytorch.models import create_model
 from sbb_pytorch.storage import load_checkpoint, save_checkpoint
-from sbb_pytorch.storage.images import imwrite
+from sbb_pytorch.storage.images import imwrite, read_mask
 from sbb_pytorch.training.callbacks import build_callbacks, load_callbacks_file
 
 SIZE = 32
@@ -796,6 +796,68 @@ def test_gt_generate_min_area_overrides_the_config_value(
     )
     assert result.exit_code == 0, result.output
     assert "page.xml" in result.output
+
+
+def test_gt_generate_honours_the_configs_own_type_output(
+    runner: CliRunner, tmp_path: Path, xml_dir: Path
+) -> None:
+    """The first test to actually run ``sbb gt generate`` rather than ``--dry-run`` it, because the
+    bug was in a line dry runs never reach: the command passed its own ``--type-output`` flag,
+    ``3d`` by default, to the generator and never consulted ``GroundTruthConfig``, which had no
+    ``type_output`` field to consult. A ``"2d"`` config therefore produced the palette rendering --
+    class id 1 as the colour ``(255, 0, 0)`` -- and ``sbb train`` on that folder failed with
+    ``no class id configured for label values [255]``.
+    """
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": {"use_case": "layout", "textregions": {"paragraph": 1}},
+            }
+        )
+    )
+    out = tmp_path / "gt"
+    result = invoke(runner, "gt", "generate", "--xml", xml_dir, "-o", out, "--config", gt_config)
+    assert result.exit_code == 0, result.output
+    label = read_mask(out / "page.png")
+    assert label.shape == (SIZE, SIZE)
+    assert set(np.unique(label).tolist()) == {0, 1}  # class ids, not the palette's 255
+
+
+def test_gt_generate_type_output_flag_beats_the_config(
+    runner: CliRunner, tmp_path: Path, xml_dir: Path
+) -> None:
+    """Naming the flag still wins over the file -- the precedence ``sbb infer --save`` uses -- and
+    ``3d`` here writes the palette colour ``(255, 0, 0)`` for class 1, whose channel 0 the label
+    reader reads back as ``255``."""
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": {"use_case": "layout", "textregions": {"paragraph": 1}},
+            }
+        )
+    )
+    out = tmp_path / "gt"
+    result = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        xml_dir,
+        "-o",
+        out,
+        "--config",
+        gt_config,
+        "--type-output",
+        "3d",
+    )
+    assert result.exit_code == 0, result.output
+    assert set(np.unique(read_mask(out / "page.png")).tolist()) == {0, 255}
 
 
 def test_gt_enhance_writes_a_degraded_page_and_its_label_per_scale(
