@@ -325,6 +325,13 @@ def main(ctx: click.Context, verbose: bool) -> None:
     help="JSON list of extra callback classes to add to the run's own (see "
     "sbb_pytorch.training.callbacks.load_callbacks_file).",
 )
+@click.option(
+    "--verbose-metrics/--no-verbose-metrics",
+    "verbose_metrics",
+    default=False,
+    help="Print ``Metric val_loss improved. New best score: 0.449`` on every improvement. Off: the "
+    "bar carries the same numbers as ``early_stopping/val_loss: 3/10``.",
+)
 @click.option("--logger/--no-logger", default=True, help="Write TensorBoard (or CSV) logs.")
 @click.option("--progress-bar/--no-progress-bar", default=True)
 @click.option(
@@ -350,6 +357,7 @@ def train(
     scales: Path | None,
     every_n_steps: int | None,
     callbacks_file: Path | None,
+    verbose_metrics: bool,
     logger: bool,
     progress_bar: bool,
     dry_run: bool,
@@ -367,6 +375,10 @@ def train(
     for (``training/trainer.py:111``); ``every_n_steps`` moves into the same call because
     ``build_trainer`` only derives the built set -- and so only reads that flag -- when it is given
     no callbacks.
+
+    ``--verbose-metrics`` restores the ``Metric val_loss improved. New best score: 0.449`` prints
+    the checkpoint and early-stopping callbacks emit on every improvement. It is off by default:
+    the progress bar carries the same information as ``early_stopping/val_loss: 3/10``.
     """
     state: GlobalState = ctx.obj
     resolved = load_config(config, page2label_path=page2label, scales_path=scales)
@@ -389,7 +401,7 @@ def train(
     # With a callbacks file the list is built here and handed over whole; without one the trainer
     # builds it, which is the path every existing run takes and stays byte-identical to.
     trainer_kwargs: dict[str, Any] = (
-        {"every_n_steps": every_n_steps}
+        {"every_n_steps": every_n_steps, "verbose": verbose_metrics}
         if callbacks_file is None
         else {
             "callbacks": build_callbacks(
@@ -398,6 +410,7 @@ def train(
                 output_dir=output_dir,
                 every_n_steps=every_n_steps,
                 callbacks_file=callbacks_file,
+                verbose=verbose_metrics,
             )
         }
     )

@@ -44,7 +44,17 @@ from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    Callback,
+    EarlyStopping,
+    ModelCheckpoint,
+    RichModelSummary,
+    RichProgressBar,
+)
+from pytorch_lightning.utilities.model_summary import (
+    get_formatted_model_size,
+    get_human_readable_count,
+)
 from torch import Tensor
 
 from sbb_pytorch.config.models import SBBConfig
@@ -54,9 +64,12 @@ from sbb_pytorch.training.module import SBBLightningModule
 
 __all__ = [
     "DEFAULT_TOP_K",
+    "SBBModelSummary",
+    "SBBProgressBar",
     "StepCheckpoint",
     "build_callbacks",
     "checkpoint_for",
+    "early_stopping_fields",
     "early_stopping_for",
     "load_callbacks_file",
     "metric_mode",
@@ -95,6 +108,7 @@ def checkpoint_for(
     output_dir: str | Path | None = None,
     stem: str | None = None,
     top_k: int = DEFAULT_TOP_K,
+    verbose: bool = False,
 ) -> ModelCheckpoint:
     """One ``ModelCheckpoint`` writing ``{stem}-{epoch:02d}-{metric:.4f}.ckpt``.
 
@@ -105,6 +119,11 @@ def checkpoint_for(
     The ``<stem>_config.json`` sidecar is *not* written here: pytorch-lightning names and rotates
     these files, and the config travels inside ``model.pt`` (see
     :func:`sbb_pytorch.training.trainer.fit`) and inside every ``Checkpoint`` this module writes.
+
+    ``verbose`` is ``False`` (the ``ModelCheckpoint`` default) -- the one line it prints on an
+    improvement is the pair's ``Metric val_loss improved. New best score: 0.449`` output, and
+    :command:`sbb train --verbose-metrics` switches both this and :func:`early_stopping_for` on
+    together.
     """
     directory = Path(output_dir if output_dir is not None else config.dir_output)
     mode = mode or metric_mode(monitor)
@@ -115,6 +134,7 @@ def checkpoint_for(
         monitor=monitor,
         mode=mode,
         save_top_k=int(top_k),
+        verbose=bool(verbose),
     )
 
 
@@ -125,15 +145,119 @@ def early_stopping_for(
     mode: str | None = None,
     patience: int | None = None,
     min_delta: float = 0.0,
+    verbose: bool = False,
 ) -> EarlyStopping:
-    """``EarlyStopping`` on ``monitor`` with the config's patience (``train.py``'s ``min_delta=0``)."""
+    """``EarlyStopping`` on ``monitor`` with the config's patience (``train.py``'s ``min_delta=0``).
+
+    ``verbose`` used to be hard-coded ``True``: every improvement printed a line -- ``Metric
+    val_loss improved. New best score: 0.449`` the first time, ``Metric val_loss improved by 0.047
+    >= min_delta = 0.0. New best score: 0.402`` every time after, so two lines per epoch for the
+    pair this package registers. It is ``False`` now, because the same numbers sit on the progress
+    bar as ``early_stopping/val_loss: 3/10`` (see :class:`SBBProgressBar`) and
+    :command:`sbb train --verbose-metrics` brings the prints back for anyone who wants them in the
+    log instead of the bar.
+    """
     return EarlyStopping(
         monitor=monitor,
         mode=mode or metric_mode(monitor),
         patience=int(config.patience if patience is None else patience),
         min_delta=float(min_delta),
-        verbose=True,
+        verbose=bool(verbose),
     )
+
+
+def early_stopping_fields(trainer: Any) -> dict[str, str]:
+    """``{"early_stopping/val_loss": "3/10"}`` for every ``EarlyStopping`` attached to *trainer*.
+
+    The bar's version of what the ``verbose=True`` prints said: epochs a monitor has gone without
+    improving, over the patience that ends the run. Two callbacks watching one metric collapse to
+    one field.
+    """
+    fields: dict[str, str] = {}
+    for callback in getattr(trainer, "callbacks", ()):
+        if not isinstance(callback, EarlyStopping) or callback.monitor is None:
+            continue
+        fields[f"early_stopping/{callback.monitor}"] = f"{callback.wait_count}/{callback.patience}"
+    return fields
+
+
+class SBBProgressBar(RichProgressBar):
+    """``RichProgressBar`` with the early-stopping counters added to the numbers it shows.
+
+    The bar lists ``trainer.callback_metrics`` -- ``v_num``, ``train_loss_step``, ``val_loss`` --
+    and says nothing about the two ``EarlyStopping``\\ s registered beside it, so a run's remaining
+    patience was only ever visible as the ``Metric ...`` lines this package silenced. Those numbers
+    belong on the bar: :func:`early_stopping_fields` adds ``early_stopping/val_loss: 3/10``.
+    """
+
+    def get_metrics(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> dict[str, Any]:
+        """The parent's metrics plus the early-stopping counters, as one dict."""
+        items = dict(super().get_metrics(trainer, pl_module))
+        items.update(early_stopping_fields(trainer))
+        return items
+
+
+class SBBModelSummary(RichModelSummary):
+    """``RichModelSummary`` minus the ``FLOPs`` column and the ``Total FLOPs: 0`` line under it.
+
+    Lightning can only count FLOPs when the module exposes ``example_input_array``, and
+    :class:`~sbb_pytorch.training.module.SBBLightningModule` has never had one -- so every run
+    printed ``Total FLOPs: 0`` under a model with real convolutions, a number that was never a
+    measurement. The table and the parameter grid are rendered here without it: everything
+    ``train.py`` showed stays, the one field that never meant anything goes.
+    :func:`~sbb_pytorch.training.trainer.build_trainer` still decides whether a summary is shown.
+    """
+
+    @staticmethod
+    def summarize(
+        summary_data: list[tuple[str, list[str]]],
+        total_parameters: int,
+        trainable_parameters: int,
+        model_size: float,
+        total_training_modes: dict[str, int],
+        total_flops: int | None = None,
+        **summarize_kwargs: Any,
+    ) -> None:
+        """The rich table and parameter grid of ``RichModelSummary``, without the FLOPs entries.
+
+        ``total_flops`` is accepted and ignored: the point of this subclass is that the value is
+        unmeasured, and the signature has to stay the one ``ModelCheckpoint``-era
+        ``ModelSummary.on_fit_start`` calls it with.
+        """
+        from rich import get_console
+        from rich.table import Table
+
+        def count(value: float) -> str:
+            return f"{get_human_readable_count(int(value)):<10}"
+
+        columns = [(name, values) for name, values in summary_data if name != "FLOPs"]
+        table = Table(header_style=summarize_kwargs.get("header_style", "bold magenta"))
+        for name, _ in columns:
+            table.add_column(
+                name,
+                justify="left" if name in (" ", "Name", "Type") else "right",
+                no_wrap=name == "Name",
+            )
+        if columns:
+            for row in zip(*(values for _, values in columns), strict=False):
+                table.add_row(*(str(cell) for cell in row))
+        get_console().print(table)
+
+        size = f"{get_formatted_model_size(model_size):<10}"
+        rows = [
+            ("Trainable params", count(trainable_parameters)),
+            ("Non-trainable params", count(total_parameters - trainable_parameters)),
+            ("Total params", count(total_parameters)),
+            ("Total estimated model params size (MB)", size),
+            ("Modules in train mode", str(total_training_modes.get("train", 0))),
+            ("Modules in eval mode", str(total_training_modes.get("eval", 0))),
+        ]
+        grid = Table.grid(expand=True)
+        grid.add_column()
+        grid.add_column()
+        for label, value in rows:
+            grid.add_row(f"[bold]{label}[/]: {value}")
+        get_console().print(grid)
 
 
 def metric_snapshot(trainer: pl.Trainer) -> dict[str, float]:
@@ -332,6 +456,7 @@ def build_callbacks(
     every_n_steps: int | None = None,
     early_stopping: bool = True,
     callbacks_file: str | Path | None = None,
+    verbose: bool = False,
 ) -> list[Callback]:
     """The callback list for a run: the checkpoint pair, the early-stopping pair, optional steps.
 
@@ -351,6 +476,10 @@ def build_callbacks(
             replaces it -- ``build_trainer``'s ``callbacks=`` argument is what replaces the built
             set, and :command:`sbb train` passes the finished list through that argument so the
             config's own callbacks survive the file.
+        verbose: ``--verbose-metrics``, forwarded to both callbacks built here -- the ``Metric
+            val_loss improved. New best score: 0.449`` prints ``train.py`` ran with. ``False`` by
+            default, because the same numbers reach the bar as ``early_stopping/val_loss: 3/10``
+            through :class:`SBBProgressBar`.
     """
     callbacks: list[Callback] = []
     if module is None:
@@ -360,10 +489,12 @@ def build_callbacks(
 
     for metric, mode in metrics:
         callbacks.append(
-            checkpoint_for(config, metric, mode=mode, output_dir=output_dir, top_k=top_k)
+            checkpoint_for(
+                config, metric, mode=mode, output_dir=output_dir, top_k=top_k, verbose=verbose
+            )
         )
         if early_stopping:
-            callbacks.append(early_stopping_for(config, metric, mode=mode))
+            callbacks.append(early_stopping_for(config, metric, mode=mode, verbose=verbose))
     if every_n_steps is not None:
         callbacks.append(StepCheckpoint(config, every_n_steps=every_n_steps, output_dir=output_dir))
     if callbacks_file is not None:

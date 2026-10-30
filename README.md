@@ -93,6 +93,7 @@ Builds the model, the Lightning module, the trainer and the callbacks from one f
 | `--every-n-steps` | Also save a mid-epoch checkpoint every N batches (the old `--save-interval`, whose callback never fired) |
 | `--logger / --no-logger` | TensorBoard logs when tensorboard is importable, CSV logs otherwise |
 | `--progress-bar / --no-progress-bar` | The `rich` bar pytorch-lightning uses when `rich` is installed |
+| `--verbose-metrics / --no-verbose-metrics` | Print `Metric val_loss improved. New best score: 0.449` on every improvement, as `training.py` did. Off by default: the bar carries the same numbers as `early_stopping/val_loss: 3/10` |
 | `--dry-run` | One train and one validation batch, no `model.pt`: turns a bad config into a two-second failure |
 
 ### `sbb infer MODEL [INPUT...]`

@@ -38,7 +38,12 @@ from sbb_pytorch.data import SBBDataModule
 from sbb_pytorch.device import resolve_device
 from sbb_pytorch.exceptions import TrainingError
 from sbb_pytorch.storage.checkpoint import Checkpoint
-from sbb_pytorch.training.callbacks import build_callbacks, metric_snapshot
+from sbb_pytorch.training.callbacks import (
+    SBBModelSummary,
+    SBBProgressBar,
+    build_callbacks,
+    metric_snapshot,
+)
 from sbb_pytorch.training.module import SBBLightningModule
 
 __all__ = ["build_trainer", "fit", "resolve_accelerator", "resolve_logger", "tensorboard_available"]
@@ -98,6 +103,7 @@ def build_trainer(
     use_rich: bool | None = None,
     every_n_steps: int | None = None,
     enable_model_summary: bool = True,
+    verbose: bool = False,
     **overrides: Any,
 ) -> pl.Trainer:
     """Assemble the ``pl.Trainer`` for ``config`` without touching a dataset.
@@ -117,7 +123,12 @@ def build_trainer(
         use_rich: Force the ``rich`` bar on or off; default is whenever ``rich`` is importable,
             which the package requires anyway.
         every_n_steps: Also add the mid-epoch :class:`~sbb_pytorch.training.callbacks.StepCheckpoint`.
-        enable_model_summary: The summary table ``train.py`` printed on every run start.
+        enable_model_summary: The summary table ``train.py`` printed on every run start, built here
+            as :class:`~sbb_pytorch.training.callbacks.SBBModelSummary` (same table, no
+            ``Total FLOPs: 0`` line).
+        verbose: ``--verbose-metrics`` -- the ``Metric ... improved. New best score`` prints of the
+            checkpoint and early-stopping callbacks this function builds. Ignored when
+            ``callbacks=`` is given, since that list brings its own settings.
         **overrides: Anything else ``pl.Trainer`` takes (``fast_dev_run``, ``max_steps``,
             ``limit_train_batches``, ``strategy``, ...), applied last.
 
@@ -132,14 +143,24 @@ def build_trainer(
 
     if callbacks is None:
         callbacks = build_callbacks(
-            config, module, output_dir=directory, every_n_steps=every_n_steps
+            config, module, output_dir=directory, every_n_steps=every_n_steps, verbose=verbose
         )
     else:
         callbacks = list(callbacks)
     if rich_bar:
-        from pytorch_lightning.callbacks import RichProgressBar  # only imported when rich exists
+        # RichProgressBar, plus the early-stopping counters on its metrics line.
+        callbacks.append(SBBProgressBar())
 
-        callbacks.append(RichProgressBar())
+    # ``pl.Trainer`` builds the summary itself -- ``RichModelSummary`` whenever rich is installed,
+    # which the package requires -- and that render ends with ``Total FLOPs: 0``: the count needs
+    # ``LightningModule.example_input_array``, which this package's module has never had, so the
+    # line has always reported 0 for a model with real convolutions. Handing over our own subclass
+    # and turning the bool off keeps the table and drops the number; a summary callback *and*
+    # ``enable_model_summary=True`` would make Lightning warn about two summaries. Without rich the
+    # subclass cannot be constructed, so the bool goes through unchanged.
+    own_summary = SBBModelSummary() if enable_model_summary and _rich_available() else None
+    if own_summary is not None:
+        callbacks.append(own_summary)
 
     resolved_logger: Any = False
     if isinstance(logger, str):
@@ -158,7 +179,7 @@ def build_trainer(
         "logger": resolved_logger,
         "callbacks": callbacks,
         "enable_progress_bar": show_bar,
-        "enable_model_summary": enable_model_summary,
+        "enable_model_summary": bool(enable_model_summary) and own_summary is None,
         "log_every_n_steps": 1,
         "default_root_dir": str(directory),
     }

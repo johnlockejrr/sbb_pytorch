@@ -7,12 +7,15 @@ piece so that a failure names the piece rather than the fit.
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, ModelSummary
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 from sbb_pytorch.config.models import SBBConfig
@@ -22,11 +25,14 @@ from sbb_pytorch.storage.checkpoint import Checkpoint
 from sbb_pytorch.storage.images import imwrite
 from sbb_pytorch.training import (
     SBBLightningModule,
+    SBBModelSummary,
+    SBBProgressBar,
     StepCheckpoint,
     build_callbacks,
     build_trainer,
     checkpoint_for,
     default_criterion,
+    early_stopping_fields,
     early_stopping_for,
     fit,
     metric_mode,
@@ -203,6 +209,55 @@ def test_early_stopping_uses_the_configured_patience(tmp_path: Path) -> None:
     assert early_stopping_for(make(patience=4), "val_accuracy", patience=2).patience == 2
 
 
+def test_both_callbacks_are_quiet_unless_asked(stub: nn.Module, tmp_path: Path) -> None:
+    """``EarlyStopping(verbose=True)`` was hard-coded; the pair's prints are now opt-in.
+
+    The two lines that used to follow the bar every epoch -- ``Metric val_loss improved. New best
+    score: 0.449`` and ``Metric val_accuracy improved by 0.063 >= min_delta = 0.0. ...`` -- come
+    from these two ``verbose`` flags, so both default to ``False`` and one flag turns them on.
+    """
+    assert checkpoint_for(make(), "val_loss", output_dir=tmp_path).verbose is False
+    assert early_stopping_for(make(), "val_loss").verbose is False
+    assert checkpoint_for(make(), "val_loss", output_dir=tmp_path, verbose=True).verbose is True
+    assert early_stopping_for(make(), "val_loss", verbose=True).verbose is True
+
+
+def test_build_callbacks_turns_both_verbases_on_together(stub: nn.Module, tmp_path: Path) -> None:
+    """``--verbose-metrics`` sets the flag on the checkpoint *and* the stopping rule of each pair."""
+    module = SBBLightningModule(make(), stub)
+    quiet = build_callbacks(make(), module, output_dir=tmp_path)
+    loud = build_callbacks(make(), module, output_dir=tmp_path, verbose=True)
+    assert [callback.verbose for callback in quiet] == [False] * 4
+    assert [callback.verbose for callback in loud] == [True] * 4
+
+
+def test_early_stopping_fields_names_the_wait_of_every_attached_callback(tmp_path: Path) -> None:
+    """The bar's ``early_stopping/val_loss: 3/10``: epochs waited over the configured patience."""
+    config = make(patience=4)
+    stopping = early_stopping_for(config, "val_loss")
+    stopping.wait_count = 3
+    assert early_stopping_fields(SimpleNamespace(callbacks=[stopping])) == {
+        "early_stopping/val_loss": "3/4"
+    }
+
+
+def test_progress_bar_carries_the_counters_alongside_the_losses(
+    stub: nn.Module, tmp_path: Path
+) -> None:
+    """``SBBProgressBar.get_metrics`` is what puts them on the bar next to ``val_loss``."""
+    config = make()
+    module = SBBLightningModule(config, stub)
+    trainer = build_trainer(config, module, output_dir=tmp_path, logger=False)
+    bar = next(callback for callback in trainer.callbacks if isinstance(callback, SBBProgressBar))
+    # the bar reads ``trainer.progress_bar_metrics`` (what ``self.log(..., prog_bar=True)`` fills),
+    # not ``callback_metrics``, and RichProgressBar turns each tensor into a float
+    trainer.progress_bar_metrics["val_loss"] = torch.tensor(0.5)
+    items = bar.get_metrics(trainer, module)
+    assert items["val_loss"] == pytest.approx(0.5)
+    assert items["early_stopping/val_loss"] == "0/10"
+    assert items["early_stopping/val_accuracy"] == "0/10"
+
+
 def test_build_callbacks_pairs_each_metric_with_its_stopping(
     stub: nn.Module, tmp_path: Path
 ) -> None:
@@ -297,6 +352,43 @@ def test_build_trainer_applies_the_config_fields(stub: nn.Module, tmp_path: Path
     assert trainer.precision == "32-true"
     assert trainer.log_every_n_steps == 1
     assert Path(trainer.default_root_dir) == tmp_path
+
+
+@pytest.mark.skipif(
+    not importlib.util.find_spec("rich"), reason="needs rich to build the rich callbacks"
+)
+def test_build_trainer_hands_over_its_own_bar_and_summary(stub: nn.Module, tmp_path: Path) -> None:
+    """The bar and the summary come from this package, and Lightning must not add a second one.
+
+    ``Trainer`` appends a ``RichModelSummary`` itself whenever ``enable_model_summary`` is true and
+    rich is installed, and warns when a summary callback is already in the list -- so handing over
+    :class:`SBBModelSummary` goes together with ``enable_model_summary=False``.
+    """
+    module = SBBLightningModule(make(), stub)
+    trainer = build_trainer(make(), module, output_dir=tmp_path, logger=False)
+    types = {type(callback) for callback in trainer.callbacks}
+    assert SBBProgressBar in types and SBBModelSummary in types
+    # ``RichModelSummary`` derives from ``ModelSummary``, so this count is how a second summary --
+    # Lightning's own, which the ``enable_model_summary=False`` in ``build_trainer`` prevents --
+    # would show up. ``Trainer`` keeps the flag private in 2.6, so the list is the observable.
+    assert sum(1 for callback in trainer.callbacks if isinstance(callback, ModelSummary)) == 1
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_build_trainer_passes_verbosity_to_the_callbacks_it_builds(
+    stub: nn.Module, tmp_path: Path, verbose: bool
+) -> None:
+    trainer = build_trainer(
+        make(),
+        SBBLightningModule(make(), stub),
+        output_dir=tmp_path,
+        logger=False,
+        verbose=verbose,
+        enable_progress_bar=False,
+    )
+    built = [c for c in trainer.callbacks if isinstance(c, ModelCheckpoint | EarlyStopping)]
+    assert len(built) == 4
+    assert [c.verbose for c in built] == [verbose] * 4
 
 
 def test_build_trainer_rejects_an_unknown_logger_string(tmp_path: Path) -> None:

@@ -60,7 +60,7 @@ replacement.
   file handler, replacing the `train.py` logger that appended a fresh `FileHandler` on every call
   and the ~200 `print()` calls spread across the old modules.
 - The `tests/` suite: fourteen modules covering config, models, data, augmentations, metrics,
-  losses, storage, inference, training (plus the training factory) and ground truth -- 809
+  losses, storage, inference, training (plus the training factory) and ground truth -- 816
   collected cases as of this batch.
   `tests/test_gt.py` is the last to land and the largest -- 2300 lines, 116 test functions, 252
   collected cases over `parser`, `geometry`, `render`, `reading_order`, `generator` and `writer`,
@@ -69,9 +69,6 @@ replacement.
   expected values are derived from the geometry or from the legacy contract each docstring states
   rather than read back off the implementation. Eleven of its assertions disagreed with the code
   they covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
-  assertion, and the eleven fixes are listed in
-  [docs/migration.md](docs/migration.md) section 3.8 and under **Fixed** below.
-  covered; each was first pinned with a `# TODO(file.py:line)` marker and is now an ordinary
   assertion, and the eleven fixes are listed in
   [docs/migration.md](docs/migration.md) section 3.8 and under **Fixed** below.
 - `configs/`: six ready-made configs (textline, layout, binarization, enhancement,
@@ -91,6 +88,12 @@ replacement.
   overlap, previously reachable only through the Python API), `--ground-truth` (the legacy
   `--ground_truth`, whose IoU the old script computed and threw away) and `--xml-file` (writes the
   answer back as PageXML through `gt.writer`, the legacy `--xml_file`).
+- `sbb train --verbose-metrics/--no-verbose-metrics`, the flag that sets the `verbose` field of
+  every `ModelCheckpoint` and `EarlyStopping` a run builds, plus the two callbacks that make a
+  quiet run still readable: `training.callbacks.SBBProgressBar` (the rich bar plus the
+  `early_stopping/val_loss: 3/10` counters `early_stopping_fields` reads off the trainer) and
+  `training.callbacks.SBBModelSummary` (the same summary table without its `FLOPs` column and the
+  `Total FLOPs: 0` line under it).
 
 ### Changed
 
@@ -107,6 +110,19 @@ replacement.
 - Checkpoint file names: `model-{epoch:02d}-{val_loss:.4f}.ckpt` and
   `best-{epoch:02d}-{val_accuracy:.4f}.ckpt`, `top_k=3` each; mid-epoch checkpoints go in a
   `steps/` subdirectory instead of one directory per step.
+- The `Metric val_loss improved. New best score: 0.449` lines are off by default, and the bar now
+  carries what they said. Both came from `training.py`'s hard-coded `EarlyStopping(verbose=True)` --
+  one line per monitored metric per epoch, `Metric ... improved by 0.047 >= min_delta = 0.0. New
+  best score: 0.402` after the first -- and `early_stopping_for` takes `verbose` now, default
+  `False` like the `ModelCheckpoint` beside it, both set together by `sbb train --verbose-metrics`.
+  The same numbers sit on the progress bar instead: `val_loss: 0.281 train_loss: 0.306
+  val_accuracy: 0.892 early_stopping/val_loss: 3/10 early_stopping/val_accuracy: 0/10`.
+- `Total FLOPs: 0` is gone from the model summary, the table above it unchanged. Lightning can only
+  count FLOPs when the module exposes `example_input_array`, which `SBBLightningModule` has never
+  had, so the line reported `0` for a model with real convolutions on every run; `SBBModelSummary`
+  renders the same table without the `FLOPs` column and is handed to `pl.Trainer` together with
+  `enable_model_summary=False`, which a summary callback and the bool both being set would
+  otherwise have made Lightning warn about.
 - Metric names: `val_acc` becomes `val_accuracy`, and the accuracy/IoU/Dice set is replaced by one
   confusion matrix reporting `val_loss`, `val_accuracy`, `val_miou`, `val_dice_macro`,
   `val_dice_micro` and the per-class keys. Reading an old TensorBoard or CSV run by the old keys
