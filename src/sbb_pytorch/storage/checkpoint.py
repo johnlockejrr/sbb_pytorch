@@ -14,6 +14,14 @@ So a model trained with ``train.py`` could not be loaded by ``model_utils.load_m
 vice-versa. :meth:`Checkpoint.load` now accepts all three spellings (and a bare state dict),
 so existing checkpoints keep working while everything new is written in one format.
 
+A fourth layout comes from pytorch-lightning rather than from the legacy scripts: a ``.ckpt``
+holds the module's weights under ``state_dict`` with every key prefixed by the attribute that
+holds the model (``model.conv.weight``), the optimiser step under ``global_step``, and the
+optimiser states under the plural ``optimizer_states``. :meth:`Checkpoint.from_lightning` reads
+that shape as well -- which is what lets ``sbb export best-07-0.9812.ckpt`` write a file
+``sbb infer`` will accept. Before it, the export copied the prefixed keys into ``model.pt`` and
+the very next load rejected them as ``Unexpected key(s) "model.conv.weight"``.
+
 Pruning also changed: ``sorted(glob("..._epoch_*.pth"))`` is lexicographic, so ``epoch_10``
 sorted before ``epoch_2`` and ``keep_last_n`` deleted the newest files. Ordering is numeric now.
 """
@@ -23,6 +31,7 @@ from __future__ import annotations
 import json
 import pickle
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +56,101 @@ _STATE_KEYS = ("model_state", "model_state_dict", "state_dict", "model")
 
 _SCHEME = re.compile(r"(?P<stem>.*?)(?:[._-](?P<epoch>\d+))?(?:\.(?P<ext>pt|pth|ckpt))?$")
 
+#: The key pytorch-lightning stamps on every checkpoint it writes. Ours is spelled
+#: ``pytorch_lightning_version``; the hyphen is Lightning's own and is what identifies the file.
+_LIGHTNING_VERSION_KEY = "pytorch-lightning_version"
+
+
+def _is_lightning(raw: dict[str, Any]) -> bool:
+    """Whether *raw* is pytorch-lightning's layout, whatever the file happens to be called.
+
+    Content rather than suffix, because ``model.ckpt`` renamed to ``model.pt`` is the ordinary
+    thing an old run ends up as and ``torch.load`` cannot tell the two apart afterwards. Either
+    marker is enough: Lightning's own dumps always carry ``pytorch-lightning_version``, while a
+    trimmed or older file still pairs ``global_step`` with the plural ``optimizer_states``.
+    Neither appears in this package's schema, whose fields are ``step`` and ``optimizer_state``.
+    """
+    return _LIGHTNING_VERSION_KEY in raw or ("global_step" in raw and "optimizer_states" in raw)
+
+
+def _lightning_state(raw: dict[str, Any]) -> dict[str, Tensor]:
+    """The architecture's tensors out of a Lightning ``state_dict``, with the prefix removed.
+
+    Lightning keys everything through the attribute that holds the model, so
+    :class:`~sbb_pytorch.training.module.SBBLightningModule`'s parameters come out as
+    ``model.conv.weight`` while this package's ``model_state`` holds the *architecture's* own keys
+    (``conv.weight``) -- which is exactly what ``fit`` writes into ``model.pt``. Taking
+    ``state_dict`` whole is the ``Unexpected key(s) "model.conv.weight"`` that used to make an
+    exported checkpoint unloadable, so the ``model.`` group is what gets returned, renamed.
+
+    Order of attempts, each one all-or-nothing so a partial match is never taken quietly: the
+    ``model.`` group; one prefix shared by every key, stripped; the ``state_dict`` verbatim.
+    """
+    state = {k: v for k, v in (raw.get("state_dict") or {}).items() if isinstance(v, Tensor)}
+    if not state:
+        return {}
+    if any(key.startswith("model.") for key in state):
+        return {k[len("model.") :]: v for k, v in state.items() if k.startswith("model.")}
+    heads = {key.split(".", 1)[0] for key in state}
+    if len(heads) == 1 and "" not in heads:
+        (head,) = heads
+        return {k[len(head) + 1 :]: v for k, v in state.items()}
+    return dict(state)
+
+
+def _modules(target: nn.Module, keys: Iterable[str]) -> list[tuple[nn.Module, str]]:
+    """Every module *keys* could belong to, with the prefix they would carry.
+
+    ``target`` itself, then each of its child modules under ``"<child_name>."`` -- the shape
+    pytorch-lightning writes (``SBBLightningModule.model`` gives ``model.conv.weight``) and the
+    shape ``fit`` saves ``model.pt`` from -- then ``target`` again under each leading segment the
+    keys themselves use, which is how a ``.ckpt``'s ``model.`` prefix is found when the weights are
+    being loaded into a bare architecture rather than into the module that saved them. No
+    architecture in :mod:`sbb_pytorch.models` has a ``model`` attribute of its own
+    (``grep -rn "self\\.model" src/sbb_pytorch/models/*.py`` is empty), so a prefixed match can
+    only fire for a wrapper or for a file that really was written with that prefix.
+    """
+    found: list[tuple[nn.Module, str]] = [(target, "")]
+    found += [(module, f"{name}.") for name, module in target.named_children()]
+    heads = sorted({key.split(".", 1)[0] for key in keys if "." in key})
+    found += [(target, f"{head}.") for head in heads]
+    return found
+
+
+def _spellings(state: dict[str, Tensor], prefix: str) -> list[dict[str, Tensor]]:
+    """The ways *state* can be spelled for *prefix*: as it is, prefixed, or un-prefixed.
+
+    One prefix, all keys at once. Renaming some keys and not others is how a checkpoint belonging
+    to another architecture quietly loses weight, so a partial match is never taken.
+    """
+    if not prefix:
+        return [state]
+    if all(key.startswith(prefix) for key in state):
+        return [state, {key[len(prefix) :]: value for key, value in state.items()}]
+    return [state, {f"{prefix}{key}": value for key, value in state.items()}]
+
+
+def _resolve_target(
+    state: Mapping[str, Tensor], target: nn.Module
+) -> tuple[nn.Module, dict[str, Tensor], str]:
+    """The module *state* belongs in, the keys to hand it, and the rule that decided so.
+
+    One policy, written once, covering every source a :class:`Checkpoint` can come from:
+
+    * ``"exact"`` -- the keys are ``target``'s own, so the weights go where they were written from;
+    * ``"prefix"`` -- they are a child module's keys under one prefix, which is the shape a
+      pytorch-lightning ``.ckpt`` keeps them in for its ``self.model`` and the shape ``fit``
+      writes ``model.pt`` from, so loading either into a ``SBBLightningModule`` resolves here;
+    * ``"as-is"`` -- nothing matched, so ``load_state_dict`` receives the original keys and
+      produces torch's own missing/unexpected report instead of a guess being made first.
+    """
+    keys = dict(state)
+    for module, prefix in _modules(target, keys):
+        for spelling in _spellings(keys, prefix):
+            if set(spelling) == set(module.state_dict()):
+                return module, spelling, "exact" if not prefix else "prefix"
+    return target, keys, "as-is"
+
 
 def _sidecar(path: Path) -> Path:
     """``model.pt`` -> ``model_config.json``: the JSON mirror written next to a checkpoint."""
@@ -69,6 +173,10 @@ class Checkpoint:
         metrics: Final metrics, e.g. ``{"val_loss": 0.31, "val_iou": 0.78}``.
         package_version: Version of this package that produced the file.
         schema_version: On-disk layout version; currently ``1``.
+        pytorch_lightning_version: The pytorch-lightning version a ``.ckpt`` was written by, when
+            the checkpoint came from one. ``package_version`` answers for *this* package -- a
+            Lightning file was not produced by it, which is why ``sbb export`` re-stamps it -- so
+            a foreign producer gets its own field instead of borrowing that one.
     """
 
     model_state: dict[str, Tensor]
@@ -80,6 +188,7 @@ class Checkpoint:
     metrics: dict[str, float] = field(default_factory=dict)
     package_version: str = __version__
     schema_version: int = 1
+    pytorch_lightning_version: str | None = None
 
     # -------------------------------------------------------------- construction
 
@@ -88,11 +197,15 @@ class Checkpoint:
         """Build a checkpoint from a loaded dict, accepting the legacy key spellings.
 
         Accepts ``model_state``, ``model_state_dict``, ``state_dict``, ``model``, or a bare
-        ``{name: tensor}`` mapping with no wrapper at all.
+        ``{name: tensor}`` mapping with no wrapper at all. A dict that is recognisably
+        pytorch-lightning's own layout goes to :meth:`from_lightning` first -- see
+        :func:`_is_lightning` for how the two are told apart.
 
         Raises:
             CheckpointError: if no weights can be located in ``raw``.
         """
+        if _is_lightning(raw):
+            return cls.from_lightning(raw)
         state: dict[str, Tensor] | None = None
         for key in _STATE_KEYS:
             value = raw.get(key)
@@ -112,6 +225,7 @@ class Checkpoint:
         if not isinstance(metrics, dict):
             # train.py used to store val_loss/val_acc as loose top-level scalars.
             metrics = {k: v for k, v in raw.items() if isinstance(v, int | float) and k != "epoch"}
+        lightning_version = raw.get("pytorch_lightning_version")
 
         return cls(
             model_state=state,
@@ -123,6 +237,48 @@ class Checkpoint:
             metrics={str(k): float(v) for k, v in metrics.items() if isinstance(v, int | float)},
             package_version=str(raw.get("package_version", "unknown")),
             schema_version=int(raw.get("schema_version", 0)),
+            pytorch_lightning_version=(
+                str(lightning_version) if isinstance(lightning_version, str) else None
+            ),
+        )
+
+    @classmethod
+    def from_lightning(cls, raw: dict[str, Any]) -> Checkpoint:
+        """Read pytorch-lightning's own checkpoint layout into this schema.
+
+        A ``.ckpt`` from ``Trainer.save_checkpoint`` or ``ModelCheckpoint`` is not our shape. Its
+        ``state_dict`` holds the *LightningModule's* state, so every parameter is named through
+        the attribute that holds it (``model.conv.weight``), the step is ``global_step`` rather
+        than ``step``, and the optimisers are the plural ``optimizer_states`` -- a list with one
+        entry per optimiser -- rather than ``optimizer_state``. Reading it with :meth:`from_dict`
+        alone copied those prefixed keys straight into ``model.pt``, which the next
+        :meth:`apply_to` then rejected as ``Unexpected key(s) "model.conv.weight"``, so
+        ``sbb export best-07-0.9812.ckpt`` produced a file ``sbb infer`` could not load.
+
+        ``task`` and ``config`` stay ``None`` here for the reason they stay ``None`` for any
+        pre-schema file: ``SBBLightningModule`` does not call ``save_hyperparameters`` (see
+        migration 3.6), so a Lightning checkpoint carries no configuration, and ``sbb infer``
+        still needs ``--config`` after such an export. ``metrics`` stays empty rather than
+        harvesting loose scalars the way :meth:`from_dict` does for ``train.py``'s files:
+        ``global_step`` is not a metric, and Lightning keeps epoch metrics in ``callback_metrics``,
+        which never reach the file.
+        """
+        optimizers = raw.get("optimizer_states")
+        if isinstance(optimizers, list | tuple):
+            optimizer_state = optimizers[0] if optimizers else None
+        elif isinstance(optimizers, dict):  # a trimmed file that kept one state instead of a list
+            optimizer_state = optimizers
+        else:
+            optimizer_state = None
+        version = raw.get(_LIGHTNING_VERSION_KEY)
+        return cls(
+            model_state=_lightning_state(raw),
+            epoch=int(raw.get("epoch") or 0),
+            step=int(raw.get("step", raw.get("global_step")) or 0),
+            optimizer_state=optimizer_state,
+            package_version=str(raw.get("package_version", "unknown")),
+            schema_version=int(raw.get("schema_version", 1)),
+            pytorch_lightning_version=str(version) if isinstance(version, str) else None,
         )
 
     @classmethod
@@ -155,6 +311,7 @@ class Checkpoint:
             "metrics": self.metrics,
             "package_version": self.package_version,
             "schema_version": self.schema_version,
+            "pytorch_lightning_version": self.pytorch_lightning_version,
         }
 
     def save(self, path: str | Path, *, write_sidecar: bool = True) -> Path:
@@ -213,23 +370,31 @@ class Checkpoint:
     ) -> None:
         """Load these weights into ``model`` (and ``optimizer``), with a precise error on mismatch.
 
+        The target is chosen by :func:`_resolve_target`: the architecture ``model`` itself when the
+        keys are its own, its ``model`` child when they carry the ``model.`` prefix a
+        pytorch-lightning checkpoint writes, and ``model`` unchanged so torch's own report is what
+        the caller sees when nothing matches. The rule used is named in the error, because "which
+        of these two files is this?" is the question a mismatch really asks.
+
         Raises:
             CheckpointError: on any key mismatch when ``strict`` -- rather than the bare
                 ``RuntimeError`` the legacy callers surfaced, which usually just said
                 ``size mismatch for <layer>`` without saying which checkpoint it came from.
         """
+        module, state, rule = _resolve_target(self.model_state, model)
+        detail = "" if rule == "exact" else f" (matched by the {rule} rule)"
         try:
-            result = model.load_state_dict(self.model_state, strict=strict)
+            result = module.load_state_dict(state, strict=strict)
         except RuntimeError as exc:
             raise CheckpointError(
-                f"weights incompatible with {type(model).__name__}: {exc}"
+                f"weights incompatible with {type(model).__name__}: {exc}{detail}"
             ) from exc
         # strict=False never raises; report what it skipped so a partial load is still visible.
         if not strict and (result.missing_keys or result.unexpected_keys):
             raise CheckpointError(
                 f"{type(model).__name__}: {len(result.missing_keys)} missing and "
                 f"{len(result.unexpected_keys)} unexpected keys; "
-                f"first missing: {result.missing_keys[:3] or 'none'}"
+                f"first missing: {result.missing_keys[:3] or 'none'}{detail}"
             )
 
         if optimizer is not None and self.optimizer_state:

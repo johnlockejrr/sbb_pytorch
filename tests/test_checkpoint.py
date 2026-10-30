@@ -77,6 +77,81 @@ def test_reads_every_historical_key_spelling(tmp_path: Path, key: str) -> None:
     assert Checkpoint.load(path).model_state.keys() == TinyModel().state_dict().keys()
 
 
+def test_loads_a_lightning_checkpoint_and_strips_the_model_prefix(tmp_path: Path) -> None:
+    """A ``.ckpt`` names every parameter through the module holding it; ``model_state`` does not.
+
+    pytorch-lightning writes ``{"state_dict": {"model.conv.weight": ...}, "global_step": ...,
+    "optimizer_states": [...]}`` -- so the step and the optimiser state live under names
+    :meth:`Checkpoint.from_dict` never looked at, and the prefixed keys it did copy made
+    ``sbb export best-07-0.9812.ckpt`` produce a ``model.pt`` that ``sbb infer`` then refused.
+    """
+    model = TinyModel()
+    path = tmp_path / "best-07-0.9812.ckpt"
+    torch.save(
+        {
+            "state_dict": {f"model.{k}": v for k, v in model.state_dict().items()}
+            | {"criterion.weights": torch.zeros(3)},
+            "epoch": 7,
+            "global_step": 42,
+            "optimizer_states": [torch.optim.SGD(model.parameters(), lr=0.1).state_dict()],
+            "pytorch-lightning_version": "2.6.6",
+        },
+        path,
+    )
+
+    checkpoint = Checkpoint.load(path)
+    assert checkpoint.model_state.keys() == model.state_dict().keys()  # the model group, renamed
+    assert checkpoint.epoch == 7
+    assert checkpoint.step == 42  # Lightning spells this ``global_step``
+    assert checkpoint.optimizer_state is not None  # ...and this one ``optimizer_states``
+    assert checkpoint.pytorch_lightning_version == "2.6.6"
+    assert (
+        checkpoint.metrics == {}
+    )  # global_step is not a metric, whatever from_dict's fallback says
+    checkpoint.apply_to(model)  # the load this whole path used to end in
+
+
+def test_loads_a_lightning_checkpoint_whose_state_dict_is_not_prefixed(tmp_path: Path) -> None:
+    """No single ``model.`` group to take: keep the whole ``state_dict`` rather than guess one.
+
+    The file is a ``.ckpt`` renamed to ``.pt``, which is the ordinary fate of an old run -- so the
+    layout is decided by the contents, not by the suffix.
+    """
+    state = TinyModel().state_dict()
+    path = tmp_path / "model.pt"
+    torch.save(
+        {
+            "state_dict": {**state, "criterion.weights": torch.zeros(3)},
+            "epoch": 3,
+            "global_step": 12,
+            "optimizer_states": [],
+            "pytorch-lightning_version": "2.4.0",
+        },
+        path,
+    )
+    checkpoint = Checkpoint.load(path)
+    assert set(checkpoint.model_state) == set(state) | {"criterion.weights"}
+    assert checkpoint.step == 12 and checkpoint.optimizer_state is None
+    assert checkpoint.pytorch_lightning_version == "2.4.0"
+
+
+def test_strips_the_one_prefix_a_lightning_checkpoint_shares(tmp_path: Path) -> None:
+    """A checkpoint whose every key starts ``net.``: the shared prefix is what gets removed."""
+    path = tmp_path / "net.ckpt"
+    torch.save(
+        {
+            "state_dict": {"net.weight": torch.zeros(2, 2), "net.bias": torch.zeros(2)},
+            "epoch": 1,
+            "global_step": 5,
+            "optimizer_states": [],
+        },
+        path,
+    )
+    checkpoint = Checkpoint.load(path)
+    assert set(checkpoint.model_state) == {"weight", "bias"}
+    assert checkpoint.pytorch_lightning_version is None  # only Lightning's hyphenated key sets it
+
+
 def test_reads_bare_state_dict_without_wrapper(tmp_path: Path) -> None:
     path = tmp_path / "bare.pt"
     torch.save(TinyModel().state_dict(), path)
@@ -132,6 +207,29 @@ def test_apply_to_rejects_wrong_architecture(tmp_path: Path) -> None:
     other = TinyModel(out=9)
     with pytest.raises(CheckpointError, match="incompatible with TinyModel"):
         load_into_model(path, other)
+
+
+def test_apply_to_reaches_the_architecture_through_a_wrapper(tmp_path: Path) -> None:
+    """``SBBLightningModule`` keeps the architecture in ``self.model``; so does this stand-in.
+
+    The keys a ``model.pt`` holds are the *architecture's* own, so loading one into anything that
+    wraps an architecture means reaching through the attribute -- the case the ``prefix`` rule in
+    :func:`~sbb_pytorch.storage.checkpoint._resolve_target` exists for.
+    """
+
+    class Wrapper(nn.Module):
+        def __init__(self, model: nn.Module) -> None:
+            super().__init__()
+            self.model = model
+
+    model = TinyModel()
+    with torch.no_grad():
+        model.conv.weight.normal_()  # weights the wrapper's own freshly built ones cannot match
+    path = save_checkpoint(tmp_path / "model.pt", model)
+
+    wrapper = Wrapper(TinyModel())
+    Checkpoint.load(path).apply_to(wrapper)
+    torch.testing.assert_close(wrapper.model.conv.weight, model.conv.weight)
 
 
 def test_apply_to_non_strict_reports_skipped_keys(tmp_path: Path) -> None:

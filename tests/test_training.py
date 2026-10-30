@@ -443,10 +443,19 @@ def test_fit_writes_the_epoch_checkpoints_next_to_it(
         dir_output=str(tmp_path),
         data_is_provided=True,
     )
-    fit(config, model=stub, logger=False, enable_progress_bar=False, enable_model_summary=False)
+    module = SBBLightningModule(config, stub)
+    fit(config, module=module, logger=False, enable_progress_bar=False, enable_model_summary=False)
     names = sorted(p.name for p in tmp_path.glob("*.ckpt"))
     assert len(names) == 2  # model-* and best-*, one per monitored metric
     assert any(n.startswith("model-") for n in names) and any(n.startswith("best-") for n in names)
+    # Every one of them has to load, into the module it came from and into the architecture inside
+    # it: the ``model.`` prefix Lightning writes used to make the pair refuse each other, which is
+    # why ``sbb export best-07-0.9812.ckpt`` produced a ``model.pt`` ``sbb infer`` could not read.
+    for name in names:
+        checkpoint = Checkpoint.load(tmp_path / name)
+        checkpoint.apply_to(module)
+        checkpoint.apply_to(stub)
+        assert checkpoint.pytorch_lightning_version is not None  # provenance, not a guess
 
 
 def test_fit_can_skip_the_final_save(stub: nn.Module, data_root: Path, tmp_path: Path) -> None:

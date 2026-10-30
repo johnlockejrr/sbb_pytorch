@@ -203,6 +203,15 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   downloaded. `device.available_devices` called `torch.device_count()` -- an attribute that does not
   exist, on the one branch that only runs when CUDA is present, so it passed every test here and
   would have raised `AttributeError` on the machine `--device auto` is meant for.
+- **Checkpoints.** `Checkpoint.load` could not read a pytorch-lightning `.ckpt`: it copied
+  `state_dict` verbatim, where Lightning keys every parameter through the attribute holding it
+  (`model.conv.weight`), so the `apply_to` immediately after the load raised
+  `Unexpected key(s) "model.conv.weight"` -- which is exactly what `sbb export
+  best-07-0.9812.ckpt` then handed to `sbb infer`. `Checkpoint.from_lightning` reads that layout
+  now, with the `model.` prefix stripped, `step` taken from `global_step`, `optimizer_states[0]` as
+  `optimizer_state`, and the Lightning version kept in a new `pytorch_lightning_version` field
+  instead of `package_version`. Detection is by contents, not by suffix, so a `.ckpt` renamed to
+  `.pt` is still recognised.
 - **Callbacks.** `SaveWeightsAfterSteps` declared a signature pytorch-lightning never calls, so it
   never fired; `training.py`'s `ModelCheckpoint.save_model` read attributes its own `__init__`
   never assigned, so the first save raised `AttributeError`; pruning sorted `epoch_10` before
