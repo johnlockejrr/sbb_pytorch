@@ -21,6 +21,7 @@ check -- had been fixed already, and their tests say so.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -54,6 +55,22 @@ PAGE_XML = """<?xml version="1.0" encoding="UTF-8"?>
     </ReadingOrder>
   </Page>
 </PcGts>"""
+
+# One text block holding three lines, in the shape a real annotation has: the lines are inside the
+# block, and the block is the only page-level region. The attribute spellings (@id, @custom,
+# TextEquiv/@conf, Baseline) and the 461-line page the user annotated are the reason each is here.
+NESTED_LINES = """<TextRegion id="block" custom="structure {type:text_zone;}">
+  <Coords points="10,10 50,10 50,50 10,50"/>
+  <TextLine id="l1" custom="structure {type:text_line;}">
+    <Coords points="12,12 48,12 48,20 12,20"/>
+    <Baseline points="12,19 48,19"/>
+    <TextEquiv conf="0.9999"><Unicode>first</Unicode></TextEquiv>
+  </TextLine>
+  <TextLine id="l2"><Coords points="12,24 48,24 48,32 12,32"/>
+    <TextEquiv conf="0.5"><Unicode>second</Unicode></TextEquiv>
+  </TextLine>
+  <TextLine id="l3"><Coords points="12,36 48,36 48,44 12,44"/></TextLine>
+</TextRegion>"""
 
 # Contours whose geometry is closed-form: a 20x15 rectangle (area 300, boundingRect 21x16 because
 # OpenCV counts both end pixels), a 3-4-5 triangle (area 6), a collinear triple (area 0) and a
@@ -153,6 +170,203 @@ def test_region_id_is_read_from_both_attribute_spellings(tmp_path: Path) -> None
         )
     )
     assert both.regions[0].region_id == "upper"  # @ID is consulted first
+
+
+def nested_page(tmp_path: Path) -> parser.Page:
+    """Parse :data:`NESTED_LINES` -- one block holding three lines -- as a page."""
+    return parser.parse_pagexml(
+        write_xml(tmp_path, "nested.xml", xml_document(NESTED_LINES, width=60, height=60))
+    )
+
+
+def test_nested_lines_are_their_regions_children_not_their_siblings(tmp_path: Path) -> None:
+    """The defect this exists for: a page whose 38 lines sit in one block came back as 38 blocks.
+
+    ``PAGE_XML`` above is flat, so nothing here noticed that ``_iter_regions``'s ``root.iter()``
+    sweep turned a ``TextLine`` nested in a ``TextRegion`` into another ``TextRegion``.
+    """
+    page = nested_page(tmp_path)
+    assert [r.region_id for r in page.regions] == ["block", "l1", "l2", "l3"]  # document order
+
+    block = page.regions[0]
+    assert block.kind is parser.RegionKind.TEXT
+    assert [child.region_id for child in block.children] == ["l1", "l2", "l3"]
+    assert [child.kind for child in block.children] == [parser.RegionKind.TEXTLINE] * 3
+    assert all(child.parent is block for child in block.children)  # the edge the writer needs
+
+    assert page.root_regions() == [block]  # the lines are not page-level regions
+    assert [(r.region_id, depth) for r, depth in page.walk()] == [
+        ("block", 0),
+        ("l1", 1),
+        ("l2", 1),
+        ("l3", 1),
+    ]  # walk() covers every region exactly once, at its own depth
+
+
+def test_words_and_glyphs_nest_under_the_line_that_holds_them(tmp_path: Path) -> None:
+    """``TextLine`` holds ``Word``\\ s and ``Word``\\ s hold ``Glyph``\\ s -- three levels deep."""
+    page = parser.parse_pagexml(
+        write_xml(
+            tmp_path,
+            "deep.xml",
+            xml_document(
+                '<TextRegion id="b" type="paragraph"><Coords points="0,0 30,0 30,10 0,10"/>'
+                '<TextLine id="l"><Coords points="1,1 29,1 29,9 1,9"/>'
+                '<Word><Coords points="1,1 14,1 14,9 1,9"/>'
+                '<Glyph><Coords points="1,1 6,1 6,9 1,9"/></Glyph></Word>'
+                '<Word><Coords points="16,1 29,1 29,9 16,9"/></Word></TextLine></TextRegion>',
+                width=30,
+                height=10,
+            ),
+        )
+    )
+    line = page.regions[1]
+    assert line.kind is parser.RegionKind.TEXTLINE
+    assert [w.kind for w in line.children] == [parser.RegionKind.WORD] * 2
+    assert [g.kind for g in line.children[0].children] == [parser.RegionKind.GLYPH]
+    assert len(list(page.walk())) == len(page.regions) == 5
+
+
+def test_a_child_the_schema_forbids_where_it_is_found_is_kept_as_an_orphan(tmp_path: Path) -> None:
+    """A region in a place the content model does not allow keeps existing -- just not nested.
+
+    Re-parenting it to the nearest legal ancestor would invent a page that was never annotated,
+    and dropping it would lose the annotation, so it is recorded at page level with the odd
+    nesting left unstated.  That is how the old flat output of ``sbb infer`` round-trips.
+    """
+    page = parser.parse_pagexml(
+        write_xml(
+            tmp_path,
+            "illegal.xml",
+            xml_document(
+                '<TextRegion id="outer"><Coords points="0,0 30,0 30,30 0,30"/>'
+                '<TextLine id="line"><Coords points="1,1 29,1 29,9 1,9"/>'
+                '<TextRegion id="nested"><Coords points="2,2 8,2 8,8 2,8"/></TextRegion>'
+                '<Glyph id="g1"><Coords points="3,3 7,3 7,7 3,7"/></Glyph>'
+                "</TextLine></TextRegion>",
+                width=30,
+                height=30,
+            ),
+        )
+    )
+    assert [r.region_id for r in page.regions] == ["outer", "line", "nested", "g1"]
+    line = page.regions[1]
+    assert line.children == []  # a TextLine holds Words -- not a TextRegion, not a Glyph
+    # and both of those stay on the page, unparented, rather than being dropped or re-parented:
+    assert [r.region_id for r in page.root_regions()] == ["outer", "nested", "g1"]
+
+
+def test_custom_confidence_and_baseline_are_read(tmp_path: Path) -> None:
+    """``@custom``, ``TextEquiv/@conf`` and ``<Baseline>`` -- three attributes once unread."""
+    page = nested_page(tmp_path)
+    block, first, second, third = page.regions
+
+    assert block.custom == "structure {type:text_zone;}"
+    assert first.custom == "structure {type:text_line;}"  # the line's own class
+    assert second.custom == ""  # an absent attribute is "", never None
+    assert (block.text, block.text_conf) == (None, None)  # a block with no TextEquiv of its own
+
+    assert (first.text, first.text_conf) == ("first", pytest.approx(0.9999))
+    assert first.baseline.tolist() == [[12, 19], [48, 19]]  # Coords is the box; this is the line
+    assert (second.text, second.text_conf) == ("second", pytest.approx(0.5))
+    assert second.baseline is None  # no <Baseline> element
+    assert (third.text, third.text_conf) == (None, None)
+
+    malformed = parser.parse_pagexml(
+        write_xml(
+            tmp_path,
+            "conf.xml",
+            xml_document(
+                '<TextLine id="x"><Coords points="0,0 9,0 9,4 0,4"/>'
+                '<TextEquiv conf="high"><Unicode>text</Unicode></TextEquiv></TextLine>',
+                width=10,
+                height=10,
+            ),
+        )
+    )
+    assert (malformed.regions[0].text, malformed.regions[0].text_conf) == (
+        "text",
+        None,
+    )  # a confidence that is not a number costs the number only
+
+
+def test_a_region_without_geometry_is_dropped_but_the_lines_inside_survive(tmp_path: Path) -> None:
+    """The old ``root.iter()`` sweep skipped an unusable element and went on inside it; so does
+    the walk -- an element that cannot be drawn must not take its readable children with it.
+    """
+    page = parser.parse_pagexml(
+        write_xml(
+            tmp_path,
+            "hollow.xml",
+            xml_document(
+                '<TextRegion id="hollow" type="paragraph">'
+                '<TextLine id="inside"><Coords points="4,4 20,4 20,10 4,10"/></TextLine>'
+                "</TextRegion>",
+                width=30,
+                height=20,
+            ),
+        )
+    )
+    assert [r.region_id for r in page.regions] == ["inside"]  # the block itself is not a region
+    assert page.regions[0].parent is None
+    assert page.root_regions() == page.regions  # promoted to page level, not lost with the block
+
+
+def test_page_metadata_is_read_and_a_page_without_any_is_still_parsed(tmp_path: Path) -> None:
+    """``Metadata`` used to be read only for ``num_col``; the rest of it is kept now."""
+    page = parser.parse_pagexml(
+        write_xml(
+            tmp_path,
+            "meta.xml",
+            xml_document(
+                "",
+                width=10,
+                height=10,
+                metadata=(
+                    '<Metadata externalRef="mets//sam_40_mss.zip/BL_Or_1443_300.jpg">'
+                    "<Creator>escriptorium</Creator>"
+                    "<Created>2025-05-10T19:51:07.113207+00:00</Created>"
+                    "<LastChange>2025-05-10T20:04:11.553118+00:00</LastChange>"
+                    "</Metadata>"
+                ),
+            ),
+        )
+    )
+    assert page.external_ref == "mets//sam_40_mss.zip/BL_Or_1443_300.jpg"
+    assert page.creator == "escriptorium"
+    assert page.created == "2025-05-10T19:51:07.113207+00:00"
+    assert page.last_change == "2025-05-10T20:04:11.553118+00:00"
+
+    bare = parser.parse_pagexml(
+        write_xml(tmp_path, "bare.xml", xml_document("", width=10, height=10))
+    )
+    assert (bare.external_ref, bare.creator, bare.created, bare.last_change) == (
+        "",
+        None,
+        None,
+        None,
+    )  # a document with no <Metadata> at all still parses; "" for the attribute, None for elements
+
+
+def test_the_parent_back_reference_is_excluded_from_equality_and_repr() -> None:
+    """``parent`` is ``compare=False, repr=False`` because ``children`` holds the objects it points at.
+
+    Comparing or formatting that field walks parent -> child -> parent forever; the two flags are
+    the only thing that stops it, and the generator compares regions by value (``generator.py:551``
+    notes the dataclass leaves them unhashable), so the rule is load-bearing rather than cosmetic.
+    """
+    line = parser.Region(kind=parser.RegionKind.TEXTLINE, type_name="", region_id="l", contour=RECT)
+    block = parser.Region(
+        kind=parser.RegionKind.TEXT, type_name="paragraph", region_id="b", contour=RECT
+    )
+    block.children.append(line)
+    line.parent = block
+
+    assert line == line  # would raise RecursionError were `parent` compared
+    assert "parent=" not in repr(line)
+    declared = {item.name: item for item in dataclasses.fields(parser.Region)}
+    assert (declared["parent"].repr, declared["parent"].compare) == (False, False)
+    assert declared["children"].compare is True  # the tree itself is part of a region's value
 
 
 def test_page_geometry_and_element_local_names(tmp_path: Path) -> None:
