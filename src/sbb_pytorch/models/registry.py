@@ -41,6 +41,17 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
 #: Configurations that mean "the plain CNN U-Net": segmentation and its two-class subsets.
 _UNET_TASKS = (TaskType.SEGMENTATION, TaskType.BINARIZATION)
 
+#: The entries with a convolutional segmentation head, i.e. the ones ``image_fusion`` applies to.
+#: The classifier and the reading-order model pool the encoder instead of decoding it, so passing
+#: the argument to them would be a ``TypeError`` rather than a no-op.
+_SEGMENTATION_MODELS = (
+    "resnet50_unet",
+    "resnet50_unet_light",
+    "vit_resnet50_unet",
+    "vit_resnet50_unet_transformer_before_cnn",
+    "enhancement",
+)
+
 
 def model_name(config: SBBConfig) -> str:
     """The registry key :data:`MODEL_REGISTRY` should serve for ``config``.
@@ -79,6 +90,7 @@ def create_model(
     model: str | None = None,
     pretrained: bool | None = None,
     pairing: str = "aligned",
+    image_fusion: bool | None = None,
 ) -> nn.Module:
     """Build the model ``config`` describes.
 
@@ -89,6 +101,9 @@ def create_model(
             machines use, since the legacy constructors always downloaded ImageNet weights.
         pairing: Decoder skip pairing for the U-Net family; ``"legacy"`` loads
             ``models_pytorch.ResNet50UNet`` checkpoints.
+        image_fusion: Fuse the input image into the segmentation head, as upstream does. ``None``
+            (default) lets the class decide -- ``True`` on an aligned head, ``False`` on a legacy
+            one. Ignored by the two pooled models, which have no segmentation head.
 
     Raises:
         ModelBuildError: unknown ``model`` name, or a config that names an architecture needing
@@ -112,6 +127,8 @@ def create_model(
 
     if issubclass(target, UNet):
         args["pairing"] = pairing
+    if name in _SEGMENTATION_MODELS:
+        args["image_fusion"] = image_fusion
     if name in ("vit_resnet50_unet", "vit_resnet50_unet_transformer_before_cnn") and (
         config.transformer is None
     ):

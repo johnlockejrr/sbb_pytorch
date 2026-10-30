@@ -21,14 +21,18 @@ pass. The one variant that ran (``ResNet50UNet``) worked only because it special
 decoder block with the encoder feature map of the *same* level (the
 `segmentation-models <https://github.com/qubvel-org/segmentation_models.pytorch>`_ convention),
 sizes every fusion by ``F.interpolate`` to the skip's actual shape rather than assuming a clean
-pyramid (``f1`` and ``f2`` are both at ``H/2`` in a ResNet, so ``Upsample(scale_factor=2)`` is
-wrong for one of them), and exposes ``pairing="legacy"`` so checkpoints trained against
-``ResNet50UNet``'s off-by-one decoder still load.
+pyramid (levels 0 and 1 of a torchvision ResNet are both at ``H/4``, so
+``Upsample(scale_factor=2)`` is wrong for one of them), and exposes ``pairing="legacy"`` so
+checkpoints trained against ``ResNet50UNet``'s off-by-one decoder still load.
 
-Two more cross-cutting fixes live here:
+Three more cross-cutting fixes live here:
 
 * ``weight_decay`` was an argument of every model constructor and was never used -- it is an
   optimiser setting and now lives in ``training/factory.py``.
+* The head dropped the upstream ``Conv2D(32, 3x3)`` that fuses the input image at full
+  resolution and only then predicts a class map, so the shipped models were an interpolation of
+  an ``H/4`` prediction rather than a prediction. :class:`SegmentationHead` rebuilds that stage
+  (plus the segmentation-only ``BatchNormalization`` on the logits) for ``pairing="aligned"``.
 * The legacy models disagreed about activations: ``ResNet50UNet`` returned raw logits for
   segmentation and ``sigmoid`` otherwise, while ``ResNet50UNetLight`` and both ViT variants
   returned ``softmax``. A ``CrossEntropyLoss`` on softmaxed logits normalises twice, so those
@@ -46,15 +50,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
 
+from sbb_pytorch.config.models import TaskType
+
 __all__ = [
     "RESNET_LEVELS",
     "RESNET_STRIDES",
     "AttentionBlock",
     "ConvBlock",
     "ResNetEncoder",
+    "SegmentationHead",
     "UNetDecoder",
     "probs",
     "resize_to_input",
+    "resolve_head",
 ]
 
 Pairing = Literal["aligned", "legacy"]
@@ -158,6 +166,112 @@ class AttentionBlock(nn.Module):
             torch.cat((x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)), dim=1)
         )
         return x * spatial
+
+
+def resolve_head(
+    image_fusion: bool | None = None,
+    pairing: Pairing = "aligned",
+    logits_norm: bool | None = None,
+    task: TaskType | None = None,
+) -> tuple[bool, bool]:
+    """The two head rules -- ``(image_fusion, logits_norm)`` -- in the one place they are stated.
+
+    An unset ``image_fusion`` follows the pairing: only the aligned head exists upstream, so a
+    legacy head stays the bare ``Conv2d`` its checkpoint was written against. An unset
+    ``logits_norm`` follows upstream's own rule, ``task == "segmentation"``, but only on a fused
+    head -- and asking for a norm on an unfused one is refused rather than ignored, because it
+    adds parameters the checkpoint that pairing exists to load cannot supply.
+
+    Raises:
+        ValueError: ``image_fusion`` on a pairing that has no fusion weights, or ``logits_norm``
+            without ``image_fusion``.
+    """
+    fused = pairing == "aligned" if image_fusion is None else bool(image_fusion)
+    if fused and pairing != "aligned":
+        raise ValueError(
+            f"image_fusion needs pairing='aligned', got {pairing!r}: that pairing reproduces the "
+            "class the checkpoint came from, and its head has no fusion weights to fill"
+        )
+    normalise = (
+        fused and task is TaskType.SEGMENTATION if logits_norm is None else bool(logits_norm)
+    )
+    if normalise and not fused:
+        raise ValueError(
+            "logits_norm needs image_fusion: the unfused head is the bare Conv2d its checkpoints "
+            "were written against, and a BatchNorm2d has no weights there"
+        )
+    return fused, normalise
+
+
+class SegmentationHead(nn.Module):
+    """The output stage every segmentation model shares: optional image fusion, then the 1x1.
+
+    ``image_fusion=True`` is the Keras tail -- ``unet_decoder`` in the upstream
+    ``training/models.py:294-306``, the same six lines on every architecture they ship:
+    upsample the decoder output to the image, ``concatenate([o, img])``,
+    ``Conv2D(32, 3x3) -> BatchNormalization -> ReLU``, then ``Conv2D(n_classes, 1x1)``. The
+    0.1.0 port dropped that stage and resized the ``H/4`` logits to the input instead, so the
+    class conv never looked at a single input pixel -- a one-pixel textline became a blur, and
+    the "prediction" at full resolution was an interpolation of a prediction at a quarter of it.
+
+    ``logits_norm`` is the ``BatchNormalization`` upstream puts on the logits when
+    ``task == "segmentation"`` and omits on the sigmoid tasks, which is why it is a flag rather
+    than part of the convolution.
+
+    Args:
+        in_channels: Channels the decoder hands over.
+        n_classes: Head width.
+        image_fusion: Fuse the input image at full resolution before the class conv. Needs a
+            3-channel input, and it is what a ``pairing="aligned"`` model must build to be the
+            upstream network at all.
+        fusion_channels: Width of the fusion conv; upstream uses ``32`` on every model.
+        logits_norm: Apply ``BatchNorm2d(n_classes)`` to the logits.
+
+    Raises:
+        ValueError: if a channel count is not positive, or fusion was asked for on a model whose
+            input is not 3 channels.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_classes: int,
+        *,
+        image_fusion: bool = False,
+        fusion_channels: int = 32,
+        logits_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        if min(in_channels, n_classes, fusion_channels) < 1:
+            raise ValueError(
+                f"channel counts must be positive, got in={in_channels} classes={n_classes} "
+                f"fusion={fusion_channels}"
+            )
+        self.n_classes = int(n_classes)
+        self.image_fusion = image_fusion
+        if image_fusion:
+            self.fusion: ConvBlock | None = ConvBlock(in_channels + 3, int(fusion_channels))
+            head_in = int(fusion_channels)
+        else:
+            self.fusion = None
+            head_in = int(in_channels)
+        self.classify = nn.Conv2d(head_in, self.n_classes, kernel_size=1)
+        self.norm = nn.BatchNorm2d(self.n_classes) if logits_norm else None
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+        """``features`` is the decoder output, ``image`` the model input it must line up with."""
+        size = (image.shape[-2], image.shape[-1])
+        if self.fusion is None:
+            logits = resize_to_input(self.classify(features), size)
+        else:
+            if image.shape[1] != 3:
+                raise ValueError(
+                    f"{type(self).__name__} fuses the input image into the head, so it needs 3 "
+                    f"input channels, got {image.shape[1]}"
+                )
+            fused = torch.cat((resize_to_input(features, size), image), dim=1)
+            logits = self.classify(self.fusion(fused))
+        return logits if self.norm is None else self.norm(logits)
 
 
 class ResNetEncoder(nn.Module):

@@ -13,10 +13,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from sbb_pytorch.config.models import SBBConfig
+from sbb_pytorch.config.models import SBBConfig, TaskType
 from sbb_pytorch.exceptions import ModelBuildError
 from sbb_pytorch.models import (
     FULL_DECODER_CHANNELS,
+    FUSION_CHANNELS,
     LIGHT_DECODER_CHANNELS,
     MODEL_REGISTRY,
     RESNET_STRIDES,
@@ -326,6 +327,60 @@ def test_segmentation_head_returns_logits_and_exposes_probabilities() -> None:
     assert torch.allclose(probabilities.sum(dim=1), torch.ones(2, 128, 128), atol=1e-5)
     with torch.no_grad():
         assert torch.equal(build("enhancement").predict_proba(IMAGE), build("enhancement")(IMAGE))
+
+
+def test_the_fused_head_is_the_stage_the_port_dropped() -> None:
+    """The Keras head upsamples, concatenates the image, convolves 64+3 -> 32, normalises,
+    then predicts with a 1x1 -- and the port had only the 1x1, run at ``H/4`` and resized."""
+    head = build("resnet50_unet").head  # decoder ends at 64 channels, the image adds 3
+    assert head.fusion is not None and tuple(head.fusion.conv.weight.shape) == (
+        FUSION_CHANNELS,
+        FULL_DECODER_CHANNELS[-1] + 3,
+        3,
+        3,
+    )
+    assert tuple(head.classify.weight.shape) == (3, FUSION_CHANNELS, 1, 1)
+    assert isinstance(head.norm, nn.BatchNorm2d), "upstream normalises the logits it softmaxes"
+
+
+def test_both_resnet_unets_end_at_the_same_head_widths() -> None:
+    """``64`` then ``32`` on both: the light model's old ``(..., 64, 32)`` had merged the head's
+    fusion conv into the last decoder block and halved every width below the first."""
+    assert LIGHT_DECODER_CHANNELS == (512, 512, 256, 128, 64)
+    for name in ("resnet50_unet", "resnet50_unet_light"):
+        head = build(name).head
+        assert head.fusion is not None
+        assert tuple(head.fusion.conv.weight.shape) == (FUSION_CHANNELS, 64 + 3, 3, 3)
+
+
+def test_an_unfused_head_stays_the_bare_conv_and_refuses_a_norm() -> None:
+    """``pairing="legacy"`` exists to load a checkpoint whose head is one ``Conv2d``: no fusion
+    block to fill, no normalisation to fill, and asking for either is the caller's bug."""
+    legacy = build("resnet50_unet", pairing="legacy").head
+    assert legacy.fusion is None and legacy.norm is None
+    assert tuple(legacy.classify.weight.shape) == (3, FULL_DECODER_CHANNELS[-1], 1, 1)
+    with pytest.raises(ValueError, match=r"image_fusion needs pairing='aligned'"):
+        build("resnet50_unet", pairing="legacy", image_fusion=True)
+    with pytest.raises(ValueError, match="logits_norm needs image_fusion"):
+        build("resnet50_unet", pairing="legacy", logits_norm=True)
+
+
+def test_only_a_segmentation_task_gets_normalised_logits() -> None:
+    """``if task == "segmentation": BatchNormalization`` -- the sigmoid tasks skip it, so a
+    binarization model built on the same weights must not grow one."""
+    assert build("resnet50_unet", task=TaskType.BINARIZATION).head.norm is None
+
+
+def test_every_segmentation_model_shares_one_head_type() -> None:
+    """Five architectures, one head class -- the ``nn.Conv2d`` each of them used to carry."""
+    heads = [
+        build("resnet50_unet").head,
+        build("resnet50_unet_light").head,
+        build("vit_resnet50_unet").head,
+        build("vit_resnet50_unet_transformer_before_cnn").unet.head,
+        build("enhancement").unet.head,
+    ]
+    assert {type(head) for head in heads} == {type(build("resnet50_unet").head)}
 
 
 def test_probs_follows_the_task_not_the_caller_memory() -> None:

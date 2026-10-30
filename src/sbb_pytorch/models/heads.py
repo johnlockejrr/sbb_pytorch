@@ -164,6 +164,9 @@ class EnhancementModel(nn.Module):
         n_classes: int = 3,
         backbone: str = "resnet50",
         pretrained: bool = True,
+        image_fusion: bool | None = None,
+        fusion_channels: int = 32,
+        logits_norm: bool | None = None,
     ) -> None:
         super().__init__()
         if n_classes != 3:
@@ -179,6 +182,9 @@ class EnhancementModel(nn.Module):
             backbone=backbone,
             pretrained=pretrained,
             attention=True,
+            image_fusion=image_fusion,
+            fusion_channels=fusion_channels,
+            logits_norm=logits_norm,
             output_activation="sigmoid",
             task=TaskType.ENHANCEMENT,
         )

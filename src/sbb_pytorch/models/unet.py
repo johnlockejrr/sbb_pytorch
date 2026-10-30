@@ -16,6 +16,14 @@ Behaviour changed (see ``docs/migration.md``):
 * ``ResNet50UNetLight`` used to return ``softmax`` and ``ResNet50UNet`` raw logits for the same
   task; both now return logits (``output_activation="none"``), because ``CrossEntropyLoss``
   applies ``log_softmax`` itself and feeding it softmaxed values normalises twice.
+* The head is now :class:`~sbb_pytorch.models.base.SegmentationHead`: for
+  ``pairing="aligned"`` it fuses the input image at full resolution through a 32-channel
+  convolution before predicting, which is the stage the port dropped, and it normalises the
+  logits on segmentation tasks the way the upstream head does. ``pairing="legacy"`` keeps the
+  bare ``Conv2d`` its checkpoints were written against.
+* ``LIGHT_DECODER_CHANNELS`` is ``(512, 512, 256, 128, 64)``: the five widths the upstream light
+  decoder actually has. The old ``(512, 256, 128, 64, 32)`` was copied out of a class that never
+  ran and had merged its full-resolution fusion conv into the last decoder block.
 """
 
 from __future__ import annotations
@@ -26,15 +34,26 @@ import torch
 import torch.nn as nn
 
 from sbb_pytorch.config.models import TaskType
-from sbb_pytorch.models.base import ResNetEncoder, UNetDecoder, probs, resize_to_input
+from sbb_pytorch.models.base import (
+    ResNetEncoder,
+    SegmentationHead,
+    UNetDecoder,
+    probs,
+    resolve_head,
+)
 
 __all__ = ["ResNet50UNet", "ResNet50UNetLight", "UNet"]
 
 #: ``(1024, 512, 256, 128, 64)`` -- the full model's decoder widths, deepest level first.
 FULL_DECODER_CHANNELS: tuple[int, ...] = (1024, 512, 256, 128, 64)
 
-#: ``(512, 256, 128, 64, 32)`` -- the light model's, as its ``# Reduced from ...`` comments said.
-LIGHT_DECODER_CHANNELS: tuple[int, ...] = (512, 256, 128, 64, 32)
+#: ``(512, 512, 256, 128, 64)`` -- the light model's, deepest first: a 1x1 projection of f5 to
+#: 512 and then the same halving as the full model. Its 32-channel full-resolution conv is the
+#: head's, not a decoder block, so it is not in this list.
+LIGHT_DECODER_CHANNELS: tuple[int, ...] = (512, 512, 256, 128, 64)
+
+#: The width every upstream head uses for its fusion conv, on every model.
+FUSION_CHANNELS: int = 32
 
 Activation = Literal["none", "softmax", "sigmoid"]
 
@@ -55,6 +74,14 @@ class UNet(nn.Module):
         pairing: ``"aligned"`` for the correct skip pairing, ``"legacy"`` to reproduce
             ``models_pytorch.ResNet50UNet`` exactly so its checkpoints load.
         attention: Add CBAM attention to each decoder block (the enhancement model's shape).
+        image_fusion: Fuse the input image into the head at full resolution -- the stage the port
+            dropped. ``None`` (default) means ``True`` for ``pairing="aligned"`` and ``False``
+            for ``"legacy"``, whose checkpoint has no fusion weights to fill.
+        fusion_channels: Width of that fusion convolution (``32`` upstream).
+        logits_norm: Batch-normalise the logits, as the upstream segmentation head does. ``None``
+            (default) means ``True`` for a fused head on a segmentation task -- upstream's own
+            rule -- and ``False`` otherwise: an unfused head is the bare ``Conv2d`` a legacy
+            checkpoint was written against, and it has no normalisation weights to fill.
         output_activation: ``"none"`` (default) returns logits; ``"softmax"`` and ``"sigmoid"``
             return probabilities for callers that were trained expecting them.
         task: Recorded so :meth:`predict_proba` knows whether to use softmax or sigmoid.
@@ -71,6 +98,9 @@ class UNet(nn.Module):
         decoder_channels: tuple[int, ...] = FULL_DECODER_CHANNELS,
         pairing: Literal["aligned", "legacy"] = "aligned",
         attention: bool = False,
+        image_fusion: bool | None = None,
+        fusion_channels: int = FUSION_CHANNELS,
+        logits_norm: bool | None = None,
         output_activation: Activation = "none",
         task: TaskType | None = None,
     ) -> None:
@@ -90,14 +120,22 @@ class UNet(nn.Module):
         self.decoder = UNetDecoder(
             self.encoder.channels, decoder_channels, pairing=pairing, attention=attention
         )
-        self.head = nn.Conv2d(self.decoder.output_channels, self.n_classes, kernel_size=1)
+        # Both rules come from :func:`~sbb_pytorch.models.base.resolve_head`: only the aligned
+        # head exists upstream, and only a segmentation head is normalised there.
+        fused, normalise = resolve_head(image_fusion, pairing, logits_norm, task)
+        self.head = SegmentationHead(
+            self.decoder.output_channels,
+            self.n_classes,
+            image_fusion=fused,
+            fusion_channels=fusion_channels,
+            logits_norm=normalise,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, 3, H, W)`` in, ``(B, n_classes, H, W)`` out -- same H, W as the input."""
         if x.ndim != 4:
             raise ValueError(f"expected a (B, C, H, W) batch, got shape {tuple(x.shape)}")
-        logits = self.head(self.decoder(self.encoder(x)))
-        logits = resize_to_input(logits, (x.shape[-2], x.shape[-1]))
+        logits = self.head(self.decoder(self.encoder(x)), x)
         if self.output_activation == "softmax":
             return probs(logits, task_binary=False)
         if self.output_activation == "sigmoid":
@@ -132,6 +170,9 @@ class ResNet50UNet(UNet):
         *,
         pretrained: bool = True,
         pairing: Literal["aligned", "legacy"] = "aligned",
+        image_fusion: bool | None = None,
+        fusion_channels: int = FUSION_CHANNELS,
+        logits_norm: bool | None = None,
         task: TaskType | None = TaskType.SEGMENTATION,
     ) -> None:
         super().__init__(
@@ -142,6 +183,9 @@ class ResNet50UNet(UNet):
             pretrained=pretrained,
             decoder_channels=FULL_DECODER_CHANNELS,
             pairing=pairing,
+            image_fusion=image_fusion,
+            fusion_channels=fusion_channels,
+            logits_norm=logits_norm,
             task=task,
         )
 
@@ -151,7 +195,9 @@ class ResNet50UNetLight(UNet):
 
     Its own decoder could not run -- at block 0 it concatenated 2048 + 1024 channels and fed
     them to a ``Conv2d(512, ...)`` -- which :class:`UNetDecoder` resolves by computing every
-    block's real input width (``2048->512, 1536->256, 768->128, 384->64, 128->32``).
+    block's real input width. The widths are now the upstream ones (``512, 512, 256, 128, 64``);
+    the ``512, 256, 128, 64, 32`` this class declared had shifted the upstream head's
+    32-channel conv into the last decoder block and halved everything below the first.
     """
 
     def __init__(
@@ -162,6 +208,9 @@ class ResNet50UNetLight(UNet):
         *,
         pretrained: bool = True,
         pairing: Literal["aligned", "legacy"] = "aligned",
+        image_fusion: bool | None = None,
+        fusion_channels: int = FUSION_CHANNELS,
+        logits_norm: bool | None = None,
         task: TaskType | None = TaskType.SEGMENTATION,
     ) -> None:
         super().__init__(
@@ -172,5 +221,8 @@ class ResNet50UNetLight(UNet):
             pretrained=pretrained,
             decoder_channels=LIGHT_DECODER_CHANNELS,
             pairing=pairing,
+            image_fusion=image_fusion,
+            fusion_channels=fusion_channels,
+            logits_norm=logits_norm,
             task=task,
         )
