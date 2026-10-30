@@ -168,6 +168,20 @@ replacement.
   is given. The field existed on `SBBConfig` and was read by nothing, so a config asking not to
   save images saved them anyway; passing `--save` or `--no-save` still wins, as it does for
   `--patches`.
+- **`configs/textline.json` says `n_classes: 2`, the count upstream's textline pairing carries.** It
+  had been moved to 7 -- `configs/layout.json`'s number, from the migration row that covered both
+  configs with one figure -- and 7 is a layout table's count, not this one's: a single-class
+  textline model has background plus the one class it predicts, so the head carried five channels
+  nothing supervised and they argmaxed onto every page as `marginalia`/`<imageregion>`/
+  `rest_as_decoration` speckle over the lines the model was trained to find. The head width is a
+  function of the field, so the textline checkpoint trained under 7 stops loading and that run needs
+  a retrain. `Page2Label` gained the five fields `custom_config_page2label.json` carries and the
+  model lacked (`case_label`, `artificial_class_label`, `printspace_as_class_in_layout`,
+  `tableregion`, `noiseregion`) so a single-class config can name its own class instead of borrowing
+  the layout ids, and a flat legacy file with `case_label` beside its `use_case` now folds into
+  `page2label` instead of being left at the top level for `extra="forbid"` to reject. The layout
+  tables stay in the file beside them, so `sbb validate` reports the ids above 1 -- the state
+  upstream ships; clearing them is the follow-up. `docs/config-reference.json` is regenerated.
 
 ### Fixed
 

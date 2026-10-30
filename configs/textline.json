@@ -1,7 +1,7 @@
 {
     "task": "segmentation",
     "backbone_type": "nontransformer",
-    "n_classes": 7,
+    "n_classes": 2,
     "input_height": 672,
     "input_width": 448,
     "light_model": false,

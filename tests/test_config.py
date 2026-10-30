@@ -96,6 +96,60 @@ def test_every_config_in_the_configs_directory_validates() -> None:
         SBBConfig.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def test_the_shipped_textline_config_is_single_class() -> None:
+    """``configs/textline.json`` predicts background plus one class, and now says so.
+
+    It said ``n_classes: 7`` -- ``configs/layout.json``'s count, copied onto a config whose own
+    upstream value is 2 -- so the head carried five channels nothing supervised.  The head width
+    is a function of this number, so the value is pinned here as loudly as the checkpoint that
+    stops loading under it.
+    """
+    config = load_config(REPO_ROOT / "configs" / "textline.json")
+    assert config.n_classes == 2
+    assert config.page2label is not None
+    assert config.page2label.use_case.value == "textline"
+    assert config.page2label.case_label == 1  # the field the model lacked and the file implies
+
+
+def test_page2label_carries_the_five_fields_the_legacy_file_has(tmp_path: Path) -> None:
+    """``case_label`` and friends were readable only by ``gt.GroundTruthConfig``."""
+    label = Page2Label(
+        use_case="textline",
+        case_label=1,
+        artificial_class_label=8,
+        printspace_as_class_in_layout=9,
+        tableregion=10,
+        noiseregion=11,
+    )
+    assert (label.case_label, label.tableregion, label.noiseregion) == (1, 10, 11)
+    assert label.artificial_class_label == 8
+    assert label.printspace_as_class_in_layout == 9
+    # The inversion names only the elements it always named, so a layout config's class ids are
+    # unchanged by fields that describe the run rather than its regions.
+    assert label.all_regions() == {}
+    assert label.class_ids() == {}
+
+    # The flat legacy shape carried these keys beside ``use_case``; they fold into ``page2label``
+    # instead of being left at the top level, where ``extra="forbid"`` would reject the file.
+    config = load_config(
+        write(
+            tmp_path,
+            make(
+                use_case="textline",
+                case_label=1,
+                artificial_class_label=8,
+                printspace_as_class_in_layout=9,
+                tableregion=10,
+                noiseregion=11,
+            ),
+        )
+    )
+    assert config.page2label is not None
+    assert config.page2label.case_label == 1
+    assert config.page2label.tableregion == 10
+    assert config.page2label.noiseregion == 11
+
+
 def test_flat_transformer_keys_fold_into_the_nested_model() -> None:
     config = SBBConfig.model_validate(TRANSFORMER)
     assert config.transformer is not None

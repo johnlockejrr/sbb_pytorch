@@ -114,6 +114,14 @@ _PAGE2LABEL_KEYS = (
     "separatorregion",
     "graphicregions",
     "columns_width",
+    # The four the legacy ``custom_config_page2label.json`` also carries, and the five fields
+    # ``Page2Label`` was missing: without them here, a flat file naming ``case_label`` next to its
+    # ``use_case`` folded everything but that key and then failed on it as an extra.
+    "case_label",
+    "artificial_class_label",
+    "printspace_as_class_in_layout",
+    "tableregion",
+    "noiseregion",
 )
 
 #: Historical spellings accepted for :class:`BlurKind` values before validation.
@@ -217,6 +225,13 @@ class Page2Label(BaseModel):
     ``marginalia``) so the rule contradicted the project's own config and is dropped. The
     duplicate value (both ``header`` and ``heading`` map to ``2``) is reported by
     :meth:`SBBConfig.warnings` rather than rejected, because it is present in the shipped file.
+
+    The five fields the legacy table carried and this model did not have -- ``case_label``,
+    ``artificial_class_label``, ``printspace_as_class_in_layout``, ``tableregion``,
+    ``noiseregion`` -- are here now, which is what lets a single-class config
+    (``configs/textline.json``, ``n_classes: 2``) name what its own model predicts instead of
+    inheriting the layout table's ids.  :meth:`all_regions` and :meth:`class_ids` keep naming only
+    the elements they always named, so the inversion a ``layout`` config produces is unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -227,6 +242,21 @@ class Page2Label(BaseModel):
     separatorregion: int | None = None
     graphicregions: dict[str, int] = Field(default_factory=dict)
     columns_width: dict[str, int] = Field(default_factory=dict)
+    #: The id every region of the use case's own class is labelled with -- the field
+    #: :class:`~sbb_pytorch.gt.GroundTruthConfig` reads and this model lacked, so a single-class
+    #: config (``configs/textline.json``, ``n_classes: 2``) inherited the layout table's ids
+    #: instead of saying what its own model predicts.
+    case_label: int = Field(default=1, ge=0)
+    #: The id for content the label generator adds rather than reads (the ``adding_rgb_*``
+    #: composites), which the legacy label map painted in a colour of its own.
+    artificial_class_label: int | None = None
+    #: The id painted everywhere outside the print space on a layout run.
+    printspace_as_class_in_layout: int | None = None
+    #: Class ids for the two elements the legacy table named and this model had no field for.
+    #: ``all_regions()`` does not list them -- it keeps naming only the elements it always named --
+    #: so the pair is read by the generators that want them, not by the class-id inversion.
+    tableregion: int | None = None
+    noiseregion: int | None = None
 
     @model_validator(mode="after")
     def _values_are_positive(self) -> Page2Label:
