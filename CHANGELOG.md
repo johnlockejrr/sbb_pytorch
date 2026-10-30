@@ -110,6 +110,16 @@ replacement.
   safetensors refuses the shared storage (`Some tensors share memory`) and the non-contiguous views
   (`torch.save` accepts both) -- and an empty `model_state` is refused up front instead of becoming
   a weightless checkpoint.
+- **`sbb train --start-weights FILE`, the finetuning path for weights that are not a
+  pytorch-lightning `.ckpt`.** `training.apply_start_weights` loads a `.pt`, `.pth`, `.ckpt` or
+  `.safetensors` into the module *before* the trainer is built and returns the `Checkpoint` it read.
+  Only the weights move -- the optimiser and the epoch counter start fresh, which is the point of
+  finetuning and the thing `--resume` never offered, since `trainer.fit(ckpt_path=...)` wants
+  Lightning's own file and restores its optimiser, and `--pretrained` cannot express it, since that
+  flag only chooses which ImageNet weights to download. The CLI refuses every pairing that answers
+  one question twice -- `--resume`, an explicit `--pretrained`/`--no-pretrained`, a config whose
+  `continue_training` is true -- and `fit` refuses `start_weights` alongside `resume` for the reason
+  Lightning itself gives: the start file gets loaded and then overwritten.
 
 ### Changed
 
@@ -209,6 +219,17 @@ replacement.
   checkpoint before the history it was written from. `Checkpoint.save`'s `write_sidecar` becomes
   `bool | None = None` -- yes for a torch file, no for a safetensors one, whose config is already
   inside it -- so every existing call site keeps its meaning.
+- **`sbb train` writes two files where it wrote one.** `model.pt` holds the last epoch, exactly as
+  before, and `model.safetensors` -- beside it, whenever the `safetensors` package is importable,
+  with `fit(save_safetensors=)` overriding -- holds the **best** weights, read back through
+  `Checkpoint.load` from the `.ckpt` the run's own `ModelCheckpoint` callbacks call best
+  (`training.best_checkpoint_path`: the `val_accuracy` file when there is one, since that is the
+  metric `train.py` optimised and the file people point `sbb export` at; the `val_loss` file
+  otherwise). `training.final_checkpoint` and `training.best_checkpoint` are the two answers, the
+  first extracted from the block `fit` used to build inline. Publishing the best weights *through*
+  `model.pt` was the alternative, and this is why it was refused: a reader could not tell which of
+  the two it had been given, and every tool reading that file today would get a different answer
+  without being asked. The CLI prints both paths.
 
 ### Fixed
 

@@ -69,7 +69,11 @@ from sbb_pytorch.training.factory import (
 )
 from sbb_pytorch.training.module import SBBLightningModule, default_criterion, unpack_batch
 from sbb_pytorch.training.trainer import (
+    apply_start_weights,
+    best_checkpoint,
+    best_checkpoint_path,
     build_trainer,
+    final_checkpoint,
     fit,
     resolve_accelerator,
     resolve_logger,
@@ -84,6 +88,9 @@ __all__ = [
     "SBBModelSummary",
     "SBBProgressBar",
     "StepCheckpoint",
+    "apply_start_weights",
+    "best_checkpoint",
+    "best_checkpoint_path",
     "build_callbacks",
     "build_optimizer",
     "build_scheduler",
@@ -95,6 +102,7 @@ __all__ = [
     "default_criterion",
     "early_stopping_fields",
     "early_stopping_for",
+    "final_checkpoint",
     "fit",
     "init_weights",
     "kaiming_init",

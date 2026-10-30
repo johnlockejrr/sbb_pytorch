@@ -82,7 +82,8 @@ of them -- `--resume`, `--num-workers` for some tasks -- had no config field to 
 ### `sbb train CONFIG`
 
 Builds the model, the Lightning module, the trainer and the callbacks from one file, runs
-`trainer.fit`, then writes `model.pt`.
+`trainer.fit`, then writes `model.pt` -- and beside it `model.safetensors`, the run's best weights,
+when the `safetensors` dependency is installed.
 
 | Option | Meaning |
 | --- | --- |
@@ -93,6 +94,7 @@ Builds the model, the Lightning module, the trainer and the callbacks from one f
 | `-o, --output-dir` | Run directory; default `config.dir_output` |
 | `-e, --epochs`, `-b, --batch-size`, `-w, --num-workers`, `--lr`, `--patience` | Field overrides (`n_epochs`, `n_batch`, `num_workers`, `learning_rate`, `patience`) |
 | `--resume` | Checkpoint to resume from; the config's `dir_of_start_model` when omitted -- in `train.py` the flag existed and the value was never passed to `fit(ckpt_path=...)` |
+| `--start-weights` | Finetune: a `.pt`, `.pth`, `.ckpt` or `.safetensors` whose weights the model is built from, replacing the config's `init_method` and any ImageNet download. A *new* run -- the optimiser and epoch counter do not come from the file -- so it is refused next to `--resume`, next to an explicit `--pretrained`/`--no-pretrained`, and next to a config whose `continue_training` is true |
 | `--page2label`, `--scales` | Attach a page-to-label / enhancement-scales file (or use a config with them inlined) |
 | `--every-n-steps` | Also save a mid-epoch checkpoint every N batches (the old `--save-interval`, whose callback never fired) |
 | `--logger / --no-logger` | TensorBoard logs when tensorboard is importable, CSV logs otherwise |
@@ -168,12 +170,19 @@ A training run in `runs/textline/` contains:
 ```
 runs/textline/
   model.pt                  final weights, config and metrics in one schema
+  model.safetensors         the *best* weights, in the format with no pickle in it
   model_config.json         the same config as JSON, for tooling that will not unpickle
   model-07-0.3141.ckpt      epoch checkpoints, best-by-val_loss   (top_k=3 kept)
   best-07-0.9812.ckpt       epoch checkpoints, best-by-val_accuracy
   steps/model_step_1200.pt  mid-epoch checkpoints, when --every-n-steps is used
   lightning_logs/           TensorBoard, or CSV when tensorboard is not installed
 ```
+
+`model.pt` holds the **last** epoch and `model.safetensors` the **best** weights, read back from the
+`best-*.ckpt` the run's own callbacks chose; two files, because putting the best weights into
+`model.pt` would move a file every existing reader opens without telling them which of the two they
+got. Either one -- or another run's `best-07-0.9812.ckpt` -- can start a new run through
+`sbb train --start-weights`.
 
 `train.py` wrote `model-{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}.ckpt` and then read
 `callback_metrics["val_acc"]` to build `model.pt`, so any task that never logs `val_acc`

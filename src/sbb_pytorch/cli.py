@@ -311,6 +311,14 @@ def main(ctx: click.Context, verbose: bool) -> None:
     help="Checkpoint to resume from; the config's dir_of_start_model when omitted.",
 )
 @click.option(
+    "--start-weights",
+    "start_weights",
+    type=click.Path(exists=True, dir_okay=False, allow_dash=False, path_type=Path),
+    default=None,
+    help="Finetune: .pt/.pth/.ckpt/.safetensors to build the model from, replacing the config's "
+    "init (and --pretrained). Starts a new run: the optimiser and epoch counter do not come from it.",
+)
+@click.option(
     "--page2label", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None
 )
 @click.option(
@@ -358,6 +366,7 @@ def train(
     learning_rate: float | None,
     patience: int | None,
     resume: Path | None,
+    start_weights: Path | None,
     page2label: Path | None,
     scales: Path | None,
     every_n_steps: int | None,
@@ -384,9 +393,21 @@ def train(
     ``--verbose-metrics`` restores the ``Metric val_loss improved. New best score: 0.449`` prints
     the checkpoint and early-stopping callbacks emit on every improvement. It is off by default:
     the progress bar carries the same information as ``early_stopping/val_loss: 3/10``.
+
+    ``--start-weights FILE`` is the finetuning path, and the only one that accepts weights that are
+    not a pytorch-lightning ``.ckpt``: a ``model.pt``, a ``model.safetensors`` or a ``.ckpt`` is
+    loaded into the model the config builds, and training starts there with a fresh optimiser and
+    epoch counter. ``--resume`` cannot take those -- it needs the ``.ckpt`` because that is the only
+    file carrying an optimiser state -- so the two flags are mutually exclusive, as are a start file
+    and an explicit ``--pretrained`` (see :func:`_resolve_start_weights`). The run then writes
+    ``model.pt`` (the final weights, as always) and ``model.safetensors`` (the best ones) when the
+    ``safetensors`` package is installed.
     """
     state: GlobalState = ctx.obj
     resolved = load_config(config, page2label_path=page2label, scales_path=scales)
+    # --start-weights decides --pretrained (and rejects the combinations that contradict it) before
+    # the config is resolved, so the field the run reads matches the weights it is built from.
+    pretrained = _resolve_start_weights(resolved, resume, start_weights, pretrained)
     resolved = apply_overrides(
         resolved,
         device=device,
@@ -424,6 +445,7 @@ def train(
         module=module,
         device=device,
         resume=resume,
+        start_weights=start_weights,
         output_dir=output_dir,
         save_final=not dry_run,
         logger="auto" if logger else False,
@@ -437,8 +459,51 @@ def train(
         click.secho(f"dry run finished; {checkpoint} not written", fg="green")
         return
     click.secho(f"wrote {checkpoint}", fg="green")
+    # The best weights, published beside the final ones whenever safetensors is installed.
+    if (exported := checkpoint.with_suffix(".safetensors")).exists():
+        click.secho(f"wrote {exported}", fg="green")
     for name, value in sorted(metric_snapshot(trainer).items()):
         click.echo(f"  {name:<24} {value:.6f}")
+
+
+def _resolve_start_weights(
+    config: SBBConfig,
+    resume: Path | None,
+    start_weights: Path | None,
+    pretrained: bool | None,
+) -> bool | None:
+    """The ``--pretrained`` value ``--start-weights`` implies, and the flags it refuses to pair with.
+
+    ``--start-weights`` and ``--resume`` answer different questions -- "train again from this run"
+    versus "build a new model out of these weights" -- and pytorch-lightning will not answer both:
+    ``trainer.fit(ckpt_path=...)`` restores the optimiser and the epoch counter from the ``.ckpt``
+    *after* any weights loaded beforehand, so a start file handed to a resume is loaded and then
+    overwritten. Pairing them is therefore a parameter error, and so is pairing a start file with a
+    config that asks to continue (``continue_training`` plus ``dir_of_start_model``) or with an
+    explicit ``--pretrained``/``--no-pretrained`` -- the download the given file replaces on the next
+    line. Everything else forces ``pretrained=False``; without ``--start-weights`` the flag is
+    returned untouched, which is every run that existed before this flag did.
+    """
+    if start_weights is None:
+        return pretrained
+    if resume is not None:
+        raise click.BadParameter(
+            "--start-weights and --resume are mutually exclusive: --resume continues the run a "
+            "checkpoint came from, --start-weights starts a new one from its weights"
+        )
+    if config.continue_training:
+        raise click.BadParameter(
+            f"--start-weights contradicts this config's continue_training=true "
+            f"(dir_of_start_model={config.dir_of_start_model}): set continue_training=false, or "
+            f"use --resume instead"
+        )
+    if pretrained is not None:
+        raise click.BadParameter(
+            f"--{'no-' if pretrained is False else ''}pretrained is redundant next to "
+            f"--start-weights {start_weights}: the file is the weights, and --pretrained only "
+            f"chooses which ones to download"
+        )
+    return False
 
 
 def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -> list[str]:

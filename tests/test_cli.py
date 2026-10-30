@@ -342,6 +342,67 @@ def test_train_reports_a_callbacks_file_it_cannot_use(
     assert "callbacks file is not valid JSON" in result.output
 
 
+def test_start_weights_and_resume_conflict_in_the_cli(
+    runner: CliRunner, config_file: Path, run_dir: Path
+) -> None:
+    """``--resume`` continues a run, ``--start-weights`` starts a new one from weights; Lightning
+    would load the start file and then overwrite it with the resume file, so the CLI refuses it."""
+    weights = run_dir / "model.pt"
+    result = invoke(
+        runner,
+        "train",
+        config_file,
+        "--dry-run",
+        "--no-logger",
+        "--resume",
+        weights,
+        "--start-weights",
+        weights,
+    )
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_start_weights_and_explicit_pretrained_conflict(
+    runner: CliRunner, config_file: Path, run_dir: Path
+) -> None:
+    """``--pretrained`` picks which weights to *download*; giving it beside a file that already
+    holds the weights asks two questions about the same slot, so it is refused rather than ignored."""
+    result = invoke(
+        runner,
+        "train",
+        config_file,
+        "--dry-run",
+        "--no-logger",
+        "--start-weights",
+        run_dir / "model.pt",
+        "--no-pretrained",
+    )
+    assert result.exit_code == 2
+    assert "--no-pretrained is redundant" in result.output
+
+
+def test_start_weights_and_a_config_that_continues_conflict(
+    runner: CliRunner, tmp_path: Path, run_dir: Path
+) -> None:
+    """``continue_training`` is the config-file spelling of ``--resume``, so it is refused too."""
+    config = tmp_path / "continue.json"
+    config.write_text(
+        json.dumps({**BASE, "continue_training": True, "dir_of_start_model": str(run_dir)})
+    )
+    result = invoke(
+        runner,
+        "train",
+        config,
+        "--dry-run",
+        "--no-logger",
+        "--start-weights",
+        run_dir / "model.pt",
+    )
+    assert result.exit_code == 2
+    assert "contradicts this config's continue_training=true" in result.output
+
+
 # ----------------------------------------------------------------------------- sbb infer
 
 

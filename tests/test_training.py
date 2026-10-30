@@ -19,21 +19,25 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, ModelSum
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 from sbb_pytorch.config.models import SBBConfig
-from sbb_pytorch.exceptions import ConfigError, TrainingError
+from sbb_pytorch.exceptions import CheckpointError, ConfigError, TrainingError
 from sbb_pytorch.losses import CombinedLoss, SoftDiceLoss
-from sbb_pytorch.storage.checkpoint import Checkpoint
+from sbb_pytorch.storage.checkpoint import Checkpoint, safetensors_available
 from sbb_pytorch.storage.images import imwrite
 from sbb_pytorch.training import (
     SBBLightningModule,
     SBBModelSummary,
     SBBProgressBar,
     StepCheckpoint,
+    apply_start_weights,
+    best_checkpoint,
+    best_checkpoint_path,
     build_callbacks,
     build_trainer,
     checkpoint_for,
     default_criterion,
     early_stopping_fields,
     early_stopping_for,
+    final_checkpoint,
     fit,
     metric_mode,
     metric_snapshot,
@@ -47,6 +51,11 @@ from sbb_pytorch.training.factory import class_weights_from_directory
 SIZE = 32
 _IMAGE = torch.zeros(2, 3, 4, 4)
 _MASK = torch.zeros(2, 4, 4)
+#: Same marker as ``tests/test_checkpoint.py``: the safetensors half of ``fit`` cannot be checked
+#: without the package, and its absence must not fail the run.
+needs_safetensors = pytest.mark.skipif(
+    not safetensors_available(), reason="needs the safetensors package"
+)
 
 
 def make(**overrides: object) -> SBBConfig:
@@ -480,3 +489,157 @@ def test_fit_needs_data_or_a_directory(tmp_path: Path) -> None:
     """``train.py`` found out mid-epoch; the config is now checked before a trainer exists."""
     with pytest.raises(ConfigError, match="no data configured"):
         fit(make(dir_output=str(tmp_path)), model=nn.Conv2d(3, 3, 1), logger=False)
+
+
+@needs_safetensors
+def test_fit_writes_both_model_pt_and_model_safetensors(
+    stub: nn.Module, data_root: Path, tmp_path: Path
+) -> None:
+    """One run, two files: ``model.pt`` keeps the last weights, the twin carries the best ones.
+
+    Both are written by the same ``save_final`` block, and the pair is the point -- moving the best
+    weights into ``model.pt`` would have changed what every existing reader gets without asking.
+    """
+    import safetensors.torch
+
+    config = make(
+        dir_train=str(data_root),
+        dir_eval=str(data_root),
+        dir_output=str(tmp_path),
+        data_is_provided=True,  # the fixture *is* the dataset, as in the other fit tests
+    )
+    module = SBBLightningModule(config, stub)
+    fit(
+        config,
+        module=module,
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+
+    assert (tmp_path / "model.pt").exists()
+    twin = tmp_path / "model.safetensors"
+    assert twin.exists()
+    with safetensors.torch.safe_open(twin, framework="pt") as handle:
+        metadata = handle.metadata()
+    assert metadata is not None
+    assert metadata["format"] == "pt"  # what every torch loader checks before reading
+    assert metadata["sbb.task"] == "segmentation"
+    assert int(metadata["sbb.schema_version"]) == 1
+
+
+def test_fit_can_be_told_not_to_write_the_twin(
+    stub: nn.Module, data_root: Path, tmp_path: Path
+) -> None:
+    """``save_safetensors=False`` turns the extra file off even where the package is installed --
+    the flag is a real option, not just a reflection of what happens to be importable."""
+    config = make(
+        dir_train=str(data_root),
+        dir_eval=str(data_root),
+        dir_output=str(tmp_path),
+        data_is_provided=True,
+    )
+    fit(
+        config,
+        model=stub,
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        save_safetensors=False,
+    )
+    assert (tmp_path / "model.pt").exists()
+    assert not (tmp_path / "model.safetensors").exists()
+
+
+def test_fit_refuses_start_weights_and_resume_together(
+    stub: nn.Module, data_root: Path, tmp_path: Path
+) -> None:
+    """``--resume`` restores a run; ``--start-weights`` starts a new one. Asking for both is a bug."""
+    config = make(dir_train=str(data_root), dir_eval=str(data_root), dir_output=str(tmp_path))
+    with pytest.raises(TrainingError, match="mutually exclusive"):
+        fit(
+            config,
+            model=stub,
+            resume=data_root / "run.ckpt",
+            start_weights=data_root / "weights.pt",
+            logger=False,
+        )
+
+
+# ---------------------------------------------------------- start weights and best weights
+
+
+def test_apply_start_weights_loads_a_pt_file(stub: nn.Module, tmp_path: Path) -> None:
+    """The finetuning entry: only the weights move, and the file they came from is returned."""
+    source = nn.Conv2d(3, 3, 1)
+    with torch.no_grad():
+        source.weight.copy_(torch.arange(9, dtype=torch.float32).reshape(3, 3, 1, 1))
+        source.bias.copy_(torch.ones(3))
+    path = tmp_path / "start.pt"
+    Checkpoint(model_state=dict(source.state_dict()), task="segmentation").save(path)
+
+    module = SBBLightningModule(make(), stub)
+    checkpoint = apply_start_weights(module, path)
+
+    assert checkpoint.task == "segmentation"
+    # ``module.model`` is the conv passed in, so the numbers landing in ``stub`` proves the load ran
+    # through the LightningModule and not past it.
+    assert checkpoint.model_state.keys() == stub.state_dict().keys()
+    torch.testing.assert_close(
+        stub.weight, torch.arange(9, dtype=torch.float32).reshape(3, 3, 1, 1)
+    )
+    torch.testing.assert_close(stub.bias, torch.ones(3))
+
+
+@needs_safetensors
+def test_apply_start_weights_loads_a_safetensors_file(stub: nn.Module, tmp_path: Path) -> None:
+    """An exported ``model.safetensors`` -- from Hugging Face or from ``sbb export`` -- is loadable."""
+    import safetensors.torch
+
+    source = nn.Conv2d(3, 3, 1)
+    with torch.no_grad():
+        source.weight.copy_(torch.full((3, 3, 1, 1), 0.25))
+    path = tmp_path / "start.safetensors"
+    safetensors.torch.save_file(
+        {"weight": source.weight.detach().clone(), "bias": source.bias.detach().clone()},
+        path,
+        metadata={"format": "pt", "sbb.task": "segmentation", "sbb.schema_version": "1"},
+    )
+
+    module = SBBLightningModule(make(), stub)
+    checkpoint = apply_start_weights(module, path)
+
+    assert checkpoint.task == "segmentation"
+    assert checkpoint.schema_version == 1
+    torch.testing.assert_close(stub.weight, torch.full((3, 3, 1, 1), 0.25))
+
+
+def test_fit_loads_start_weights_before_it_trains(
+    stub: nn.Module, data_root: Path, tmp_path: Path
+) -> None:
+    """A path that cannot be read fails before ``trainer.fit`` runs, so a typo costs no training
+    time -- which is the only way to tell "applied first" apart from "applied afterwards". The
+    weights themselves are covered by :func:`test_apply_start_weights_loads_a_pt_file`."""
+    config = make(dir_train=str(data_root), dir_eval=str(data_root), dir_output=str(tmp_path))
+    with pytest.raises(CheckpointError, match="no checkpoint at"):
+        fit(config, model=stub, start_weights=tmp_path / "nope.pt", logger=False)
+    assert not (tmp_path / "model.pt").exists()
+
+
+def test_best_checkpoint_without_a_checkpoint_is_the_final_one(
+    stub: nn.Module, tmp_path: Path
+) -> None:
+    """Before a run writes anything -- ``--dry-run``, a trainer that never fitted -- the best file
+    does not exist and the export falls back to the state ``model.pt`` would have held."""
+    config = make(dir_output=str(tmp_path))
+    module = SBBLightningModule(config, stub)
+    trainer = build_trainer(config, module, logger=False, enable_progress_bar=False)
+
+    assert best_checkpoint_path(trainer) is None
+    best = best_checkpoint(config, module, trainer)
+    final = final_checkpoint(config, module, trainer)
+    # ``Checkpoint.__eq__`` compares the tensors, so the fields are named one by one -- and the
+    # answer is literally ``final_checkpoint``: with no .ckpt to read, "best" is what ran last.
+    assert best.model_state.keys() == final.model_state.keys()
+    assert (best.epoch, best.step, best.task) == (final.epoch, final.step, final.task)
+    assert torch.equal(best.model_state["weight"], final.model_state["weight"])
