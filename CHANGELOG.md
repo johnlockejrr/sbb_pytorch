@@ -122,6 +122,14 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   into a `Conv2d(2048, 1024)`), and their skip pairing was off by one (`f4` unused, `f1` twice).
   Both ViT variants raised `RuntimeError` on their first batch. `TaskType.BINARIZATION` did not
   exist as an enum member, so a binarization config failed at parse time.
+- **The head's missing stage.** The port kept the `Conv2D(n_classes, 1x1)` and dropped the stage in
+  front of it -- the upstream head concatenates the input image onto the upsampled decoder output
+  and runs a `Conv2D(32, 3x3) + BatchNormalization + ReLU` at full resolution, then normalises the
+  logits on segmentation tasks -- so a "full resolution" prediction was an interpolation of a
+  prediction made at `H/4`. `models.base.SegmentationHead` is that stage, composed by every
+  segmentation model; `pairing="legacy"` keeps the bare conv its checkpoints hold (`head.weight`
+  becomes `head.classify.weight`), and `LIGHT_DECODER_CHANNELS` takes the widths the light decoder
+  really has now that its 32-channel conv has moved back into the head.
 - **Training.** `torch.save({... "val_acc": trainer.callback_metrics["val_acc"]})` raised `KeyError`
   *after* a full run for any task that does not log it, throwing away the result.
   `config.precision`, `config.accumulate_grad_batches` and `config.gradient_clip_val` were read by
