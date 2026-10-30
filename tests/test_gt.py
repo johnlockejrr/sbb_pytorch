@@ -30,7 +30,16 @@ import cv2
 import numpy as np
 import pytest
 
-from sbb_pytorch.gt import generator, geometry, parser, reading_order, render, writer
+from sbb_pytorch.gt import (
+    RegionKind,
+    generator,
+    geometry,
+    parser,
+    reading_order,
+    render,
+    vocabulary,
+    writer,
+)
 
 NS = "http://schema.primaresearch.org/PAGE/gts/schema/v2019.07.24"
 
@@ -2423,6 +2432,109 @@ def test_labelled_contours_pairs_every_contour_with_one_label() -> None:
     assert generator.labelled_contours([], 5) == []
 
 
+# ---------------------------------------------------------------------------------- vocabulary
+
+
+def test_the_table_covers_every_kind_and_every_kind_recognises_its_own_element() -> None:
+    """``VOCABULARY``, ``REGION_TAGS`` and ``element_for`` are one mapping checked both ways.
+
+    The parser kept the tags it would read and the writer kept its own table of elements per kind
+    (``writer._REGION_ELEMENTS``), and they agreed only because both had been copied from the kind
+    enum. Every kind has a row, every row names an element the schema has, and reading that element
+    back -- as a tag or as a class name -- gives the same kind.
+    """
+    assert set(vocabulary.VOCABULARY) == set(vocabulary.REGION_TAGS.values())
+    for kind, row in vocabulary.VOCABULARY.items():
+        # Every element is either one of the fifteen a <Page> may hold (plus Border and PrintSpace,
+        # which are its own slots) or one of the three that nest inside a region.
+        assert row.element in vocabulary.PAGE_ELEMENT_NAMES or row.element in {
+            "TextLine",
+            "Word",
+            "Glyph",
+        }
+        assert vocabulary.kind_for_element(vocabulary.element_for(kind)) is kind
+        assert vocabulary.kind_for_class_name(vocabulary.element_for(kind)) is kind
+        assert vocabulary.element_for(kind) == row.element
+
+
+def test_type_for_answers_only_with_values_the_element_in_question_has() -> None:
+    """``@type`` is per element, not global: 18 values on ``TextRegion``, 11 on ``GraphicRegion``.
+
+    The rest of the fifteen have no ``@type`` at all, and the two enumerations are closed -- so
+    ``"class_1"``, ``"header, heading"`` and the ``rest_as_`` spelling all come back empty from the
+    element that cannot say them, which is what stopped the writer inventing a ``@type`` for an
+    ``ImageRegion``.
+    """
+    assert vocabulary.type_for(RegionKind.TEXT, "header") == "header"
+    assert vocabulary.type_for(RegionKind.TEXT, "TOC-entry") == "TOC-entry"
+    assert vocabulary.type_for(RegionKind.TEXT, "rest_as_paragraph") == "paragraph"
+    assert vocabulary.type_for(RegionKind.TEXT, "class_1") == ""  # not one of the eighteen
+    assert vocabulary.type_for(RegionKind.TEXT, "") == ""  # no name, no type, whatever the element
+    assert vocabulary.type_for(RegionKind.IMAGE, "header") == ""  # ImageRegion has no @type at all
+    assert vocabulary.type_for(RegionKind.GRAPHIC, "decoration") == "decoration"
+    assert vocabulary.type_for(RegionKind.TEXTLINE, "header") == ""  # nor does a TextLine
+    # The two tuples the parser still re-exports are these rows, and nothing else.
+    assert set(vocabulary.TEXT_REGION_TYPES) == vocabulary.VOCABULARY[RegionKind.TEXT].types
+    assert set(vocabulary.GRAPHIC_REGION_TYPES) == vocabulary.VOCABULARY[RegionKind.GRAPHIC].types
+    assert len(vocabulary.TEXT_REGION_TYPES) == 18  # the schema's TextTypeSimpleType, all of them
+    assert len(vocabulary.GRAPHIC_REGION_TYPES) == 11  # and GraphicsTypeSimpleType
+
+
+def test_custom_for_writes_the_dialect_the_annotation_tools_use() -> None:
+    """``structure {type:<name>;}`` -- the only spelling of ``@custom`` this package writes.
+
+    A line is ``text_line`` whatever its block was (``custom_from_class`` is off for it), a block
+    with no class is ``text_zone``, and a kind with neither writes nothing.
+    """
+    assert vocabulary.custom_for(RegionKind.TEXT, "header") == "structure {type:header;}"
+    assert vocabulary.custom_for(RegionKind.TEXT) == "structure {type:text_zone;}"
+    assert vocabulary.custom_for(RegionKind.TEXTLINE) == "structure {type:text_line;}"
+    # A line never carries its block's class: the element already says what it is.
+    assert vocabulary.custom_for(RegionKind.TEXTLINE, "header") == "structure {type:text_line;}"
+    assert vocabulary.custom_for(RegionKind.TEXT, "class_1") == "structure {type:class_1;}"
+    assert vocabulary.custom_for(RegionKind.IMAGE) == ""  # nothing to say, so no attribute
+    assert vocabulary.custom_for(RegionKind.TABLE, "class_3") == "structure {type:class_3;}"
+
+
+def test_kind_for_class_name_reads_every_way_a_config_names_a_class() -> None:
+    """One lookup for the three spellings a ``Page2Label`` uses: an element name, its bracketed
+    singleton form, and any ``@type`` value an element declares."""
+    assert vocabulary.kind_for_class_name("header") is RegionKind.TEXT
+    assert vocabulary.kind_for_class_name("decoration") is RegionKind.GRAPHIC
+    assert vocabulary.kind_for_class_name("<imageregion>") is RegionKind.IMAGE
+    assert vocabulary.kind_for_class_name("ImageRegion") is RegionKind.IMAGE
+    assert vocabulary.kind_for_class_name("imageRegion") is RegionKind.IMAGE  # any casing
+    assert vocabulary.kind_for_class_name("class_1") is None  # names nothing the schema has
+    assert vocabulary.kind_for_element("ReadingOrder") is None  # not a region at all
+
+
+def test_ancestor_chain_is_the_parents_the_schema_wants_and_no_others() -> None:
+    """``Glyph`` -> ``Word`` -> ``TextLine`` -> ``TextRegion``, and nothing above a region.
+
+    The chain the writer builds around a nested-only orphan, straight from the same ``parent`` fields
+    the parser's ``_ALLOWED_CHILDREN`` used -- one table says where a region may sit, and this reads
+    it back as the ancestors it needs to sit in.
+    """
+    assert vocabulary.ancestor_chain(RegionKind.GLYPH) == (
+        RegionKind.WORD,
+        RegionKind.TEXTLINE,
+        RegionKind.TEXT,
+    )
+    assert vocabulary.ancestor_chain(RegionKind.WORD) == (RegionKind.TEXTLINE, RegionKind.TEXT)
+    assert vocabulary.ancestor_chain(RegionKind.TEXTLINE) == (RegionKind.TEXT,)
+    for kind in (
+        RegionKind.TEXT,
+        RegionKind.IMAGE,
+        RegionKind.GRAPHIC,
+        RegionKind.TABLE,
+        RegionKind.SEPARATOR,
+        RegionKind.NOISE,
+        RegionKind.PRINTSPACE,
+        RegionKind.BORDER,
+    ):
+        assert vocabulary.ancestor_chain(kind) == ()
+
+
 # ------------------------------------------------------------------------------------- writer
 
 
@@ -2445,9 +2557,331 @@ def test_a_parsed_page_written_and_parsed_again_is_the_same_page(tmp_path: Path)
     assert again.printspace_contour.tolist() == page.printspace_contour.tolist()
     assert again.printspace_bbox == page.printspace_bbox
     assert again.region_index == page.region_index  # the order survives, unsorted as it is
+    # ``@custom`` is the one field the writer adds rather than echoes -- a region parsed with a
+    # ``@type`` and no ``@custom`` gains ``structure {type:<name>;}`` on the way out, which is what
+    # :func:`sbb_pytorch.gt.vocabulary.custom_for` is for -- so it is asserted where it is decided
+    # (``test_a_type_the_element_cannot_say_is_written_in_custom_instead``) and not compared here.
     assert [
         (r.kind, r.type_name, r.region_id, r.contour.tolist(), r.text) for r in again.regions
     ] == [(r.kind, r.type_name, r.region_id, r.contour.tolist(), r.text) for r in page.regions]
+    # The nesting too: the fixture's lines are children of their regions, and the page that comes
+    # back says so with the same tree -- not as siblings, which is what the flat writer wrote.
+    assert [(r.region_id, [c.region_id for c in r.children]) for r in again.regions] == [
+        (r.region_id, [c.region_id for c in r.children]) for r in page.regions
+    ]
+    # The three Metadata elements the schema requires, which this fixture has none of and the old
+    # writer never wrote at all: the page's own values when it has them (pinned by
+    # ``test_a_parsed_page_keeps_the_author_and_stamps_a_rewrite_would_erase``) and the writer's
+    # :data:`~sbb_pytorch.gt.writer.CREATOR`/:data:`~sbb_pytorch.gt.writer.DEFAULT_TIMESTAMP` when
+    # it does not, which is the case here.
+    assert (again.creator, again.created, again.last_change) == (
+        writer.CREATOR,
+        writer.DEFAULT_TIMESTAMP,
+        writer.DEFAULT_TIMESTAMP,
+    )
+
+
+def qname(name: str) -> str:
+    """``"Page"`` -> ``"{http://schema.primaresearch.org/...}Page"`` -- the tag ElementTree wants.
+
+    Every element in an XPath has to be qualified on its own (``Page/TextRegion`` looks for a
+    *namespace-less* ``TextRegion`` and finds none), which is why the tests below build their paths
+    one qualified name at a time.
+    """
+    return f"{{{writer.PAGE_NAMESPACE}}}{name}"
+
+
+def _names(element: ET.Element) -> list[str]:
+    """The local names of *element*'s children, in the order they were written.
+
+    The check the schema actually makes: not that the right regions exist, but that they are the
+    right children of the right parent, in the order its content model lists them.
+    """
+    return [child.tag.rsplit("}", 1)[-1] for child in element]
+
+
+def test_a_textline_is_written_inside_the_block_that_holds_it(tmp_path: Path) -> None:
+    """The nested fixture comes back nested, which is the whole reason this writer exists.
+
+    The page the user annotated holds one ``TextRegion`` with thirty-eight ``TextLine``\\ s in it, and
+    the writer that preceded this one emitted them side by side -- ``<Page><TextRegion/><TextLine/>…``
+    -- because ``Page`` had no field the nesting could live in. The schema allows a ``TextLine`` only
+    inside a ``TextRegion``, so ``xmllint`` rejected the file; the check here is the shape of the
+    written tree, element by element, in the order ``TextRegionType`` and ``TextLineType`` list.
+    """
+    page = nested_page(tmp_path)
+    root = ET.fromstring(writer.to_pagexml(page))
+    page_element = root.find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+
+    assert _names(page_element) == ["TextRegion"]  # one region, not a region plus three loose lines
+    block = page_element[0]
+    assert block.get("id") == "block"
+    assert block.get("custom") == "structure {type:text_zone;}"
+    assert _names(block) == ["Coords", "TextLine", "TextLine", "TextLine"]
+
+    line = block[1]  # l1, the one fixture line with a baseline and a transcription
+    assert line.get("id") == "l1"
+    assert line.get("custom") == "structure {type:text_line;}"
+    assert _names(line) == ["Coords", "Baseline", "TextEquiv"]  # TextLineType's own order
+    equiv = line.find(f"{{{writer.PAGE_NAMESPACE}}}TextEquiv")
+    assert (
+        equiv.get("conf") == "0.9999"
+    )  # the confidence the parse read, on the element it came from
+    assert equiv.find(f"{{{writer.PAGE_NAMESPACE}}}Unicode").text == "first"
+    assert _names(block[2]) == ["Coords", "TextEquiv"]  # l2: a baseline only when there is one
+    assert _names(block[3]) == ["Coords"]  # l3: no text, so no empty <TextEquiv/> either
+
+
+def test_a_region_with_no_id_gets_one_the_next_read_keeps(tmp_path: Path) -> None:
+    """``@id`` is required, so an empty one is filled -- and filled with something stable.
+
+    v3 issued ``uuid.uuid4().hex[:8]`` per region per write (``inference.py:766-767``), which renamed
+    every region on every save. ``<Element>_<n>``, counted per element name in document order, is the
+    same shape and is the same answer every time: the ids appear in the file, the next read finds
+    them, and writing what was read is byte-identical.
+    """
+    block = parser.Region(kind="textregion", type_name="", region_id="", contour=RECT)
+    line = parser.Region(kind="textline", type_name="", region_id="", contour=RECT)
+    line.parent = block
+    block.children.append(line)
+    page = parser.Page(
+        path=tmp_path / "p.xml", file_name="p", height=40, width=40, regions=[block, line]
+    )
+    text = writer.to_pagexml(page)
+    page_element = ET.fromstring(text).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+
+    assert [element.get("id") for element in page_element] == ["TextRegion_1"]
+    assert page_element[0].find(f"{{{writer.PAGE_NAMESPACE}}}TextLine").get("id") == "TextLine_1"
+    # The wrapper's id is its own, not the line's: ``xs:ID`` values are unique in the document, and
+    # a region and the line inside it sharing one is what xmllint calls "not a valid value".
+    assert (
+        writer.to_pagexml(parser.parse_pagexml(writer.write_pagexml(page, tmp_path / "p.xml")))
+        == text
+    )
+
+
+def test_ids_are_numbered_per_element_name_and_not_across_the_page(tmp_path: Path) -> None:
+    """Two nameless text regions and one image region are ``TextRegion_1``, ``TextRegion_2``,
+    ``ImageRegion_1`` -- a page-wide counter would renumber the second file's regions by reading the first."""
+    regions = [
+        parser.Region(kind="textregion", type_name="", region_id="", contour=RECT),
+        parser.Region(kind="textregion", type_name="", region_id="", contour=TRIANGLE),
+        parser.Region(kind="imageregion", type_name="", region_id="", contour=STRIP),
+        parser.Region(kind="textregion", type_name="header", region_id="named", contour=RECT),
+    ]
+    page = parser.Page(path=tmp_path / "p.xml", file_name="p", height=40, width=40, regions=regions)
+    page_element = ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+
+    assert [element.get("id") for element in page_element] == [
+        "TextRegion_1",
+        "TextRegion_2",
+        "ImageRegion_1",
+        "named",  # a parsed id is used verbatim, and is not counted as the next free number
+    ]
+
+
+def test_the_three_required_metadata_elements_and_nothing_the_page_has_no_value_for() -> None:
+    """``Creator``, ``Created``, ``LastChange`` are required; the old writer wrote one of the three.
+
+    A page with no author and no timestamps gets :data:`~sbb_pytorch.gt.writer.CREATOR` and
+    :data:`~sbb_pytorch.gt.writer.DEFAULT_TIMESTAMP` -- the package will not read a clock, so the
+    epoch says plainly that nothing was supplied, and ``--created`` replaces it -- while
+    ``@externalRef`` and ``<Comments>`` stay off the file when the page has no value for them,
+    because an optional attribute written empty is a different answer from one not written.
+    """
+    root = ET.fromstring(
+        writer.to_pagexml(parser.Page(path=Path("p.xml"), file_name="p", height=10, width=10))
+    )
+    metadata = root.find(qname("Metadata"))
+    assert _names(metadata) == ["Creator", "Created", "LastChange"]
+    assert metadata.get("externalRef") is None
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Creator").text == writer.CREATOR
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Created").text == writer.DEFAULT_TIMESTAMP
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}LastChange").text == (
+        writer.DEFAULT_TIMESTAMP  # LastChange follows Created when the page states neither
+    )
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Comments") is None  # no columns, no marker
+
+
+def test_a_parsed_page_keeps_the_author_and_stamps_a_rewrite_would_erase(tmp_path: Path) -> None:
+    """``Creator``/``Created``/``LastChange``/``@externalRef`` survive a rewrite, unchanged.
+
+    The parser used to discard all four, so every ``sbb infer --xml-file`` rewrote escriptorium's
+    author as the tool's own name and dropped the archive path beside it.
+    """
+    source = write_xml(
+        tmp_path,
+        "stamped.xml",
+        xml_document(
+            "",
+            metadata=(
+                '<Metadata externalRef="/archive/stamped.jpg">'
+                "<Creator>SBB_QURATOR</Creator>"
+                "<Created>2020-01-02T03:04:05</Created>"
+                "<LastChange>2021-06-07T08:09:10</LastChange>"
+                "<Comments>#num_col0456</Comments></Metadata>"
+            ),
+        ),
+    )
+    page = parser.parse_pagexml(source)
+    assert (page.external_ref, page.creator, page.created, page.last_change) == (
+        "/archive/stamped.jpg",
+        "SBB_QURATOR",
+        "2020-01-02T03:04:05",
+        "2021-06-07T08:09:10",
+    )
+    metadata = ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Metadata")
+    assert metadata.get("externalRef") == "/archive/stamped.jpg"
+    assert _names(metadata) == ["Creator", "Created", "LastChange", "Comments"]
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Created").text == "2020-01-02T03:04:05"
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}LastChange").text == "2021-06-07T08:09:10"
+    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Comments").text == "num_col456"
+    # The fixture's own value is ``#num_col0456``; the parser reads the number and the writer writes
+    # it back without the padding zero, which is the columns-width rule ``_columns_width`` documents.
+
+
+def test_page_children_are_written_in_the_order_the_schema_lists_them(tmp_path: Path) -> None:
+    """``Border``, ``PrintSpace``, ``ReadingOrder``, then the regions -- the order ``PageType`` gives.
+
+    The writer that preceded this one emitted the regions first and the reading order last, which is
+    where no version of the schema puts it; the fixtures all use the order asserted here.
+    """
+    page = parser.Page(
+        path=tmp_path / "p.xml",
+        file_name="p",
+        height=40,
+        width=40,
+        regions=[
+            parser.Region(kind="textregion", type_name="header", region_id="r1", contour=RECT)
+        ],
+        printspace_contour=TRIANGLE,
+        printspace_bbox=(0, 0, 4, 3),
+        region_index={"r1": 3},
+    )
+    assert _names(
+        ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+    ) == [
+        "PrintSpace",
+        "ReadingOrder",
+        "TextRegion",
+    ]
+
+
+def test_border_and_printspace_are_written_as_slots_with_no_attributes_at_all(
+    tmp_path: Path,
+) -> None:
+    """``BorderType`` and ``PrintSpaceType`` declare no attributes -- the old writer wrote an ``@id``.
+
+    Both are ``Page`` sequence slots holding one ``<Coords>`` and nothing else, so the fix is not to
+    name them better but to stop naming them: the attribute that every region requires is the one
+    these two elements must not have.
+    """
+    page = parser.Page(
+        path=tmp_path / "p.xml",
+        file_name="p",
+        height=40,
+        width=40,
+        regions=[parser.Region(kind="border", type_name="", region_id="b1", contour=RECT)],
+        printspace_contour=TRIANGLE,
+    )
+    page_element = ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+    assert _names(page_element) == ["Border", "PrintSpace"]
+    for name in ("Border", "PrintSpace"):
+        element = page_element.find(f"{{{writer.PAGE_NAMESPACE}}}{name}")
+        assert element.attrib == {}
+        assert _names(element) == ["Coords"]
+
+
+def test_an_empty_region_index_writes_no_reading_order(tmp_path: Path) -> None:
+    """``OrderedGroupType`` needs at least one indexed child, so an empty order is no order.
+
+    The previous writer emitted ``<ReadingOrder><OrderedGroup/></ReadingOrder>`` -- missing the
+    ``@id`` the type requires and holding none of the children it requires -- for every page, whether
+    or not it had been given an order to keep.
+    """
+    bare = parser.Page(path=tmp_path / "p.xml", file_name="p", height=10, width=10)
+    assert (
+        _names(ET.fromstring(writer.to_pagexml(bare)).find(f"{{{writer.PAGE_NAMESPACE}}}Page"))
+        == []
+    )
+    ordered = parser.Page(
+        path=tmp_path / "p.xml",
+        file_name="p",
+        height=10,
+        width=10,
+        regions=[
+            parser.Region(kind="textregion", type_name="", region_id="a", contour=RECT),
+            parser.Region(kind="textregion", type_name="", region_id="b", contour=TRIANGLE),
+        ],
+        region_index={"b": 7, "a": 2},
+    )
+    group = ET.fromstring(writer.to_pagexml(ordered)).find(
+        f"{qname('Page')}/{qname('ReadingOrder')}/{qname('OrderedGroup')}"
+    )
+    assert group.get("id") == writer._ORDERED_GROUP_ID  # the id the tool has used since eynollah
+    assert [(ref.get("regionRef"), ref.get("index")) for ref in group] == [
+        ("a", "2"),
+        ("b", "7"),
+    ]  # sorted by @index, as the document listed them, not as dict order
+
+
+def test_a_type_the_element_cannot_say_is_written_in_custom_instead(tmp_path: Path) -> None:
+    """``@type`` is a closed enumeration; a name outside it goes to ``@custom``, where any string is.
+
+    ``<TextRegion type="<imageregion>">`` and ``type="header, heading"`` -- both of which this
+    package wrote -- are invalid twice over (the value is not one of the eighteen, and four of the
+    fifteen elements accept no ``@type`` at all), which is what
+    :func:`sbb_pytorch.gt.vocabulary.type_for` and :func:`~sbb_pytorch.gt.vocabulary.custom_for`
+    settle for every element at once.
+    """
+    page = parser.Page(
+        path=tmp_path / "p.xml",
+        file_name="p",
+        height=40,
+        width=40,
+        regions=[
+            parser.Region(kind="textregion", type_name="header", region_id="t1", contour=RECT),
+            parser.Region(kind="textregion", type_name="class_1", region_id="t2", contour=TRIANGLE),
+            parser.Region(kind="imageregion", type_name="class_2", region_id="i1", contour=STRIP),
+        ],
+    )
+    page_element = ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+    text_a = page_element.find(f"{{{writer.PAGE_NAMESPACE}}}TextRegion[@id='t1']")
+    text_b = page_element.find(f"{{{writer.PAGE_NAMESPACE}}}TextRegion[@id='t2']")
+    image = page_element.find(f"{{{writer.PAGE_NAMESPACE}}}ImageRegion")
+    assert text_a.get("type") == "header"  # a name in the enumeration is written as @type
+    assert text_a.get("custom") == "structure {type:header;}"
+    assert text_b.get("type") is None  # not in it: no @type, and the name still reaches @custom
+    assert text_b.get("custom") == "structure {type:class_1;}"
+    assert image.get("type") is None  # ImageRegion has no @type attribute to put a name in...
+    assert (
+        image.get("custom") == "structure {type:class_2;}"
+    )  # ...and @custom holds it all the same
+
+
+def test_a_loose_textline_is_wrapped_in_the_region_the_schema_wants(tmp_path: Path) -> None:
+    """A ``TextLine`` with no parent becomes a ``TextRegion`` holding it, not an orphan at page level.
+
+    This is what the writer used to emit -- lines as ``Page`` children -- and what the schema refuses;
+    the alternative to wrapping is dropping the line, and a writer that loses the prediction it was
+    handed is worse than one that invents the region around it (whose contour is the line's own, so
+    nothing about the page's geometry is invented at all).
+    """
+    page = parser.Page(
+        path=tmp_path / "p.xml",
+        file_name="p",
+        height=40,
+        width=40,
+        regions=[parser.Region(kind="textline", type_name="", region_id="l1", contour=RECT)],
+    )
+    page_element = ET.fromstring(writer.to_pagexml(page)).find(f"{{{writer.PAGE_NAMESPACE}}}Page")
+    assert _names(page_element) == ["TextRegion"]
+    wrapper = page_element[0]
+    assert wrapper.get("id") == "TextRegion_1"  # its own id, not the line's (xs:ID must be unique)
+    assert wrapper.get("custom") == "structure {type:text_zone;}"  # a region, not a labelled line
+    assert _names(wrapper) == ["Coords", "TextLine"]
+    assert wrapper[1].get("id") == "l1"
+    assert wrapper[1].find(f"{{{writer.PAGE_NAMESPACE}}}Coords") is not None
 
 
 @pytest.mark.parametrize(

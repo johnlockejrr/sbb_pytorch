@@ -47,6 +47,7 @@ from sbb_pytorch import __version__
 from sbb_pytorch.config import (
     OutputType,
     SBBConfig,
+    TaskType,
     UseCase,
     apply_overrides,
     dump_json_schema,
@@ -59,15 +60,19 @@ from sbb_pytorch.data.dataset import label_path_for
 from sbb_pytorch.device import resolve_device
 from sbb_pytorch.exceptions import CheckpointError, SBBError
 from sbb_pytorch.gt import (
+    VOCABULARY,
     GroundTruthConfig,
     Page,
     Region,
     RegionKind,
     contour_bbox,
     contours_of_image,
+    convex_hull,
     discover_xml_files,
     generate_ground_truth,
     generate_pairs,
+    group_contours_into_blocks,
+    kind_for_class_name,
     parse_pagexml,
     render_page,
     write_image,
@@ -502,6 +507,13 @@ def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -
     "<its directory>/<page stem>.xml. An existing file is read first so its metadata survives.",
 )
 @click.option(
+    "--created",
+    "created",
+    default=None,
+    help="Metadata/Created stamp for --xml-file (the schema requires one). A page that was read "
+    "keeps its own; this names the page that was not. Default: 1970-01-01T00:00:00Z.",
+)
+@click.option(
     "-c",
     "--config",
     "config_path",
@@ -532,6 +544,7 @@ def infer(
     overlap: float | None,
     ground_truth: Path | None,
     xml_file: Path | None,
+    created: str | None,
     config_path: Path | None,
     architecture: str | None,
     device: str | None,
@@ -549,7 +562,8 @@ def infer(
     ``--no-save``, the config's ``save_visualisation`` decides what gets written. ``--xml-file``
     writes each page's answer back as PageXML, the way ``--xml_file`` and ``--page-xml`` did
     upstream; see :func:`_page_xml_for` for which file that is and :func:`_write_page_xml` for what
-    goes in it.
+    goes in it. ``--created`` stamps the pages that have no timestamp of their own -- the schema
+    requires one, and a page built from a mask has no file to take it from.
     """
     state: GlobalState = ctx.obj
     checkpoint = _resolve_model_path(model)
@@ -595,6 +609,7 @@ def infer(
                     path,
                     _page_xml_for(path, xml_file, single_page=len(files) == 1),
                     predictor.config,
+                    created,
                 )
             if ground_truth is not None:
                 scores.append((path, _score_prediction(prediction, path, ground_truth)))
@@ -692,43 +707,182 @@ def _page_xml_for(source: Path, xml_file: Path, *, single_page: bool) -> Path:
     return xml_file if single_page else xml_file.parent / f"{source.stem}.xml"
 
 
+def _class_labels(config: SBBConfig, label: int) -> list[str]:
+    """Every name a class id covers -- page2label's, or the ``class_<id>`` fallback it would need.
+
+    The same names :meth:`sbb_pytorch.inference.predictor.Predictor._class_names` assembles for a
+    classification answer, kept as a list because the two callers want different things from them:
+    :func:`_class_name` joins them into the label a prediction carries, and :func:`_kind_for_class`
+    asks each one in turn which element it names.
+    """
+    mapping = config.page2label.class_ids() if config.page2label else {}
+    return sorted(mapping[label]) if mapping.get(label) else [f"class_{label}"]
+
+
 def _class_name(config: SBBConfig, label: int) -> str:
     """The name a class id answers with: page2label's, else the ``class_<id>`` fallback.
 
     The same rule :meth:`sbb_pytorch.inference.predictor.Predictor._class_names` applies to a
     classification answer, so a region written from a mask and a ``_prediction.json`` written from a
-    label name the same class the same way.
+    label name the same class the same way. What the *element* may say about that name -- ``@type``
+    or only ``@custom`` -- is the writer's question, and :mod:`sbb_pytorch.gt.vocabulary` answers it.
     """
-    mapping = config.page2label.class_ids() if config.page2label else {}
-    return ", ".join(sorted(mapping[label])) if mapping.get(label) else f"class_{label}"
+    return ", ".join(_class_labels(config, label))
 
 
-def _mask_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
-    """The regions a mask answer describes: one per contour of every class on the page.
+def _kind_for_class(config: SBBConfig, label: int) -> RegionKind:
+    """The page element a class id's contours are written as: ``ImageRegion`` for an image class.
+
+    :func:`sbb_pytorch.gt.vocabulary.kind_for_class_name` resolves the name, and this keeps only a
+    name whose element can sit on a page -- a class called ``textline`` is not a page-level region to
+    write a whole contour as. With nothing to go on the answer is ``TextRegion``, which is what every
+    contour was before the vocabulary existed and what a ``class_<id>`` fallback still is.
+    """
+    for name in _class_labels(config, label):
+        kind = kind_for_class_name(name)
+        if kind is not None and VOCABULARY[kind].page_level:
+            return kind
+    return RegionKind.TEXT
+
+
+def _mask_labels(mask: np.ndarray) -> list[int]:
+    """Every class id *mask* carries, background (``0``) excluded, smallest first."""
+    return sorted(int(value) for value in np.unique(mask) if int(value) != 0)
+
+
+#: The use case a mask answer takes its shape from when the config has no ``page2label`` to name one.
+#: The three tasks left over (classification, enhancement, reading order) answer with a label rather
+#: than a mask, so their entry only matters for a config that produces one anyway -- and the answer
+#: then is the layout shape, which is all such a config ever produced.
+_MASK_USE_CASE_BY_TASK: dict[TaskType, UseCase] = {
+    TaskType.SEGMENTATION: UseCase.LAYOUT,
+    TaskType.BINARIZATION: UseCase.BINARIZATION,
+    TaskType.CLASSIFICATION: UseCase.LAYOUT,
+    TaskType.ENHANCEMENT: UseCase.LAYOUT,
+    TaskType.READING_ORDER: UseCase.LAYOUT,
+}
+
+
+def _use_case_for_mask(config: SBBConfig) -> UseCase:
+    """The use case *config*'s mask is written as: its ``page2label``'s, else its task's default."""
+    if config.page2label is not None:
+        return config.page2label.use_case
+    return _MASK_USE_CASE_BY_TASK[config.task]
+
+
+def _regions_for_mask(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+    """The regions a mask answer describes, in the shape its use case annotates.
+
+    Asking the use case is the whole fix for a textline model whose output looked like a layout page:
+    ``_mask_regions`` hardcoded ``kind=RegionKind.TEXT`` for every contour of every class, so
+    nothing a mask said could come out as anything but a ``TextRegion`` -- and the lines the model
+    actually predicted became 239 of them, with no ``TextLine`` anywhere.
+
+    ==============================  ====================================================
+    use case                        the shape
+    ==============================  ====================================================
+    ``layout``                      one region per class contour (:func:`_flat_regions`)
+    ``textline``                    a ``TextRegion`` per block, a ``TextLine`` per contour
+    ``printspace``, ``binarization``  no regions -- the answer is ``Page/PrintSpace``
+    ``word``, ``glyph``             :class:`click.ClickException`, naming the use case
+    ==============================  ====================================================
+
+    Raises:
+        click.ClickException: *config*'s use case is ``word`` or ``glyph``, which this port can
+            predict but not yet write -- the same voice :func:`_page_from_prediction` uses for a
+            prediction it cannot describe.
+    """
+    use_case = _use_case_for_mask(config)
+    if use_case in (UseCase.WORD, UseCase.GLYPH):
+        raise click.ClickException(
+            f"--xml-file cannot describe {source.name}: use_case={use_case.value} is not implemented "
+            f"yet, so its prediction has no PageXML shape to be written as"
+        )
+    if use_case in (UseCase.PRINTSPACE, UseCase.BINARIZATION):
+        return []  # every pixel of the answer goes into Page/PrintSpace; see ``_printspace_from_mask``
+    if use_case is UseCase.TEXTLINE:
+        return _textline_regions(source, config, mask)
+    return _flat_regions(source, config, mask)
+
+
+def _flat_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+    """One region per contour of every class on the page -- the layout shape, and the old behaviour.
 
     v3 built one ``TextRegion`` per class from that class's contours and put each contour in as a
-    ``TextLine`` (``inference.py:615-673``); :class:`~sbb_pytorch.gt.Page` models no parent/child
-    relation (``gt/parser.py:257-287``), so each contour becomes a region of its own, with the id
-    ``<page stem>_<class>_<n>`` and the class name :func:`_class_name` gives it. The area floor is
-    off because :data:`~sbb_pytorch.gt.DEFAULT_MIN_AREA_PIXELS` exists to shed JPEG noise, and a
-    predicted textline one pixel wide has an OpenCV area of zero.
+    ``TextLine`` (``inference.py:615-673``); the layout answer this port writes keeps the contours
+    as regions of their own, which is what a layout page is: the regions *are* the answer, and they
+    are not nested in anything. The area floor is off because
+    :data:`~sbb_pytorch.gt.DEFAULT_MIN_AREA_PIXELS` exists to shed JPEG noise, and a predicted
+    region one pixel wide has an OpenCV area of zero.
     """
     regions: list[Region] = []
-    for label in (int(value) for value in np.unique(mask) if int(value) != 0):
+    for label in _mask_labels(mask):
         # One raster per class, because ``cv2.findContours`` cannot segment a labelled field: the
         # port's own gt pipeline masks per class the same way (gt/generator.py builds its label map
         # first and asks geometry for the contours of one region at a time).
+        kind = _kind_for_class(config, label)
+        name = _class_name(config, label)
         contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
         for index, contour in enumerate(contours):
             regions.append(
                 Region(
-                    kind=RegionKind.TEXT,
-                    type_name=_class_name(config, label),
+                    kind=kind,
+                    type_name=name,
                     region_id=f"{source.stem}_{label}_{index}",
                     contour=contour,
                 )
             )
     return regions
+
+
+def _textline_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+    """``TextRegion`` blocks holding the predicted ``TextLine``\\ s -- the shape lines need.
+
+    A textline model predicts lines and nothing else, so the question is not which regions to write
+    but which blocks the lines form, and :func:`sbb_pytorch.gt.geometry.group_contours_into_blocks`
+    answers that from geometry alone: each block's outline is the convex hull of the lines inside it,
+    which is the quad an annotator draws around a column of lines and not the page-wide box a
+    bounding box of everything would give. Grouping happens per class, as it did in v3, so a
+    ``header`` line never joins a ``paragraph`` block.
+    """
+    regions: list[Region] = []
+    for label in _mask_labels(mask):
+        contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
+        kind = _kind_for_class(config, label)
+        name = _class_name(config, label)
+        for block_index, group in enumerate(group_contours_into_blocks(contours)):
+            block_id = f"{source.stem}_{label}_{block_index}"
+            block = Region(
+                kind=kind,
+                type_name=name,  # @type if the element may say it, @custom always
+                region_id=block_id,
+                contour=convex_hull(group),
+            )
+            for line_index, contour in enumerate(group):
+                line = Region(
+                    kind=RegionKind.TEXTLINE,
+                    type_name="",  # a line's class is its element: @custom says text_line
+                    region_id=f"{block_id}_{line_index}",
+                    contour=contour,
+                )
+                line.parent = block
+                block.children.append(line)
+            regions.append(block)
+    return regions
+
+
+def _printspace_from_mask(mask: np.ndarray) -> np.ndarray | None:
+    """The ``Page/PrintSpace`` outline a printspace or binarization answer implies.
+
+    Both use cases say one thing about a page -- where the ink is -- and PageXML writes that as the
+    page's print space rather than as regions, which is why :func:`_regions_for_mask` returns none for
+    them: a ``TextRegion`` per black blob was what the port wrote before, for a task that names no
+    regions at all. The outline is the convex hull of the ink, not the ink's own contour: the schema's
+    print space is one polygon, and a page of two columns has one.
+    """
+    contours = contours_of_image(np.where(mask == 0, 0, 255).astype(np.uint8), min_area=0.0)
+    hull = convex_hull(contours)
+    return hull if hull.size else None
 
 
 def _ordered_ids(page: Page, label: str) -> dict[str, int]:
@@ -754,18 +908,25 @@ def _ordered_ids(page: Page, label: str) -> dict[str, int]:
 
 
 def _page_from_prediction(
-    source: Path, prediction: Prediction, config: SBBConfig, existing: Page | None
+    source: Path,
+    prediction: Prediction,
+    config: SBBConfig,
+    existing: Page | None,
+    created: str | None = None,
 ) -> Page:
     """The page *source* is now that it has a prediction, keeping what the file already knew.
 
     Three shapes, the same three :class:`~sbb_pytorch.inference.predictor.Prediction` can hold:
 
     a ``mask`` (segmentation, binarization)
-        The regions come from the prediction (:func:`_mask_regions`) -- the ``--page-xml`` half of
-        upstream -- while the declared size and the ``Metadata`` column count come from *existing*
-        when the file was readable and from the mask itself when it was not. The old reading order
-        goes with the old regions: its ids named regions that are no longer there, and the new ones
-        name classes.
+        The regions come from the prediction, in the shape its use case annotates
+        (:func:`_regions_for_mask`) -- the ``--page-xml`` half of upstream -- while the declared
+        size, the ``Metadata`` column count, the ``@externalRef`` and the timestamps come from
+        *existing* when the file was readable and from the mask itself when it was not. A
+        printspace or binarization answer replaces the print space instead of the regions, because
+        that is the only thing either task says about a page. The old reading order goes with the
+        old regions: its ids named regions that are no longer there, and the new ones name classes.
+        *created* is ``--created``: the timestamp to stamp a page with when the file had none.
     a ``label`` (classification, reading order)
         The answer is an ordering, so the page keeps every region it had (``dataclasses.replace``)
         and gains the order :func:`_ordered_ids` builds. With no file to order there is nothing to
@@ -778,14 +939,38 @@ def _page_from_prediction(
         regions came from nowhere.
     """
     if prediction.mask is not None:
-        height, width = prediction.mask.shape[:2]
+        height, width = (
+            (existing.height, existing.width)
+            if existing is not None
+            else (int(prediction.mask.shape[0]), int(prediction.mask.shape[1]))
+        )
+        use_case = _use_case_for_mask(config)
+        # The answer replaces the print space only for the two use cases whose whole answer is one;
+        # every other shape keeps the page's own, which is a fact about the page and not about regions.
+        printspace = (
+            _printspace_from_mask(prediction.mask)
+            if use_case in (UseCase.PRINTSPACE, UseCase.BINARIZATION)
+            else (existing.printspace_contour if existing else None)
+        )
         return Page(
             path=source,
             file_name=source.stem,
-            height=existing.height if existing else int(height),
-            width=existing.width if existing else int(width),
+            height=height,
+            width=width,
             columns_width=existing.columns_width if existing else None,
-            regions=_mask_regions(source, config, prediction.mask),
+            regions=_regions_for_mask(source, config, prediction.mask),
+            printspace_contour=printspace,
+            printspace_bbox=(
+                contour_bbox(printspace, (height, width))
+                if printspace is not None
+                else (existing.printspace_bbox if existing else None)
+            ),
+            external_ref=existing.external_ref if existing else "",
+            creator=existing.creator if existing else None,
+            # --created wins over the file's own stamp, and the file's wins over the writer's
+            # placeholder, which is what the option exists to replace.
+            created=created or (existing.created if existing else None),
+            last_change=(existing.last_change if existing else None) or created,
         )
     if prediction.label is not None:
         if existing is None:
@@ -801,7 +986,13 @@ def _page_from_prediction(
     )
 
 
-def _write_page_xml(prediction: Prediction, source: Path, target: Path, config: SBBConfig) -> int:
+def _write_page_xml(
+    prediction: Prediction,
+    source: Path,
+    target: Path,
+    config: SBBConfig,
+    created: str | None = None,
+) -> int:
     """Fold one page's answer into its PageXML and write the file; returns 1.
 
     An existing *target* is parsed before anything is written, because upstream's promise was that
@@ -811,10 +1002,11 @@ def _write_page_xml(prediction: Prediction, source: Path, target: Path, config: 
     rather than being overwritten unread. A *missing* target is not an error for a task that answers
     with regions (that is what ``--page-xml`` created, and why ``exists=False``): the file is built
     from the prediction and written. ``--no-save`` still writes the XML: asking for it *is* the
-    request, the way ``--save-logits`` is.
+    request, the way ``--save-logits`` is. *created* is ``--created``, passed through to
+    :func:`_page_from_prediction` for the pages that have no timestamp of their own to keep.
     """
     existing = parse_pagexml(target) if target.is_file() else None
-    write_pagexml(_page_from_prediction(source, prediction, config, existing), target)
+    write_pagexml(_page_from_prediction(source, prediction, config, existing, created), target)
     return 1
 
 

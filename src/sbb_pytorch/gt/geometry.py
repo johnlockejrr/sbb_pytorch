@@ -49,7 +49,9 @@ __all__ = [
     "contour_features",
     "contours_of_image",
     "contours_of_region",
+    "convex_hull",
     "filter_contours_by_area",
+    "group_contours_into_blocks",
     "largest_contour",
     "largest_contour_bbox",
     "mask_of",
@@ -368,6 +370,120 @@ def return_parent_contours(
             continue
         parents.append(contour)
     return parents
+
+
+def convex_hull(contours: Iterable[np.ndarray] | np.ndarray) -> np.ndarray:
+    """The convex hull of every point in *contours*, as one ``(N, 1, 2)`` ``int32`` contour.
+
+    The outline a group of contours gets when it needs a single one -- a ``TextRegion`` around the
+    ``TextLine``\\ s it holds, which the schema requires and which :func:`points_attribute` refuses
+    to leave empty.  A bounding box would satisfy the letter of that requirement and ruin the page:
+    two columns of lines boxed together produce one enormous rectangle swallowing the gutter
+    between them, while the hull of a column's own lines is the narrow quad the annotators draw.
+    For a single contour that is a triangle-strip simplification of it; for a line it is the line's
+    own rectangle, which is why grouping one line never invents geometry.
+
+    Returns an empty ``(0, 1, 2)`` array when *contours* holds nothing, since a hull of no points is
+    no outline rather than an error -- :func:`contour_area` and :func:`contour_bbox` both answer
+    ``0``/``(0, 0, 0, 0)`` for the same input.
+    """
+    if isinstance(contours, np.ndarray) and contours.ndim in (1, 2, 3):
+        points = [_as_cv_contour(contours)] if contours.size else []
+    else:
+        points = [_as_cv_contour(np.asarray(c)) for c in contours]  # type: ignore[arg-type]
+    vertices = [point for contour in points for point in contour.reshape(-1, 2)]
+    if not vertices:
+        return np.empty((0, 1, 2), dtype=np.int32)
+    hull = cv2.convexHull(np.asarray(vertices, dtype=np.int32).reshape(-1, 1, 2))
+    return np.ascontiguousarray(hull.astype(np.int32))
+
+
+def group_contours_into_blocks(
+    contours: Sequence[np.ndarray],
+    *,
+    row_gap: int | None = None,
+    overlap: float = 0.3,
+) -> list[list[np.ndarray]]:
+    """Group line-shaped contours into the blocks they form: columns of lines, top to bottom.
+
+    The PageXML schema asks for it -- a ``TextLine`` must live inside a ``TextRegion`` -- and a page
+    of two columns needs two blocks, not one box around everything.  Contours are visited in
+    ``(y, x)`` order and a block grows by taking the next unclaimed contour whose *horizontal* span
+    overlaps a member by at least *overlap* (as a fraction of the narrower of the two, so a short
+    line under a long heading still belongs to it) and whose top edge sits within *row_gap* pixels
+    below a member's bottom edge.  Anything that fits neither joins no existing block and starts one
+    of its own, which is how a page of isolated lines, or a second column, comes out as several
+    blocks instead of one.
+
+    This is deliberately geometric and not typographic: it never reads the text, so grouping the
+    contours of *one class at a time* is what keeps a ``header`` line out of a ``paragraph`` block
+    (the rule v3 got right and this package's writer relied on :func:`contour_bbox` for) -- the
+    caller groups per class and calls this once per class.
+
+    Args:
+        contours: The contours to group, in any order.
+        row_gap: Largest vertical gap, in pixels, that still counts as "the next line down".
+            Defaults to the median height of *contours* -- the height of a typical line, which is
+            what separates consecutive lines from the first line of a new block.
+        overlap: Minimum fraction (``0``-``1``) of horizontal overlap with a member for a contour to
+            join its block.
+
+    Returns:
+        Lists of contours, each in ``(y, x)`` order, blocks ordered by their top edge.  Every input
+        contour appears exactly once; an empty input gives no blocks.
+    """
+    contour_list = [np.asarray(c) for c in contours if np.asarray(c).size]
+    if not contour_list:
+        return []
+    boxes = [contour_bbox(c) for c in contour_list]
+    if row_gap is None:
+        heights = sorted(h for _, _, _, h in boxes if h > 0)
+        row_gap = max(1, int(heights[len(heights) // 2])) if heights else 1
+
+    order = sorted(range(len(contour_list)), key=lambda i: (boxes[i][1], boxes[i][0]))
+    claimed = [False] * len(contour_list)
+    blocks: list[list[np.ndarray]] = []
+    for first in order:
+        if claimed[first]:
+            continue
+        block = [first]
+        claimed[first] = True
+        while True:
+            candidate = next(
+                (
+                    j
+                    for j in order
+                    if not claimed[j]
+                    and any(_joins(boxes[j], boxes[m], row_gap, overlap) for m in block)
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            claimed[candidate] = True
+            block.append(candidate)
+        blocks.append(
+            [contour_list[i] for i in sorted(block, key=lambda i: (boxes[i][1], boxes[i][0]))]
+        )
+    return blocks
+
+
+def _joins(candidate: BoundingBox, member: BoundingBox, row_gap: int, overlap: float) -> bool:
+    """Whether the contour boxed as *candidate* belongs to the block holding the box *member*.
+
+    The two tests of :func:`group_contours_into_blocks` in one place: *overlap* of the horizontal
+    spans (as a fraction of the narrower box, so a short line under a long one still counts) and a
+    vertical gap of at most *row_gap* pixels, measured from the member's bottom edge to the
+    candidate's top edge and never negative (an overlapping, side-by-side pair is not stacked).
+    """
+    cx, cy, cw, _ = candidate
+    mx, my, mw, mh = member
+    shared = min(cx + cw, mx + mw) - max(cx, mx)
+    narrower = min(cw, mw)
+    if narrower <= 0 or shared / narrower < overlap:
+        return False
+    # Below the member, within one line-height of it: the row directly under, not a lower column.
+    return 0 <= cy - (my + mh) <= row_gap
 
 
 def update_region_contours(

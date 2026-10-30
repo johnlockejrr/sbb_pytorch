@@ -11,8 +11,17 @@ Dependency direction inside the subpackage (no cycles):
     geometry  <-  parser  <-  render  <-  generator
         ^          ┌──┴──┐                    ^
         │          │     └──  writer          │
+        │          │           └──  vocabulary│
         └──────────┼──────────────────────────┘
                    └──  reading_order
+
+:mod:`.vocabulary` is the PageXML element and ``@type`` table and imports nothing from
+either side: :mod:`.parser` reads through it (``RegionKind``, ``REGION_TAGS``) and
+:mod:`.writer` writes through it (``element_for``, ``type_for``, ``custom_for``), so a
+name is decided once instead of once per direction.  The five names ``parser`` used to
+define (``GRAPHIC_REGION_TYPES``, ``LEGACY_INACTIVE_TEXT_TYPES``, ``TEXT_REGION_TYPES``,
+``RegionKind``, ``normalise_text_type``) are re-exported from here as its aliases, so
+``from sbb_pytorch.gt.parser import RegionKind`` still resolves.
 
 Modules here depend only on the standard library, ``numpy`` and ``cv2``; :mod:`.writer`
 needs nothing beyond the standard library's ``xml.etree``.  The legacy
@@ -47,7 +56,9 @@ from .geometry import (
     contour_features,
     contours_of_image,
     contours_of_region,
+    convex_hull,
     filter_contours_by_area,
+    group_contours_into_blocks,
     largest_contour,
     largest_contour_bbox,
     mask_of,
@@ -58,17 +69,12 @@ from .geometry import (
 )
 from .parser import (
     DEFAULT_XML_ENCODING,
-    GRAPHIC_REGION_TYPES,
-    LEGACY_INACTIVE_TEXT_TYPES,
-    TEXT_REGION_TYPES,
     Contour,
     Page,
     PageXMLError,
     Region,
-    RegionKind,
     discover_xml_files,
     image_for,
-    normalise_text_type,
     parse_pagexml,
 )
 from .reading_order import (
@@ -109,8 +115,26 @@ from .render import (
     to_uint8_bgr,
     write_image,
 )
+from .vocabulary import (
+    GRAPHIC_REGION_TYPES,
+    LEGACY_INACTIVE_TEXT_TYPES,
+    PAGE_ELEMENT_NAMES,
+    REGION_TAGS,
+    TEXT_REGION_TYPES,
+    VOCABULARY,
+    RegionKind,
+    RegionVocabulary,
+    ancestor_chain,
+    custom_for,
+    element_for,
+    kind_for_class_name,
+    kind_for_element,
+    normalise_text_type,
+    type_for,
+)
 from .writer import (
     CREATOR,
+    DEFAULT_TIMESTAMP,
     PAGE_NAMESPACE,
     SCHEMA_LOCATION,
     points_attribute,
@@ -147,7 +171,9 @@ __all__ = [
     "contour_features",
     "contours_of_image",
     "contours_of_region",
+    "convex_hull",
     "filter_contours_by_area",
+    "group_contours_into_blocks",
     "largest_contour",
     "largest_contour_bbox",
     "mask_of",
@@ -202,8 +228,25 @@ __all__ = [
     "generate_ground_truth",
     "labelled_contours",
     "output_stem",
+    # vocabulary — the PageXML element and @type table
+    "GRAPHIC_REGION_TYPES",
+    "LEGACY_INACTIVE_TEXT_TYPES",
+    "PAGE_ELEMENT_NAMES",
+    "REGION_TAGS",
+    "TEXT_REGION_TYPES",
+    "VOCABULARY",
+    "RegionKind",
+    "RegionVocabulary",
+    "ancestor_chain",
+    "custom_for",
+    "element_for",
+    "kind_for_class_name",
+    "kind_for_element",
+    "normalise_text_type",
+    "type_for",
     # writer — PageXML serialisation
     "CREATOR",
+    "DEFAULT_TIMESTAMP",
     "PAGE_NAMESPACE",
     "SCHEMA_LOCATION",
     "points_attribute",

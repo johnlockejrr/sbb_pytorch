@@ -1,7 +1,9 @@
 """ALTO/PageXML parsing.
 
-This module is the single place in the package that knows the page-description
-schema.  It replaces the five near-identical XML readers of the legacy
+This module reads a page.  The *names* it reads -- the element per region kind, the two ``@type``
+enumerations, the ``rest_as_`` legacy rule -- live in :mod:`.vocabulary`, which the writer consults
+too, so a name is decided once and read and written the same way round; what is left here is the
+XML itself.  Reading replaces the five near-identical readers of the legacy
 ``gt_gen_utils`` module (``read_xml``, ``get_textline_contours_for_visualization``,
 ``get_layout_contours_for_visualization`` and the two inline blocks inside
 ``get_images_of_ground_truth``), which together accounted for roughly 1000
@@ -43,7 +45,6 @@ import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from enum import Enum
 from itertools import takewhile
 from pathlib import Path
 from typing import Final
@@ -52,6 +53,14 @@ import numpy as np
 
 from ..exceptions import PageXMLError
 from .geometry import contour_bbox
+from .vocabulary import (
+    GRAPHIC_REGION_TYPES,
+    LEGACY_INACTIVE_TEXT_TYPES,
+    REGION_TAGS,
+    TEXT_REGION_TYPES,
+    RegionKind,
+    normalise_text_type,
+)
 
 __all__ = [
     "DEFAULT_XML_ENCODING",
@@ -76,66 +85,11 @@ DEFAULT_XML_ENCODING: Final = "iso-8859-5"
 Contour = np.ndarray
 
 
-class RegionKind(str, Enum):
-    """Region kinds, keyed by the lower-cased XML local name."""
-
-    TEXT = "textregion"
-    GRAPHIC = "graphicregion"
-    IMAGE = "imageregion"
-    SEPARATOR = "separatorregion"
-    TABLE = "tableregion"
-    NOISE = "noiseregion"
-    TEXTLINE = "textline"
-    WORD = "word"
-    GLYPH = "glyph"
-    PRINTSPACE = "printspace"
-    BORDER = "border"
-
-
-#: Canonical PageXML ``TextRegion/@type`` values.
-TEXT_REGION_TYPES: Final[tuple[str, ...]] = (
-    "paragraph",
-    "header",
-    "heading",
-    "footnote",
-    "footnote-continued",
-    "drop-capital",
-    "signature-mark",
-    "catch-word",
-    "page-number",
-    "marginalia",
-)
-
-#: Canonical PageXML ``GraphicRegion/@type`` values.
-GRAPHIC_REGION_TYPES: Final[tuple[str, ...]] = (
-    "decoration",
-    "handwritten-annotation",
-    "stamp",
-    "signature",
-)
-
-#: ``read_xml`` has its ``catch-word`` and ``page-number`` branches commented out,
-#: so regions of those types were routed to ``paragraph``.  The layout visualiser
-#: does collect them under their own type.  The distinction is preserved here
-#: rather than silently unified.
-LEGACY_INACTIVE_TEXT_TYPES: Final[frozenset[str]] = frozenset({"catch-word", "page-number"})
-
-_REGION_TAGS: Final[dict[str, RegionKind]] = {
-    # The legacy code matched the pairs ``'}TextRegion'`` / ``'}Textregion'`` (and the
-    # same for every other kind) because both spellings occur in real files; lower-casing
-    # the local name in :func:`_local_name` covers both with one key per kind.
-    "textregion": RegionKind.TEXT,
-    "graphicregion": RegionKind.GRAPHIC,
-    "imageregion": RegionKind.IMAGE,
-    "separatorregion": RegionKind.SEPARATOR,
-    "tableregion": RegionKind.TABLE,
-    "noiseregion": RegionKind.NOISE,
-    "textline": RegionKind.TEXTLINE,
-    "word": RegionKind.WORD,
-    "glyph": RegionKind.GLYPH,
-    "printspace": RegionKind.PRINTSPACE,
-    "border": RegionKind.BORDER,
-}
+#: The element-per-kind table, :data:`.vocabulary.REGION_TAGS` under its original private name --
+#: kept as an alias because every reader of this module reached for it by name, and because the
+#: writer used to keep a second copy of the same mapping (``writer._REGION_ELEMENTS``) that this one
+#: now stands for.
+_REGION_TAGS: Final[dict[str, RegionKind]] = REGION_TAGS
 
 #: Which region kinds the schema allows *inside* each kind, from the content models of
 #: ``pagecontent/2019-07-15``: ``TextRegionType`` nests regions and ``TextLine``\\ s,
@@ -243,32 +197,6 @@ def _element_contour(element: ET.Element, prefix: str) -> Contour | None:
     if direct is not None and direct.get("points"):
         return _parse_coords_points(direct.get("points"))
     return _contour_of(element, prefix)
-
-
-def normalise_text_type(raw_type: str, configured_types: list[str] | None = None) -> str:
-    """Map a raw ``TextRegion/@type`` onto the label key the pipeline uses.
-
-    Two legacy rules are encoded here, previously duplicated at five call sites:
-
-    * a configured ``rest_as_<type>`` key renames that type, e.g.
-      ``rest_as_paragraph`` -> ``paragraph``;
-    * ``read_xml`` had ``catch-word``/``page-number`` disabled, routing those
-      regions to ``paragraph`` (see :data:`LEGACY_INACTIVE_TEXT_TYPES`).  This is
-      applied only when *configured_types* is given, which is how the caller
-      signals it wants the label-generation routing rather than the faithful one.
-    """
-    if raw_type.startswith("rest_as_"):
-        return raw_type[len("rest_as_") :]
-    if configured_types is None:
-        return raw_type
-    declared = set(configured_types)
-    # A ``rest_as_paragraph`` key also declares the bare name ``paragraph``.
-    folded = declared | {
-        name[len("rest_as_") :] for name in declared if name.startswith("rest_as_")
-    }
-    if raw_type in LEGACY_INACTIVE_TEXT_TYPES and raw_type not in folded and "paragraph" in folded:
-        return "paragraph"
-    return raw_type
 
 
 @dataclass(slots=True)

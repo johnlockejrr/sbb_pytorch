@@ -546,9 +546,12 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
     ``inference.py:731-735``: "xml file with layout coordinates that reading order detection will
     be implemented on. The result will be written in the same xml file." The rewrite keeps what the
     file knew -- ``@imageFilename``, the declared size -- and gains one region per predicted contour
-    (:func:`sbb_pytorch.cli._mask_regions`), which is all the port's flat
-    :class:`~sbb_pytorch.gt.Page` can express; v3's ``TextLine``-under-``TextRegion`` nesting has no
-    place to live and is flattened the way :mod:`sbb_pytorch.gt.writer` documents.
+    (:func:`sbb_pytorch.cli._regions_for_mask`), which is what a *layout* answer is: the config has
+    no ``page2label``, so its task decides the shape and the shape is one flat region per class.
+
+    The class name is the pair the assertion checks. ``class_1`` is not one of the schema's eighteen
+    ``@type`` values, so the writer keeps ``@type`` empty and names the class in ``@custom`` instead,
+    where any string is legal -- and the region that comes back from parsing says the same two things.
     """
     page = tmp_path / "page.png"
     imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
@@ -567,9 +570,17 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
     written = parse_pagexml(source)
     assert (written.width, written.height, written.file_name) == (SIZE, SIZE, "page")
     assert [
-        (region.region_id, region.type_name, contour_bbox(region.contour, (SIZE, SIZE)))
+        (
+            region.region_id,
+            region.type_name,
+            region.custom,
+            contour_bbox(region.contour, (SIZE, SIZE)),
+        )
         for region in written.regions
-    ] == [("page_1_0", "class_1", (4, 4, 24, 8)), ("page_2_0", "class_2", (4, 16, 24, 8))]
+    ] == [
+        ("page_1_0", "", "structure {type:class_1;}", (4, 4, 24, 8)),
+        ("page_2_0", "", "structure {type:class_2;}", (4, 16, 24, 8)),
+    ]
 
 
 def test_infer_xml_file_names_one_file_per_page_when_the_run_has_several(

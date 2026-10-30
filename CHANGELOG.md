@@ -316,6 +316,44 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   label is upstream's own -- `gt_gen_utils.py:289` fills a `(H, W, 3)` array on that branch and
   `generate_gt_for_training.py:45` says one channel would do -- so `render.to_label_map` keeps it
   and now cites both.
+- **The PageXML `sbb infer --xml-file` wrote could not be opened by anything else.** It failed
+  `xmllint --schema pagecontent/2019-07-15` on six counts, and the two structural ones came from
+  the parser and the writer agreeing with each other instead of with the schema. `gt.parser.Region`
+  modelled five fields with no parent and no children and `_iter_regions` walked the document flat,
+  so a `<TextLine>` nested inside a `<TextRegion>` came back as the *page's* child and went back out
+  the same way -- `Element 'TextLine': This element is not expected`, once per line, which is why one
+  annotated page whose reference holds **38 lines inside one `TextRegion`** came out of here as 239
+  `TextRegion`s and no lines at all. `@custom`, `<TextEquiv @conf>` and `<Baseline>` were never read,
+  and the `Metadata` the parser threw away took the annotation's `@externalRef`, `Created` and
+  `LastChange` with it -- so a rewrite erased the provenance line the schema requires and the writer
+  supplied none of it. `Region` has `children`/`parent` now (`compare=False` on `parent`, so
+  `__eq__` does not recurse), `_iter_regions` walks pre-order through an `_ALLOWED_CHILDREN` table
+  while `Page.regions` stays the flat list every existing caller reads, and an illegal pairing (a
+  loose `TextLine`, our own old output) stays an orphan rather than being silently re-parented, so it
+  survives the round trip. The writer emits `Page`'s children in the order `PageType` declares
+  (`Border?`, `PrintSpace?`, `ReadingOrder?`, then the regions), writes the `@id` the schema requires
+  even when the parsed one was empty (`<Element>_<n>`, counted per element name, which keeps the
+  output byte-stable), gives the `<OrderedGroup>` the `@id` it had left off while its own
+  `_ORDERED_GROUP_ID` sat unused in the same file, and writes `Created`/`LastChange` from the parsed
+  page -- falling back to `--created`, and without that to `1970-01-01T00:00:00Z`, the no-clock
+  promise kept as an argument rather than a hash pretending to be a date.
+- **`gt/vocabulary.py` is the PageXML element and `@type` table, and the schema is its authority.**
+  Three places spelled these names before, and all three disagreed with the xsd: `gt.parser` kept ten
+  text types and four graphic ones where the schema has eighteen and eleven (so a `caption`, `footer`
+  or `credit` region read as untyped), `gt.writer` kept its own element-per-kind table, and
+  `cli._class_name` joined *every* name a class id stood for into `@type="header, heading"` -- a
+  value no version of this schema accepts, and invalid twice over on the elements that carry no
+  `@type` at all (`ImageRegion`, `SeparatorRegion`, `TableRegion`, `NoiseRegion`, `Word`, `Glyph`,
+  `Border`, `PrintSpace`, where `<TextRegion type="<imageregion>">` was the old output). The parser's
+  `TEXT_REGION_TYPES`, `GRAPHIC_REGION_TYPES` and `REGION_TAGS` are aliases of the new table and
+  `normalise_text_type` moved there rather than being copied a sixth time; `cli._class_name` is gone,
+  its only caller asking `type_for`/`custom_for` instead -- `Predictor._class_names` keeps the comma
+  join for `Prediction.label`, which is not an XML attribute. `cli._regions_for_mask` now shapes the
+  answer by use case (`textline` groups lines into blocks via `gt.geometry.group_contours_into_blocks`
+  and `convex_hull` and nests them, `layout` writes one region per class, `printspace` and
+  `binarization` write the `PrintSpace` outline alone instead of the bogus regions they used to add,
+  and `word`/`glyph` answer `ClickException` naming the use case). The output of the reference page
+  the user supplied validates, and a page written twice is the same bytes.
 
 ### Removed
 
