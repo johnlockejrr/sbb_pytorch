@@ -15,6 +15,7 @@ from sbb_pytorch.storage.checkpoint import (
     load_checkpoint,
     load_into_model,
     prune_checkpoints,
+    safetensors_available,
     save_checkpoint,
     write_sidecar_config,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "rotate_not_90",
     "rotated_rect_max_area",
     "save_checkpoint",
+    "safetensors_available",
     "shift_image_and_label",
     "shuffle_channels",
     "to_uint8",

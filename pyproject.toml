@@ -59,6 +59,12 @@ dependencies = [
     "rich>=13.0",
     "PyYAML>=6.0",
     "tensorboard>=2.13",
+    # `.safetensors` is a writable format next to `.pt`, not an extra: `Checkpoint.save`/`load`
+    # dispatch on the extension (storage/checkpoint.py), and a runtime guard
+    # (`safetensors_available()`, the `tensorboard_available()` pattern) keeps a machine without
+    # it working for every `.pt` path.  The code never uses `force_contiguous=`, which is 0.6+
+    # only -- 0.4 is the floor the code is written against.
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]

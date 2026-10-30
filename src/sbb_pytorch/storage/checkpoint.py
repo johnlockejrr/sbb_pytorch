@@ -23,18 +23,31 @@ that shape as well -- which is what lets ``sbb export best-07-0.9812.ckpt`` writ
 the very next load rejected them as ``Unexpected key(s) "model.conv.weight"``.
 
 Pruning also changed: ``sorted(glob("..._epoch_*.pth"))`` is lexicographic, so ``epoch_10``
-sorted before ``epoch_2`` and ``keep_last_n`` deleted the newest files. Ordering is numeric now.
+sorted before ``epoch_2`` and ``keep_last_n`` deleted the newest files. Ordering is numeric now,
+and the two files a run *publishes* (``model.pt``, ``model.safetensors``) carry no epoch number,
+so they used to be the first thing ``keep_last_n`` ate; they now sort after every epoch file.
+
+A ``.safetensors`` file is a fifth shape and the only one that is not a pickle: tensors plus one
+JSON ``__metadata__`` string, and nothing else. :meth:`Checkpoint.save` and :meth:`Checkpoint.load`
+therefore dispatch on the extension instead of treating the formats as interchangeable --
+:meth:`Checkpoint.save_safetensors` puts every schema field except ``optimizer_state`` into that
+metadata (an optimiser state is a tensor tree, not a string, which is exactly why a
+``.safetensors`` start means a *fresh* optimizer), and :meth:`Checkpoint.load_safetensors` reads a
+file back that any other torch tool can open.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import pickle
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Final
 
 import torch
 from torch import Tensor, nn
@@ -49,16 +62,64 @@ __all__ = [
     "load_into_model",
     "prune_checkpoints",
     "save_checkpoint",
+    "safetensors_available",
+    "write_sidecar_config",
 ]
 
 #: Every key name historically used for the weights blob, in preference order.
 _STATE_KEYS = ("model_state", "model_state_dict", "state_dict", "model")
 
-_SCHEME = re.compile(r"(?P<stem>.*?)(?:[._-](?P<epoch>\d+))?(?:\.(?P<ext>pt|pth|ckpt))?$")
-
 #: The key pytorch-lightning stamps on every checkpoint it writes. Ours is spelled
 #: ``pytorch_lightning_version``; the hyphen is Lightning's own and is what identifies the file.
 _LIGHTNING_VERSION_KEY = "pytorch-lightning_version"
+
+_SCHEME = re.compile(
+    r"(?P<stem>.*?)(?:[._-](?P<epoch>\d+))?(?:\.(?P<ext>pt|pth|ckpt|safetensors))?$"
+)
+
+#: The extension order :func:`latest_checkpoint` ranks by, lowest being the most wanted: a torch
+#: file before a Lightning ``.ckpt`` before a ``.safetensors``, because the first two can carry an
+#: optimiser state and the last one cannot -- so between a run's own ``model.pt`` and a
+#: ``model.safetensors`` exported from it, ``model.pt`` is the checkpoint.
+_EXT_RANKS: Final[dict[str, int]] = {"pt": 0, "pth": 1, "ckpt": 2, "safetensors": 3}
+
+#: The same extensions as globs, in that order -- what ``latest_checkpoint`` and
+#: ``prune_checkpoints`` search when the caller names no pattern.
+_PREFERRED_EXTENSIONS: Final[tuple[str, ...]] = (".pt", ".pth", ".ckpt", ".safetensors")
+
+#: The one extension that is not a pickle, and therefore the one a ``save``/``load`` dispatch on.
+_SAFETENSORS_SUFFIX: Final = ".safetensors"
+
+
+def safetensors_available() -> bool:
+    """Whether ``safetensors`` is importable -- what writing a ``.safetensors`` needs.
+
+    The question :func:`sbb_pytorch.training.trainer.tensorboard_available` asks about TensorBoard,
+    asked the same way: ``importlib.util.find_spec`` at call time, so a caller can be tested by
+    monkeypatching this one function instead of breaking an import.  It is a real dependency of the
+    package now, so ``False`` means an incomplete install rather than an optional extra -- which is
+    why :meth:`Checkpoint.save` only *refuses* an explicit ``.safetensors`` request and leaves
+    "skip the extra export" to the caller (:func:`sbb_pytorch.training.trainer.fit`).
+    """
+    return importlib.util.find_spec("safetensors") is not None
+
+
+@lru_cache(maxsize=1)
+def _safetensors_backend() -> ModuleType:
+    """The cached ``safetensors.torch`` module: ``save_file``, ``load_file`` and ``safe_open``.
+
+    Cached because importing it costs more than a dict lookup and every safetensors read wants it
+    twice -- once for the tensors, once for ``__metadata__``, which ``load_file`` does not return.
+    Raises :class:`CheckpointError` rather than ``ImportError`` so a missing package is the
+    one-line message the CLI prints; a test patches this function or the one above it.
+    """
+    try:
+        import safetensors.torch
+    except ImportError as exc:  # pragma: no cover - the guard above answers first when it is absent
+        raise CheckpointError(
+            f"safetensors support needs the `safetensors` package: {exc}"
+        ) from exc
+    return safetensors.torch
 
 
 def _is_lightning(raw: dict[str, Any]) -> bool:
@@ -155,6 +216,40 @@ def _resolve_target(
 def _sidecar(path: Path) -> Path:
     """``model.pt`` -> ``model_config.json``: the JSON mirror written next to a checkpoint."""
     return path.with_name(f"{path.stem}_config.json")
+
+
+def _metadata_int(metadata: Mapping[str, str], key: str, *, default: int = 0) -> int:
+    """One integer out of a ``__metadata__`` mapping; a value that is not a number is absent.
+
+    Safetensors metadata is ``dict[str, str]``, so ``epoch`` and ``schema_version`` arrive as text,
+    and a foreign file's ``sbb.*`` keys -- if it has any -- are whatever its own writer chose.
+    Reading the file in parts rather than parsing one nested object is what lets a checkpoint from
+    another tool be *read* (as unversioned and unattributed) instead of refused.
+    """
+    raw = metadata.get(key)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _metadata_json(metadata: Mapping[str, str], key: str) -> dict[str, Any] | None:
+    """One JSON object out of the metadata: ``sbb.config`` and ``sbb.metrics`` are stored as text.
+
+    Anything that does not parse, or parses into something other than an object, reads as absent --
+    the same treatment an unreadable ``config`` gets in :meth:`Checkpoint.from_dict`, where a value
+    that is not a dict becomes ``None`` rather than ending the load.
+    """
+    raw = metadata.get(key)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 @dataclass(slots=True)
@@ -314,14 +409,25 @@ class Checkpoint:
             "pytorch_lightning_version": self.pytorch_lightning_version,
         }
 
-    def save(self, path: str | Path, *, write_sidecar: bool = True) -> Path:
-        """Serialise to ``path`` (``.pt``/``.pth``), creating parent directories.
+    def save(self, path: str | Path, *, write_sidecar: bool | None = None) -> Path:
+        """Serialise to ``path``, creating parent directories -- the format follows the extension.
 
-        When ``write_sidecar`` is set and a config is attached, a ``<stem>_config.json`` mirror
-        is written next to the weights (``train.py`` used to write one, and external scripts
-        read it without unpickling). Set ``write_sidecar=False`` for per-epoch checkpoints.
+        ``.pt``/``.pth``/``.ckpt`` go through :func:`torch.save`: that is the layout every
+        pre-refactor file uses and the only one that can hold an ``optimizer_state``.  A
+        ``.safetensors`` path goes to :meth:`save_safetensors` instead, and an explicit request for
+        that format is refused when the package is missing rather than quietly written as a pickle
+        the caller did not ask for.
+
+        ``write_sidecar`` defaults to ``None`` meaning *yes for a torch file, no for a safetensors
+        one* -- the latter carries its config inside itself, so writing ``model_config.json``
+        beside it duplicates an answer the file already gives.  Passing ``True`` or ``False`` means
+        what it always meant, and ``train.py``'s per-epoch saves still pass ``False``.
         """
         path = Path(path)
+        if path.suffix.lower() == _SAFETENSORS_SUFFIX:
+            return self.save_safetensors(path, write_sidecar=write_sidecar is True)
+        if write_sidecar is None:
+            write_sidecar = True
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             torch.save(self.to_dict(), path)
@@ -333,13 +439,100 @@ class Checkpoint:
             )
         return path
 
+    def save_safetensors(self, path: str | Path, *, write_sidecar: bool = False) -> Path:
+        """Write the weights as ``.safetensors``, with this schema in the file's ``__metadata__``.
+
+        The format stores tensors and one JSON metadata string and nothing else, so
+        ``optimizer_state`` is the one field that cannot travel -- an optimiser's state is a tree of
+        tensors and ints, not a string, which is exactly why loading a ``.safetensors`` to start a
+        run means starting with a *fresh* optimizer rather than a resumed one.
+
+        Raises:
+            CheckpointError: the package is not installed, the state is empty, or the write itself
+                failed.  Skipping the export when the package is missing is the *caller's* policy
+                (:func:`~sbb_pytorch.training.trainer.fit` asks
+                :func:`~sbb_pytorch.training.trainer.safetensors_available`); asking for this file
+                by name and not getting it is an error.
+        """
+        if not safetensors_available():
+            raise CheckpointError(
+                f"cannot write {path}: safetensors support needs the `safetensors` package"
+            )
+        backend = _safetensors_backend()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            backend.save_file(
+                self._safetensors_state(), path, metadata=self._safetensors_metadata()
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise CheckpointError(f"failed to write {path}: {exc}") from exc
+        if write_sidecar and self.config is not None:
+            _sidecar(path).write_text(
+                json.dumps(self.config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        return path
+
+    def _safetensors_state(self) -> dict[str, Tensor]:
+        """``model_state`` as ``save_file`` will accept it: detached, on CPU, contiguous, unshared.
+
+        Three things :func:`torch.save` accepts and safetensors refuses.  An empty state writes a
+        file that loads as a checkpoint with no weights, so it is refused here rather than on read.
+        A non-contiguous tensor has a storage whose bytes are not what their shape claims
+        (``Linear.weight.t()`` is one), so ``contiguous()`` runs first.  And two names sharing one
+        storage -- tied weights, or a state built by assigning the same tensor twice -- is legal in
+        a pickle while safetensors raises ``Some tensors share memory``; the duplicate is cloned, so
+        the file says twice what the model says once and :meth:`apply_to` still accepts it.
+        """
+        if not self.model_state:
+            raise CheckpointError(
+                f"refusing to write an empty model_state as {_SAFETENSORS_SUFFIX}"
+            )
+        tensors: dict[str, Tensor] = {}
+        seen: set[int] = set()
+        for name, parameter in self.model_state.items():
+            tensor = parameter.detach().cpu()
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            if tensor.data_ptr() in seen:
+                tensor = tensor.clone()
+            seen.add(tensor.data_ptr())
+            tensors[name] = tensor
+        return tensors
+
+    def _safetensors_metadata(self) -> dict[str, str]:
+        """The ``__metadata__`` string: every schema field but ``optimizer_state``, as flat keys.
+
+        ``format`` is the key safetensors' own torch helpers look for, and it says ``pt`` because
+        the tensors came from torch -- without it a Hugging Face loader refuses the file.  The rest
+        are flat ``sbb.*`` fields rather than one nested JSON object, so each one can be read on its
+        own and a foreign file carrying none of them still loads (as an unversioned, unattributed
+        checkpoint) instead of failing on a missing key.
+        """
+        return {
+            "format": "pt",
+            "sbb.schema_version": str(self.schema_version),
+            "sbb.package_version": self.package_version,
+            "sbb.task": self.task or "",
+            "sbb.epoch": str(self.epoch),
+            "sbb.step": str(self.step),
+            "sbb.config": (
+                json.dumps(self.config, sort_keys=True) if self.config is not None else ""
+            ),
+            "sbb.metrics": json.dumps(self.metrics, sort_keys=True),
+            "sbb.pytorch_lightning_version": self.pytorch_lightning_version or "",
+        }
+
     @classmethod
     def load(cls, path: str | Path, *, map_location: str | torch.device = "cpu") -> Checkpoint:
-        """Read a checkpoint written by this package, or by any pre-refactor module.
+        """Read a checkpoint, the format chosen by the extension.
 
-        ``torch.load`` is first attempted with ``weights_only=True`` (safe against arbitrary
-        code execution in untrusted files) and retried with ``weights_only=False`` for legacy
-        pickles whose ``config`` holds non-primitive objects.
+        ``.pt``/``.pth``/``.ckpt`` are unpickled by ``torch.load`` -- first with
+        ``weights_only=True`` (safe against arbitrary code execution in untrusted files) and
+        retried with ``weights_only=False`` for legacy pickles whose ``config`` holds non-primitive
+        objects -- and every pre-refactor key spelling is accepted by :meth:`from_dict`.  A
+        ``.safetensors`` path goes to :meth:`load_safetensors`, which needs no such retry because
+        its format has no pickle in it at all.
 
         Raises:
             CheckpointError: the file is missing, unreadable, or contains no weights.
@@ -347,6 +540,8 @@ class Checkpoint:
         path = Path(path)
         if not path.exists():
             raise CheckpointError(f"no checkpoint at {path}")
+        if path.suffix.lower() == _SAFETENSORS_SUFFIX:
+            return cls.load_safetensors(path, map_location=map_location)
         try:
             raw = torch.load(path, map_location=map_location, weights_only=True)
         except Exception:
@@ -360,6 +555,48 @@ class Checkpoint:
         if not isinstance(raw, dict):
             raise CheckpointError(f"{path} contains {type(raw).__name__}, expected a dict")
         return cls.from_dict(raw)
+
+    @classmethod
+    def load_safetensors(
+        cls, path: str | Path, *, map_location: str | torch.device = "cpu"
+    ) -> Checkpoint:
+        """Read a ``.safetensors`` file -- one this package wrote, or any other tool's.
+
+        The tensors come from :func:`safetensors.torch.load_file`, which does not return the file's
+        metadata, so the metadata is opened separately: the flat ``sbb.*`` fields written by
+        :meth:`_safetensors_metadata`` fill in the schema, and a file that carries none of them --
+        a Hugging Face download, say -- becomes ``Checkpoint(model_state=..., schema_version=0,
+        package_version="unknown")``, which is how a foreign file is told from ours rather than
+        rejected.  It is also the only config a ``.safetensors`` can carry, which is why the sidecar
+        that has to sit beside a ``.pt`` is optional here rather than the only readable copy.
+
+        Raises:
+            CheckpointError: the file is missing, holds no tensors, or is not a safetensors file.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise CheckpointError(f"no checkpoint at {path}")
+        backend = _safetensors_backend()
+        device = map_location if isinstance(map_location, str) else str(map_location)
+        try:
+            state = backend.load_file(path, device=device)
+            with backend.safe_open(path, framework="pt") as handle:
+                metadata = handle.metadata() or {}
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise CheckpointError(f"could not load {path}: {exc}") from exc
+        if not state:
+            raise CheckpointError(f"{path} is a {_SAFETENSORS_SUFFIX} file with no tensors")
+        return cls(
+            model_state=dict(state),
+            epoch=_metadata_int(metadata, "sbb.epoch"),
+            step=_metadata_int(metadata, "sbb.step"),
+            task=metadata.get("sbb.task") or None,
+            config=_metadata_json(metadata, "sbb.config"),
+            metrics=_metadata_json(metadata, "sbb.metrics") or {},
+            package_version=metadata.get("sbb.package_version", "unknown"),
+            schema_version=_metadata_int(metadata, "sbb.schema_version", default=0),
+            pytorch_lightning_version=metadata.get("sbb.pytorch_lightning_version") or None,
+        )
 
     def apply_to(
         self,
@@ -449,22 +686,50 @@ def load_into_model(
     return checkpoint
 
 
-def latest_checkpoint(directory: str | Path, pattern: str | None = None) -> Path | None:
-    """Newest checkpoint in ``directory`` by modification time, or ``None`` if there is none.
+def _checkpoint_rank(path: Path, prefer: str | None) -> tuple[int, int, int, float, str]:
+    """The key :func:`latest_checkpoint` minimises: preference, name, extension, then mtime.
 
-    With no ``pattern`` all three extensions in circulation are considered (``.pt``, ``.pth``,
-    ``.ckpt``); pass one to restrict the search. ``mtime`` is used rather than the legacy
-    ``ctime``, which tracks inode changes rather than content changes and reports the wrong
-    file after a copy or a ``git checkout``.
+    ``mtime`` alone answers "which file was touched last", where the question is "which checkpoint
+    is this directory's": ``model.pt`` is the published file and the epoch files are its history, so
+    names are ranked first and times only order the ties.  A file named ``model.<ext>`` outranks its
+    own siblings, and ``prefer`` (fed by ``sbb infer --format``) moves one extension to the front
+    without disturbing the rest of the order.  The name is the last key so two files written in the
+    same second still resolve the same way on every filesystem.
+    """
+    suffix = path.suffix.lower()
+    extension = suffix.lstrip(".")
+    wanted = prefer.lower().lstrip(".") if prefer else None
+    preferred = 0 if wanted and extension == wanted else 1
+    named = 0 if path.name.casefold() == f"model{suffix}" else 1
+    return (
+        preferred,
+        named,
+        _EXT_RANKS.get(extension, len(_EXT_RANKS)),
+        -path.stat().st_mtime,
+        path.name,
+    )
+
+
+def latest_checkpoint(
+    directory: str | Path, pattern: str | None = None, *, prefer: str | None = None
+) -> Path | None:
+    """The checkpoint in ``directory``, ranked by name before modification time; ``None`` if empty.
+
+    With no ``pattern`` every extension in circulation is considered (``.pt``, ``.pth``, ``.ckpt``,
+    ``.safetensors``); pass one to restrict the search.  The order and its reasons are
+    :func:`_checkpoint_rank`'s -- ``model.pt`` before the other torch files before a Lightning
+    ``.ckpt`` before a ``.safetensors``, because only the first two can carry an optimiser state --
+    and ``mtime`` is used rather than the legacy ``ctime``, which tracks inode changes rather than
+    content changes and reports the wrong file after a copy or a ``git checkout``.
     """
     directory = Path(directory)
     if not directory.is_dir():
         return None
-    patterns = [pattern] if pattern else ["*.pt", "*.pth", "*.ckpt"]
+    patterns = [pattern] if pattern else [f"*{ext}" for ext in _PREFERRED_EXTENSIONS]
     candidates = {p for glob in patterns for p in directory.glob(glob) if p.is_file()}
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return min(candidates, key=lambda path: _checkpoint_rank(path, prefer))
 
 
 def prune_checkpoints(directory: str | Path, keep_last_n: int = 5, prefix: str = "") -> list[Path]:
@@ -473,29 +738,38 @@ def prune_checkpoints(directory: str | Path, keep_last_n: int = 5, prefix: str =
     Ordering is numeric on the embedded epoch number when one exists (so ``epoch_10`` is newer
     than ``epoch_2``), falling back to modification time. The legacy implementation sorted the
     filenames as strings, which kept ``epoch_1.pth`` and deleted ``epoch_2.pth``.
+
+    A file with no epoch number sorts after every file that has one.  ``model.pt`` carries no
+    epoch, the old key scored it ``-1`` -- the oldest thing in the directory -- and
+    ``keep_last_n`` deleted the published checkpoint, and with it the file ``sbb infer`` reads,
+    before touching the epoch history it was written from.  A ``.safetensors`` never loses its
+    sidecar on the way out either: that file's config travels inside it, so a
+    ``model_config.json`` beside one is a copy its writer was asked for explicitly and prune does
+    not own it.
     """
     directory = Path(directory)
     if not directory.is_dir():
         return []
 
-    glob = f"{prefix}*.pt" if prefix else "*.pt"
-    files = [p for p in directory.glob(glob) if p.is_file()]
-    for extra in (".pth", ".ckpt"):
-        files += [p for p in directory.glob(f"{prefix}*{extra}") if p.is_file()]
+    files = [
+        p for ext in _PREFERRED_EXTENSIONS for p in directory.glob(f"{prefix}*{ext}") if p.is_file()
+    ]
     files = sorted(set(files))
     if len(files) <= keep_last_n:
         return []
 
-    def sort_key(path: Path) -> tuple[int, float]:
+    def sort_key(path: Path) -> tuple[int, float, float]:
         match = _SCHEME.match(path.name)
-        epoch = int(match.group("epoch")) if match and match.group("epoch") else -1
-        return epoch, path.stat().st_mtime
+        epoch = int(match.group("epoch")) if match and match.group("epoch") else None
+        if epoch is None:
+            return 1, float("inf"), path.stat().st_mtime  # published, so deleted last
+        return 0, float(epoch), path.stat().st_mtime
 
     ordered = sorted(files, key=sort_key)
     deleted = ordered[:-keep_last_n]
     for path in deleted:
         path.unlink()
-        if _sidecar(path).exists():
+        if path.suffix.lower() != _SAFETENSORS_SUFFIX and _sidecar(path).exists():
             _sidecar(path).unlink()
     return deleted
 

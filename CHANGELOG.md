@@ -94,6 +94,22 @@ replacement.
   `early_stopping/val_loss: 3/10` counters `early_stopping_fields` reads off the trainer) and
   `training.callbacks.SBBModelSummary` (the same summary table without its `FLOPs` column and the
   `Total FLOPs: 0` line under it).
+- **`.safetensors` checkpoints: `Checkpoint.save_safetensors` and `Checkpoint.load_safetensors`.**
+  `save()` and `load()` pick the format from the extension now, so a run can publish
+  `model.safetensors` beside `model.pt` without a second schema. The format holds tensors plus one
+  JSON string, so every field except `optimizer_state` moves into `__metadata__` as flat `sbb.*`
+  keys (`format`, `sbb.schema_version`, `sbb.package_version`, `sbb.task`, `sbb.epoch`, `sbb.step`,
+  `sbb.config`, `sbb.metrics`, `sbb.pytorch_lightning_version`) -- which is why a `.safetensors`
+  start means a *fresh* optimizer rather than a resumed one, why a file written by another tool
+  still loads (as `schema_version=0`, `package_version="unknown"`) instead of being refused for the
+  keys it never had, and why a `.safetensors` needs no `_config.json` beside it. `safetensors>=0.4`
+  joins the runtime dependencies behind a `safetensors_available()` guard -- the
+  `tensorboard_available()` shape, so a machine without it is tested by patching one function -- and
+  an explicit `.safetensors` save there is a `CheckpointError` rather than a silent pickle. Writing
+  goes through `detach().cpu().contiguous()` with duplicates found by `data_ptr()` cloned, because
+  safetensors refuses the shared storage (`Some tensors share memory`) and the non-contiguous views
+  (`torch.save` accepts both) -- and an empty `model_state` is refused up front instead of becoming
+  a weightless checkpoint.
 
 ### Changed
 
@@ -182,6 +198,17 @@ replacement.
   `page2label` instead of being left at the top level for `extra="forbid"` to reject. The layout
   tables stay in the file beside them, so `sbb validate` reports the ids above 1 -- the state
   upstream ships; clearing them is the follow-up. `docs/config-reference.json` is regenerated.
+- **`latest_checkpoint` ranks by name and `prune_checkpoints` stops eating `model.pt`.** Ranking one
+  directory by `mtime` answered "which file was touched last" where the question is "which
+  checkpoint is this": `model.pt` is the published file and the epoch files are its history. The
+  order is `model.<ext>`, then the other `.pt`/`.pth`, then `.ckpt`, then `.safetensors`, with
+  `mtime` ordering ties and the filename breaking ties in `mtime` -- and a `prefer=` keyword (which
+  `sbb infer --format` will pass) promotes one extension. `prune_checkpoints` learns
+  `.safetensors` and sorts epoch-less files after every epoch file: `model.pt` has no epoch number,
+  the old key scored it `-1` -- the oldest thing present -- and `keep_last_n` deleted the published
+  checkpoint before the history it was written from. `Checkpoint.save`'s `write_sidecar` becomes
+  `bool | None = None` -- yes for a torch file, no for a safetensors one, whose config is already
+  inside it -- so every existing call site keeps its meaning.
 
 ### Fixed
 

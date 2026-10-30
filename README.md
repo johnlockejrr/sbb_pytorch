@@ -33,6 +33,10 @@ Python 3.10 or newer. `torch` and `torchvision` are declared as dependencies, bu
 choose the right PyTorch build for you -- CPU, cu118, cu121 and ROCm builds all satisfy
 `torch>=2.0`, and only one of them matches your machine. Install the build first, then the package.
 
+`safetensors>=0.4` is a dependency too: `Checkpoint.save`/`load` write and read `.safetensors`
+besides the `.pt` format, and an explicit `.safetensors` request on a machine without the package
+names the missing package instead of quietly writing a pickle.
+
 ## Installation
 
 With [uv](https://docs.astral.sh/uv/) (the setup this repo is developed with):

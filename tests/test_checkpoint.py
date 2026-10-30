@@ -18,6 +18,7 @@ from sbb_pytorch.storage.checkpoint import (
     load_checkpoint,
     load_into_model,
     prune_checkpoints,
+    safetensors_available,
     save_checkpoint,
     write_sidecar_config,
 )
@@ -278,17 +279,232 @@ def test_sidecar_json_written_alongside(tmp_path: Path) -> None:
     assert bare.name == "bare.pt"
 
 
+# ------------------------------------------------------------------ safetensors
+
+needs_safetensors = pytest.mark.skipif(
+    not safetensors_available(), reason="the `safetensors` package is not installed"
+)
+
+
+@needs_safetensors
+def test_safetensors_extension_and_metadata_round_trip(tmp_path: Path) -> None:
+    """Every field but ``optimizer_state`` travels in the file's ``__metadata__`` string."""
+    model = TinyModel()
+    checkpoint = Checkpoint(
+        model_state=dict(model.state_dict()),
+        epoch=7,
+        step=42,
+        task="segmentation",
+        config={"task": "segmentation", "n_classes": 2},
+        optimizer_state={"state": {"momentum_buffer": torch.zeros(1)}},
+        metrics={"val_loss": 0.31},
+        pytorch_lightning_version="2.6.6",
+    )
+    path = checkpoint.save_safetensors(tmp_path / "model.safetensors")
+
+    import safetensors.torch
+
+    with safetensors.torch.safe_open(path, framework="pt") as handle:
+        metadata = handle.metadata() or {}
+    assert metadata["format"] == "pt"
+    assert metadata["sbb.epoch"] == "7"
+    assert metadata["sbb.step"] == "42"
+    assert metadata["sbb.task"] == "segmentation"
+    assert json.loads(metadata["sbb.config"]) == {"task": "segmentation", "n_classes": 2}
+    assert json.loads(metadata["sbb.metrics"]) == {"val_loss": 0.31}
+    assert metadata["sbb.pytorch_lightning_version"] == "2.6.6"
+
+    loaded = Checkpoint.load(path)
+    assert loaded.model_state.keys() == model.state_dict().keys()
+    assert torch.equal(loaded.model_state["conv.weight"], model.conv.weight)
+    assert (loaded.epoch, loaded.step, loaded.task) == (7, 42, "segmentation")
+    assert loaded.config == checkpoint.config
+    assert loaded.metrics == checkpoint.metrics
+    assert loaded.pytorch_lightning_version == "2.6.6"
+    # An optimiser state is a tensor tree, not a string: the one field the format cannot carry.
+    assert loaded.optimizer_state is None
+
+
+@needs_safetensors
+def test_save_dispatches_on_the_extension(tmp_path: Path) -> None:
+    """``save`` writes the format the name asks for, and only a torch file gets a sidecar."""
+    checkpoint = Checkpoint(
+        model_state=dict(TinyModel().state_dict()),
+        task="layout",
+        config={"task": "layout"},
+    )
+
+    torch_path = checkpoint.save(tmp_path / "nested" / "model.pt")
+    assert torch.load(torch_path, weights_only=True)["model_state"].keys()
+    assert (torch_path.parent / "model_config.json").exists()  # the mirror external scripts read
+
+    safetensors_path = checkpoint.save(tmp_path / "model.safetensors")
+    assert safetensors_path.suffix == ".safetensors"
+    assert not (tmp_path / "model_config.json").exists()  # its config travels inside the file
+    assert Checkpoint.load(safetensors_path).config == checkpoint.config
+
+    # Asking for the sidecar explicitly still writes it, and a .pth stays a pickle.
+    assert checkpoint.save(safetensors_path, write_sidecar=True).with_name("model_config.json")
+    assert torch.load(checkpoint.save(tmp_path / "model.pth"), weights_only=True)["model_state"]
+
+
+@needs_safetensors
+def test_safetensors_refuses_an_empty_state_and_reads_a_foreign_file(tmp_path: Path) -> None:
+    """A file with no tensors would load as a checkpoint with no weights, so it is never written."""
+    import safetensors.torch
+
+    with pytest.raises(CheckpointError, match="empty model_state"):
+        Checkpoint(model_state={}).save_safetensors(tmp_path / "empty.safetensors")
+
+    # A file from another tool carries none of our metadata; it loads as unversioned and
+    # unattributed rather than being rejected for the missing keys.
+    safetensors.torch.save_file({"w": torch.ones(2, 2)}, str(tmp_path / "foreign.safetensors"))
+    foreign = Checkpoint.load(tmp_path / "foreign.safetensors")
+    assert foreign.schema_version == 0
+    assert foreign.package_version == "unknown"
+    assert foreign.task is None
+    assert foreign.config is None
+    assert foreign.metrics == {}
+    assert list(foreign.model_state) == ["w"]
+
+    # Tied weights -- two names, one storage -- are legal in a pickle and refused by safetensors.
+    shared = torch.zeros(3)
+    tied = Checkpoint(model_state={"a": shared, "b": shared}).save_safetensors(
+        tmp_path / "tied.safetensors"
+    )
+    loaded = Checkpoint.load(tied)
+    assert {value.data_ptr() for value in loaded.model_state.values()} != ({shared.data_ptr()})
+    assert torch.equal(loaded.model_state["a"], loaded.model_state["b"])
+
+
+def test_save_safetensors_without_the_dependency_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit ``.safetensors`` request is refused when the package is missing (no skipif)."""
+    monkeypatch.setattr("sbb_pytorch.storage.checkpoint.safetensors_available", lambda: False)
+    checkpoint = Checkpoint(model_state=dict(TinyModel().state_dict()))
+    with pytest.raises(CheckpointError, match="needs the `safetensors` package"):
+        checkpoint.save(tmp_path / "model.safetensors")
+    # A torch save is unaffected: the guard sits on the safetensors path alone.
+    assert checkpoint.save(tmp_path / "model.pt", write_sidecar=False).exists()
+
+
+def test_latest_checkpoint_ranks_model_pt_above_every_other_extension(tmp_path: Path) -> None:
+    """``model.pt`` is the checkpoint; the epoch files and other formats are its history."""
+    newest: dict[str, float] = {}
+    for name in (
+        "model.pt",
+        "model.pth",
+        "model.ckpt",
+        "model.safetensors",
+        "run-12.pt",
+        "run-13.pth",
+        "run-14.ckpt",
+        "run-15.safetensors",
+    ):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        newest[name] = time.time() + 100  # every other file is newer than model.pt
+    os.utime(tmp_path / "model.pt", (time.time(), time.time()))
+    for name, stamp in newest.items():
+        if name != "model.pt":
+            os.utime(tmp_path / name, (stamp, stamp))
+
+    assert latest_checkpoint(tmp_path) == tmp_path / "model.pt"
+    assert latest_checkpoint(tmp_path, pattern="*.safetensors") == tmp_path / "model.safetensors"
+
+
+def test_latest_checkpoint_honours_prefer(tmp_path: Path) -> None:
+    """``prefer`` (what ``sbb infer --format`` passes) promotes one extension above the rest."""
+    for name in ("model.pt", "model.safetensors"):
+        (tmp_path / name).write_bytes(b"x")
+
+    assert latest_checkpoint(tmp_path) == tmp_path / "model.pt"
+    assert latest_checkpoint(tmp_path, prefer="safetensors") == tmp_path / "model.safetensors"
+    assert latest_checkpoint(tmp_path, prefer=".pt") == tmp_path / "model.pt"
+    # An extension nothing in the directory has changes nothing rather than returning None.
+    assert latest_checkpoint(tmp_path, prefer="bin") == tmp_path / "model.pt"
+
+
+def test_latest_checkpoint_ties_break_on_name_not_glob_order(tmp_path: Path) -> None:
+    """Two files written in the same second resolve the same way on every filesystem."""
+    stamp = time.time()
+    written = [tmp_path / name for name in ("zeta.pt", "alpha.pt", "model.pt")]
+    for path in written:
+        path.write_bytes(b"x")
+        os.utime(path, (stamp, stamp))
+
+    assert latest_checkpoint(tmp_path) == tmp_path / "model.pt"
+    (tmp_path / "model.pt").unlink()
+    # Same tier, same mtime: the name decides, and it does not depend on glob order.
+    assert latest_checkpoint(tmp_path) == tmp_path / "alpha.pt"
+
+
+def test_prune_adds_the_safetensors_extension_and_spares_the_run_files(tmp_path: Path) -> None:
+    """``model.pt`` used to be the first casualty of ``keep_last_n``: no epoch number, no rank."""
+    now = time.time()
+    for epoch in range(1, 5):
+        path = tmp_path / f"run_epoch_{epoch}.pt"
+        path.write_bytes(b"w")
+        os.utime(path, (now + epoch, now + epoch))
+    published = tmp_path / "model.pt"
+    published.write_bytes(b"w")
+    published_sidecar = published.with_name("model_config.json")
+    published_sidecar.write_text("{}")
+    exported = tmp_path / "model.safetensors"
+    exported.write_bytes(b"w")
+    os.utime(exported, (now + 100, now + 100))
+
+    deleted = prune_checkpoints(tmp_path, keep_last_n=3)
+
+    # Six files, keep three: the three oldest *epoch* files go, and the two published ones --
+    # model.pt and model.safetensors, neither of which has an epoch number -- are kept even though
+    # they are older than every epoch file but one.
+    assert sorted(p.name for p in deleted) == ["run_epoch_1.pt", "run_epoch_2.pt", "run_epoch_3.pt"]
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "model.pt",
+        "model_config.json",
+        "model.safetensors",
+        "run_epoch_4.pt",
+    }
+    assert published.exists() and exported.exists()
+    assert published_sidecar.exists()  # pruned files lose their sidecars; kept files keep theirs
+
+
+def test_prune_never_deletes_a_safetensors_sidecar(tmp_path: Path) -> None:
+    """A ``.safetensors`` holds its config inside, so prune does not own the JSON copy beside it."""
+    now = time.time()
+    for epoch, name in (
+        (1, "run_epoch_1.safetensors"),
+        (2, "run_epoch_2.pt"),
+        (3, "run_epoch_3.pt"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(b"w")
+        os.utime(path, (now + epoch, now + epoch))
+    doomed = tmp_path / "run_epoch_1.safetensors"
+    sidecar = doomed.with_name("run_epoch_1_config.json")  # written by save(write_sidecar=True)
+    sidecar.write_text("{}")
+
+    deleted = prune_checkpoints(tmp_path, keep_last_n=2)
+
+    assert deleted == [doomed]
+    assert not doomed.exists()
+    assert sidecar.exists()  # a .pt's sidecar would have been unlinked with it
+
+
 def test_latest_checkpoint_uses_mtime_not_name(tmp_path: Path) -> None:
     """Legacy code used ``ctime``, which changes on ``git checkout`` and misreports the newest."""
     old = tmp_path / "epoch_99.pt"
-    new = tmp_path / "epoch_1.pth"
+    new = tmp_path / "epoch_1.pt"
     old.write_bytes(b"x")
     new.write_bytes(b"y")
     os.utime(old, (time.time() - 86400, time.time() - 86400))
     os.utime(new, (time.time(), time.time()))
 
+    # Inside one extension the timestamp answers the question, not the number in the name.
     assert latest_checkpoint(tmp_path) == new
-    assert latest_checkpoint(tmp_path, pattern="*.pt") == old  # only .pt considered
+    assert latest_checkpoint(tmp_path, pattern="*.pt") == new  # only .pt considered
     assert latest_checkpoint(tmp_path / "missing_dir") is None
     assert latest_checkpoint(tmp_path.parent / "definitely_absent") is None
 
