@@ -50,7 +50,7 @@ import torch.nn.functional as F
 from sbb_pytorch.config.loaders import load_config
 from sbb_pytorch.config.models import SBBConfig, TaskType
 from sbb_pytorch.device import resolve_device
-from sbb_pytorch.exceptions import ModelBuildError
+from sbb_pytorch.exceptions import CheckpointError, ModelBuildError
 from sbb_pytorch.inference.visualize import enhancement_image, render, save_images
 from sbb_pytorch.models.registry import create_model
 from sbb_pytorch.storage.checkpoint import Checkpoint, latest_checkpoint
@@ -110,7 +110,7 @@ class Prediction:
 
 
 class Predictor:
-    """``sbb infer`` engine: build once from a run directory, then predict on any number of pages.
+    """``sbb infer`` engine: build once from a checkpoint, then predict on any number of pages.
 
     Args:
         model: A constructed model. Usually obtained through :meth:`from_checkpoint`.
@@ -134,36 +134,48 @@ class Predictor:
     @classmethod
     def from_checkpoint(
         cls,
-        model_dir: str | Path,
+        checkpoint: str | Path,
         *,
         config: SBBConfig | str | Path | None = None,
         model: str | None = None,
         device: str | None = "auto",
     ) -> Predictor:
-        """Restore the weights in ``model_dir`` and the configuration saved next to them.
+        """Restore the weights in ``checkpoint`` and the configuration saved with them.
 
         Args:
-            model_dir: A training run directory (``model.pt``, or the newest ``epoch_*.pt``).
+            checkpoint: A checkpoint file -- ``model.pt``, ``best-07-0.9812.ckpt``,
+                ``model.safetensors``, a legacy ``.pth`` -- or the run directory holding one. A file
+                is read as given; a directory goes through
+                :func:`~sbb_pytorch.storage.checkpoint.latest_checkpoint`, which is the same
+                resolution ``sbb infer`` does, so the two cannot disagree about which file a
+                directory means. It used to be ``directory / "model.pt"`` here and
+                ``latest_checkpoint`` in the CLI, and the CLI's answer was thrown away: naming
+                ``run/best-07-0.9812.ckpt`` loaded ``run/model.pt``.
             config: The config used to rebuild the architecture. Omit it to read the
                 ``*_config.json`` sidecar that :class:`~sbb_pytorch.storage.checkpoint.Checkpoint`
-                writes -- which is what lets ``sbb infer --model runs/textline`` work without
-                repeating ``--config``; the legacy script read ``<dir>/config.json`` the same way.
+                writes -- or, for a ``.safetensors``, the ``sbb.config`` its own metadata carries,
+                which is what lets ``sbb infer --model runs/textline`` work without repeating
+                ``--config``; the legacy script read ``<dir>/config.json`` the same way.
             model: Registry key overriding the config-derived architecture (``--model``).
             device: See :class:`Predictor`.
 
         Raises:
-            FileNotFoundError: no checkpoint in ``model_dir``.
-            ModelBuildError: the config names an architecture that cannot be built.
+            CheckpointError: ``checkpoint`` is a directory with no checkpoint in it, or the file
+                itself cannot be read (:meth:`~sbb_pytorch.storage.checkpoint.Checkpoint.load`'s
+                answer -- previously ``TypeError: argument should be a str or an os.PathLike
+                object``, because ``latest_checkpoint`` answers ``None`` and that was passed on).
+            ModelBuildError: the config names an architecture that cannot be built, or a checkpoint
+                carries no config and none was given.
         """
-        directory = Path(model_dir)
-        checkpoint_file = directory / "model.pt"
-        if not checkpoint_file.exists():
-            checkpoint_file = latest_checkpoint(directory)
-        checkpoint = Checkpoint.load(checkpoint_file)
+        path = Path(checkpoint)
+        file = path if path.is_file() else latest_checkpoint(path)
+        if file is None:
+            raise CheckpointError(f"no checkpoint found in {path}")
+        loaded = Checkpoint.load(file)
 
-        resolved = cls._resolve_config(config, checkpoint)
+        resolved = cls._resolve_config(config, loaded)
         built = create_model(resolved, model=model, pretrained=False)
-        checkpoint.apply_to(built)
+        loaded.apply_to(built)
         return cls(built, resolved, device=device)
 
     @staticmethod

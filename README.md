@@ -107,6 +107,7 @@ when the `safetensors` dependency is installed.
 | Option | Meaning |
 | --- | --- |
 | `MODEL` | Run directory (its `model.pt`, else the newest checkpoint) or a checkpoint file |
+| `--format` | Which checkpoint a *directory* means: `pt` (default) or `safetensors`. A `MODEL` that is a file is that file either way -- the bug this flag exists to make reachable was a `Predictor` that rebuilt `directory/model.pt` from whatever path it was handed |
 | `INPUT` / `-i, --input` | Pages to predict on: files and/or directories, repeatable |
 | `-o, --output-dir` | Default `predictions/` beside the checkpoint |
 | `--save / --no-save`, `--save-layout / --no-save-layout` | Which renderings to write; asking for one the task did not produce is an error, not a silently missing file |
@@ -132,7 +133,10 @@ Rewrites a checkpoint into the current schema. The repo had three layouts in sim
 (`model_state`, `model_state_dict`, bare state dicts) and each module could read only one of them;
 `Checkpoint.load` accepts all three and writes `model.pt` plus the `model_config.json` sidecar that
 `sbb infer` reads. This is what `build_model_load_pretrained_weights_and_save.py` -- a Keras script
-in a PyTorch repo -- used to do by hand. `-o` defaults to `model.pt` beside the source.
+in a PyTorch repo -- used to do by hand. `-o` defaults to `model.pt` beside the source, and
+`--format safetensors` writes `model.safetensors` instead -- the same tensors and the same fields
+with no pickle in it, and no `model_config.json` beside it because its config travels inside the
+file. An `-o` that names a file keeps that file's extension whatever `--format` says.
 
 ### `sbb validate CONFIG` and `sbb config-schema`
 

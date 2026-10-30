@@ -120,6 +120,13 @@ replacement.
   one question twice -- `--resume`, an explicit `--pretrained`/`--no-pretrained`, a config whose
   `continue_training` is true -- and `fit` refuses `start_weights` alongside `resume` for the reason
   Lightning itself gives: the start file gets loaded and then overwritten.
+- **`--format {pt,safetensors}` on `sbb infer` and `sbb export`.** On `infer` it names which
+  checkpoint a *directory* means -- `pt` (the default: `model.pt`, then the other `.pt`/`.pth`, then
+  `.ckpt`, then `.safetensors`) or `safetensors` (the exported file) -- and is ignored when `MODEL`
+  is a file, because that file is the answer. On `export` it is the format written:
+  `model.safetensors` beside the source instead of `model.pt`, with no `model_config.json` beside it
+  because a safetensors file carries its own config. An `-o` that names a file keeps that file's
+  extension whatever `--format` says.
 
 ### Changed
 
@@ -303,6 +310,16 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   branch were `pass` statements; `--ground_truth` was documented as a directory, read as a file,
   and its IoU computed and thrown away; `color_images` hard-coded three colours, rendering every
   class from 3 up black.
+- **`sbb infer` loaded a different file than the one it was given.** `cli._resolve_model_path`
+  resolved a checkpoint and then handed its *parent* to `Predictor.from_checkpoint`, which re-derived
+  `directory / "model.pt"` from that -- so `sbb infer run/best-07-0.9812.ckpt page.png` predicted
+  with `run/model.pt`, and a `model.safetensors` could not be used at all because the Predictor went
+  looking for a `model_config.json` beside a file whose config is inside it. A directory with no
+  checkpoint raised `TypeError: argument should be a str or an os.PathLike object` -- from
+  `Checkpoint.load(None)`, which is what `latest_checkpoint` answers -- instead of naming the
+  directory. `from_checkpoint` now takes the file as given, uses `latest_checkpoint` for a directory
+  exactly as the CLI does so the two cannot disagree, and reads the config a `.safetensors` carries
+  in its own metadata.
 - **Ground truth.** The XML namespace prefix was derived as `"PcGts}"` for a namespace-less
   document, leaving `imageHeight`/`imageWidth` unbound; `config_params=None` crashed the layout
   branch although `--config` was documented as ignorable; `case_label` was applied to every region

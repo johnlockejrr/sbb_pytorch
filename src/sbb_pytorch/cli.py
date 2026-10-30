@@ -531,6 +531,14 @@ def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -
     type=click.Path(exists=True, path_type=Path),
     help="Another file or directory of pages; repeatable.",
 )
+@click.option(
+    "--format",
+    "file_format",
+    type=click.Choice(["pt", "safetensors"]),
+    default=None,
+    help="Which checkpoint a MODEL *directory* means; default model.pt, then the other .pt/.pth, "
+    "then .ckpt, then .safetensors. Ignored when MODEL is a file -- that file is the answer.",
+)
 @click.option("-o", "--output-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option(
     "--save/--no-save",
@@ -601,6 +609,7 @@ def infer(
     model: Path,
     inputs: tuple[Path, ...],
     extra_inputs: tuple[Path, ...],
+    file_format: str | None,
     output_dir: Path | None,
     save: bool | None,
     save_layout: bool,
@@ -622,6 +631,10 @@ def infer(
     repeating every option the training run used -- the legacy script needed
     ``--config --model --input --output`` every single time.
 
+    ``--format`` says which checkpoint a MODEL *directory* means: ``pt`` (``model.pt``, then the
+    other ``.pt``/``.pth`` files) is the default and ``safetensors`` takes the exported file
+    instead. A MODEL that is a file is that file whatever ``--format`` says.
+
     ``--ground-truth`` adds the per-page IoU/accuracy/Dice the legacy script computed and never
     printed; ``--overlap`` tunes the sliding window ``--patches`` builds. Without ``--save`` or
     ``--no-save``, the config's ``save_visualisation`` decides what gets written. ``--xml-file``
@@ -631,9 +644,12 @@ def infer(
     requires one, and a page built from a mask has no file to take it from.
     """
     state: GlobalState = ctx.obj
-    checkpoint = _resolve_model_path(model)
+    # One resolution, handed to the predictor as a file: it used to resolve the file here and then
+    # pass its parent to a Predictor that re-derived ``model.pt`` from that -- so naming
+    # run/best-07-0.9812.ckpt on the command line loaded run/model.pt.
+    checkpoint = _resolve_model_path(model, prefer=file_format)
     predictor = Predictor.from_checkpoint(
-        checkpoint.parent if checkpoint.is_file() else checkpoint,
+        checkpoint,
         config=config_path,
         model=architecture,
         device=device,
@@ -1110,16 +1126,19 @@ def _score_prediction(prediction: Prediction, source: Path, ground_truth: Path) 
         raise click.ClickException(f"cannot score {source.name}: {exc}") from exc
 
 
-def _resolve_model_path(model: Path) -> Path:
+def _resolve_model_path(model: Path, *, prefer: str | None = None) -> Path:
     """The checkpoint ``sbb infer`` and ``sbb export`` were pointed at.
 
-    A directory means ``model.pt`` if present, else the newest checkpoint in it -- the resolution
-    :class:`~sbb_pytorch.inference.predictor.Predictor.from_checkpoint` does itself, done here so
-    a missing file is reported before torch is imported and a model is built.
+    A file is the answer as given -- the half ``Predictor.from_checkpoint`` used to get wrong by
+    rebuilding ``directory / "model.pt"`` from its parent, so a named file was loaded as its
+    neighbour. A directory means ``model.pt`` if present, else the newest checkpoint in it, ranked
+    by :func:`~sbb_pytorch.storage.checkpoint.latest_checkpoint`; ``prefer`` (``--format``) promotes
+    one extension instead of following that order. Resolving here, before either command builds
+    anything, is what makes a missing file one message instead of a torch import and a traceback.
     """
     if model.is_file():
         return model
-    found = latest_checkpoint(model)
+    found = latest_checkpoint(model, prefer=prefer)
     if found is None:
         raise CheckpointError(f"no checkpoint found in {model}")
     return found
@@ -1519,10 +1538,19 @@ def gt_reading_order(
     "dest",
     type=click.Path(dir_okay=True, file_okay=True, allow_dash=False, path_type=Path),
     default=None,
-    help="Target file or directory; default: model.pt beside the source.",
+    help="Target file or directory; default: model.<format> beside the source.",
 )
-def export(checkpoint: Path, dest: Path | None) -> None:
-    """Rewrite a legacy ``.pth``/``.ckpt`` into the current ``model.pt`` schema.
+@click.option(
+    "--format",
+    "file_format",
+    type=click.Choice(["pt", "safetensors"]),
+    default="pt",
+    help="Format written. Also picks which checkpoint a CHECKPOINT *directory* is the source of "
+    "(model.pt for pt, model.safetensors for safetensors); a CHECKPOINT that is a file is that file "
+    "either way. An -o that names a file keeps its own extension whatever this says.",
+)
+def export(checkpoint: Path, dest: Path | None, file_format: str) -> None:
+    """Rewrite a legacy ``.pth``/``.ckpt`` into the current schema.
 
     ``build_model_load_pretrained_weights_and_save.py`` did this by hand: it built a model, loaded
     weights, and saved them under a key the next script had to guess.
@@ -1530,15 +1558,26 @@ def export(checkpoint: Path, dest: Path | None) -> None:
     (``model_state_dict``, ``state_dict``, ``model``, a bare state dict) into the
     :class:`~sbb_pytorch.storage.checkpoint.Checkpoint` schema and writes the ``*_config.json``
     sidecar every other reader expects, so an old run becomes something ``sbb infer`` accepts.
+
+    ``--format safetensors`` writes ``model.safetensors`` instead of ``model.pt`` -- the same
+    tensors and the same fields, in the format that has no pickle in it and needs no sidecar because
+    its config travels inside the file. The target is then ``model.safetensors`` beside the source
+    (or inside ``-o``, when ``-o`` names a directory); when ``-o`` names a file, that name is the
+    answer and its extension is the format, which is why ``-o model.pt --format safetensors`` writes
+    a ``.pt``.
     """
-    source = checkpoint if checkpoint.is_file() else _resolve_model_path(checkpoint)
+    source = (
+        checkpoint if checkpoint.is_file() else _resolve_model_path(checkpoint, prefer=file_format)
+    )
     # A pre-schema file loads as ``schema_version=0`` / ``package_version="unknown"`` -- true of
     # the file that was read, false of the one being written. This file *is* schema 1 and this
     # package wrote it, so the two fields are re-stamped before the save.
     payload = replace(load_checkpoint(source), schema_version=1, package_version=__version__)
-    target = Path(dest) if dest is not None else source.parent
-    if target.is_dir():
-        target = target / "model.pt"
+    target = (
+        Path(dest)
+        if dest is not None and not dest.is_dir()
+        else (Path(dest) if dest is not None else source.parent) / f"model.{file_format}"
+    )
     written = payload.save(target)
     click.secho(f"wrote {written}", fg="green")
     click.echo(f"  task             {payload.task or 'unknown'}")

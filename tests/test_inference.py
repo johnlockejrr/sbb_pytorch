@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from sbb_pytorch.config.models import SBBConfig
+from sbb_pytorch.exceptions import CheckpointError
 from sbb_pytorch.gt.render import DEFAULT_LABEL_PALETTE
 from sbb_pytorch.inference import (
     Prediction,
@@ -27,8 +28,14 @@ from sbb_pytorch.inference import (
 )
 from sbb_pytorch.inference.visualize import enhancement_image
 from sbb_pytorch.models import ResNet50UNet
-from sbb_pytorch.storage.checkpoint import Checkpoint
+from sbb_pytorch.storage.checkpoint import Checkpoint, safetensors_available
 from sbb_pytorch.storage.images import imwrite, read_image
+
+#: ``tests/test_checkpoint.py`` and ``tests/test_training.py`` use the same marker; a machine
+#: without the package skips the tests that need it rather than failing them.
+needs_safetensors = pytest.mark.skipif(
+    not safetensors_available(), reason="needs the safetensors package"
+)
 
 
 class StubModel(nn.Module):
@@ -207,6 +214,57 @@ def test_from_checkpoint_rebuilds_the_model_from_the_saved_config(tmp_path: Path
     predictor = Predictor.from_checkpoint(tmp_path)
     assert predictor.config.n_classes == 3
     assert isinstance(predictor.model, ResNet50UNet)
+
+
+def test_from_checkpoint_accepts_a_file_and_a_directory(tmp_path: Path) -> None:
+    """A file is read as given; a directory goes through the ranking ``sbb infer`` uses.
+
+    ``cli._resolve_model_path`` used to resolve the file and then hand its *parent* to a Predictor
+    that re-derived ``directory / "model.pt"`` from it, so ``sbb infer run/best-07-0.9812.ckpt``
+    loaded ``run/model.pt`` and ``--architecture`` was the only way to say otherwise. The two files'
+    configs are what say which one was read here: the same weights, two answers.
+    """
+    built = ResNet50UNet(3, 8, 8, pretrained=False)
+    run = tmp_path / "run"
+    run.mkdir()
+    Checkpoint(model_state=built.state_dict(), config=make(n_epochs=5).model_dump(), epoch=5).save(
+        run / "model.pt"
+    )
+    Checkpoint(model_state=built.state_dict(), config=make(n_epochs=9).model_dump(), epoch=9).save(
+        run / "best-07-0.9812.ckpt"
+    )
+
+    # the file as given, not the one a directory would resolve to
+    assert Predictor.from_checkpoint(run / "best-07-0.9812.ckpt").config.n_epochs == 9
+    assert Predictor.from_checkpoint(str(run / "best-07-0.9812.ckpt")).config.n_epochs == 9
+    # the directory: latest_checkpoint's ranking, which is model.pt
+    assert Predictor.from_checkpoint(run).config.n_epochs == 5
+
+
+@needs_safetensors
+def test_from_checkpoint_reads_the_config_from_the_safetensors_metadata(tmp_path: Path) -> None:
+    """A ``.safetensors`` has no ``*_config.json`` beside it -- its config is in the file's own
+    metadata -- and that is enough to rebuild the architecture, exactly like the sidecar."""
+    built = ResNet50UNet(3, 8, 8, pretrained=False)
+    checkpoint = Checkpoint(
+        model_state=built.state_dict(), config=make(n_epochs=4).model_dump(), epoch=4
+    )
+    path = tmp_path / "model.safetensors"
+    checkpoint.save_safetensors(path)  # no sidecar, by design
+    assert not (tmp_path / "model_config.json").exists()
+
+    predictor = Predictor.from_checkpoint(path)
+    assert predictor.config.n_epochs == 4
+    assert isinstance(predictor.model, ResNet50UNet)
+
+
+def test_from_checkpoint_reports_a_directory_without_a_checkpoint(tmp_path: Path) -> None:
+    """``latest_checkpoint`` answers ``None`` for an empty directory and that used to be passed
+    straight to ``Checkpoint.load``, whose ``Path(None)`` raised ``TypeError``."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(CheckpointError, match=f"no checkpoint found in {empty}"):
+        Predictor.from_checkpoint(empty)
 
 
 # ------------------------------------------------------------------------ rendering

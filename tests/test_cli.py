@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -30,9 +31,15 @@ from sbb_pytorch.exceptions import ConfigError
 from sbb_pytorch.gt import contour_bbox, parse_pagexml
 from sbb_pytorch.inference import Prediction
 from sbb_pytorch.models import create_model
-from sbb_pytorch.storage import load_checkpoint, save_checkpoint
+from sbb_pytorch.storage import Checkpoint, load_checkpoint, safetensors_available, save_checkpoint
 from sbb_pytorch.storage.images import imwrite, read_mask
 from sbb_pytorch.training.callbacks import build_callbacks, load_callbacks_file
+
+#: The safetensors half of ``infer``/``export`` is skipped, not failed, where the package is
+#: missing -- the same marker ``tests/test_checkpoint.py`` and ``tests/test_inference.py`` define.
+needs_safetensors = pytest.mark.skipif(
+    not safetensors_available(), reason="needs the safetensors package"
+)
 
 SIZE = 32
 BASE: dict[str, object] = {
@@ -516,6 +523,54 @@ def test_infer_reads_the_architecture_from_the_checkpoint_unless_overridden(
     assert "Error:" in bad.output
 
 
+@needs_safetensors
+def test_infer_accepts_a_safetensors_checkpoint(
+    runner: CliRunner, tmp_path: Path, light_model
+) -> None:
+    """``sbb infer run/model.safetensors page.png`` -- a file with no ``model_config.json`` beside
+    it, because its config is in the file's own ``__metadata__``, and that is enough to rebuild."""
+    import safetensors.torch
+
+    exported = tmp_path / "model.safetensors"
+    Checkpoint(
+        model_state=light_model.state_dict(),
+        config=SBBConfig.model_validate(BASE).model_dump(mode="json"),
+        task="segmentation",
+        epoch=3,
+    ).save_safetensors(exported)
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+
+    result = invoke(runner, "infer", exported, str(page), "--no-save")
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "model_config.json").exists()  # the sidecar is inside the file now
+    with safetensors.torch.safe_open(exported, framework="pt") as handle:
+        assert handle.metadata()["sbb.task"] == "segmentation"
+
+
+def test_infer_format_flag_picks_the_extension(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--format`` says which checkpoint a directory means; left alone, ``model.pt`` and then the
+    other ``.pt``/``.pth`` outrank a ``.safetensors``. The stub records the path it was handed, so
+    the assertion is about the CLI's resolution -- and the two files are one byte each on purpose."""
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "model.ckpt").write_bytes(b"x")
+    (run / "model.safetensors").write_bytes(b"x")
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    stub = _stub_predictor(
+        monkeypatch,
+        Prediction(task=TaskType.SEGMENTATION, mask=np.zeros((SIZE, SIZE), dtype=np.uint8)),
+    )
+
+    invoke(runner, "infer", run, str(page), "--no-save")
+    assert stub.seen[-1] == str(run / "model.ckpt")  # the ranking, which the flag then overrides
+    invoke(runner, "infer", run, str(page), "--no-save", "--format", "safetensors")
+    assert stub.seen[-1] == str(run / "model.safetensors")
+
+
 def test_infer_overlap_reaches_the_sliding_window(
     runner: CliRunner, tmp_path: Path, run_dir: Path
 ) -> None:
@@ -573,30 +628,35 @@ def test_infer_ground_truth_refuses_a_task_with_no_mask(runner: CliRunner, tmp_p
     assert "gave no mask for task=classification" in result.output
 
 
-def _stub_predictor(monkeypatch: pytest.MonkeyPatch, prediction: Prediction) -> None:
+def _stub_predictor(monkeypatch: pytest.MonkeyPatch, prediction: Prediction) -> type:
     """Answer every page with *prediction*, so the assertion is about the XML and not the weights.
 
     The ``--xml-file`` tests need to know the mask to know the regions a run should write, and the
     session's model is untrained -- its mask would say nothing about the writer. The stub mirrors
     the two methods the command calls (:meth:`~sbb_pytorch.inference.Predictor.from_checkpoint` and
     :meth:`~sbb_pytorch.inference.Predictor.predict_file`) and nothing else, so a signature change
-    on the real predictor breaks these exactly as it breaks the other ``infer`` tests.
+    on the real predictor breaks these exactly as it breaks the other ``infer`` tests. The class is
+    returned, and it remembers the checkpoint each call was handed -- which is how the ``--format``
+    test checks the CLI's answer rather than the model's.
     """
 
     class Stub:
         config = SBBConfig.model_validate(BASE)
+        seen: ClassVar[list[str]] = []
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         @classmethod
-        def from_checkpoint(cls, *_args: object, **_kwargs: object) -> Stub:
+        def from_checkpoint(cls, checkpoint: object, **_kwargs: object) -> Stub:
+            cls.seen.append(str(checkpoint))
             return cls()
 
         def predict_file(self, path: str | Path, **_kwargs: object) -> Prediction:
             return replace(prediction, path=Path(path))
 
     monkeypatch.setattr(cli, "Predictor", Stub)
+    return Stub
 
 
 def test_infer_xml_file_writes_the_regions_the_prediction_found(
@@ -720,6 +780,50 @@ def test_export_normalises_a_legacy_pth_into_model_pt(
     assert exported.schema_version == 1 and exported.package_version == __version__
     assert exported.model_state.keys() == light_model.state_dict().keys()
     assert "parameters" in result.output and "config embedded" in result.output
+
+
+@needs_safetensors
+def test_export_writes_safetensors_when_asked(
+    runner: CliRunner, tmp_path: Path, light_model
+) -> None:
+    """``--format safetensors`` writes ``model.safetensors``: the same tensors and the same fields,
+    in the format with no pickle in it -- so the re-stamped schema and package versions are read
+    from the file's metadata, which is the only place they can live there."""
+    import safetensors.torch
+
+    legacy = tmp_path / "old" / "weights.pth"
+    legacy.parent.mkdir()
+    torch.save({"model_state_dict": light_model.state_dict()}, legacy)
+
+    result = invoke(runner, "export", legacy, "--format", "safetensors")
+    assert result.exit_code == 0, result.output
+    target = legacy.parent / "model.safetensors"
+    assert target.exists()
+    with safetensors.torch.safe_open(target, framework="pt") as handle:
+        metadata = handle.metadata()
+    assert metadata is not None
+    assert metadata["format"] == "pt"
+    assert metadata["sbb.schema_version"] == "1"
+    assert metadata["sbb.package_version"] == __version__  # the re-stamp travels into the file
+    assert not (legacy.parent / "model_config.json").exists()  # no sidecar for this format
+
+
+def test_export_dash_o_extension_wins_over_format(
+    runner: CliRunner, tmp_path: Path, light_model
+) -> None:
+    """``-o model.pt --format safetensors``: a named file's own extension is the answer, and
+    ``--format`` only names the file when ``-o`` names a directory or nothing at all."""
+    legacy = tmp_path / "old" / "weights.pth"
+    legacy.parent.mkdir()
+    torch.save({"model_state_dict": light_model.state_dict()}, legacy)
+    named = tmp_path / "out" / "model.pt"
+    named.parent.mkdir()
+
+    result = invoke(runner, "export", legacy, "-o", named, "--format", "safetensors")
+    assert result.exit_code == 0, result.output
+    assert named.exists()
+    assert not (tmp_path / "out" / "model.safetensors").exists()
+    assert load_checkpoint(named).schema_version == 1
 
 
 def test_export_reports_a_directory_with_no_checkpoint(runner: CliRunner, tmp_path: Path) -> None:
