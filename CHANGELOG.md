@@ -41,8 +41,9 @@ replacement.
   builder; `training/callbacks.py` derives its monitored metrics from what the module actually
   logs; `training/trainer.py` assembles `pl.Trainer` and the `fit` the CLI calls.
 - `models/base.py`: one `UNetDecoder` plus four thin assemblies and a `MODEL_REGISTRY` of seven
-  architectures, replacing seven classes built from five copied decoders. `pairing="legacy"`
-  reproduces the old off-by-one skip pairing so old checkpoints still load.
+  architectures, replacing seven classes built from five copied decoders. It builds the one skip
+  pairing the upstream model uses -- each block with the encoder level of the same name,
+  `[f5, f4, f3, f2, f1]` -- rather than the port's `[f5, f3, f2, f1, f1]`.
 - `metrics/`: one `Metric` interface over `functional.py`, `segmentation.py` and `enhance.py`,
   replacing five ways of computing two numbers. `losses.py` is now a thin `nn.Module` layer over
   it, and the losses that existed only as plain functions (`SoftDiceLoss`, `TverskyLoss`,
@@ -127,9 +128,15 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   and runs a `Conv2D(32, 3x3) + BatchNormalization + ReLU` at full resolution, then normalises the
   logits on segmentation tasks -- so a "full resolution" prediction was an interpolation of a
   prediction made at `H/4`. `models.base.SegmentationHead` is that stage, composed by every
-  segmentation model; `pairing="legacy"` keeps the bare conv its checkpoints hold (`head.weight`
-  becomes `head.classify.weight`), and `LIGHT_DECODER_CHANNELS` takes the widths the light decoder
-  really has now that its 32-channel conv has moved back into the head.
+  segmentation model -- so the head's parameters are `head.fusion.*`, `head.classify.weight` and
+  `head.norm.*` where the port had only `head.weight`/`head.bias` -- and
+  `LIGHT_DECODER_CHANNELS` takes the widths the light decoder really has now that its 32-channel
+  conv has moved back into the head.
+- **The encoder's tap points.** `ResNetEncoder` takes `f1` from `conv1 -> bn -> relu` at `H/2` and
+  lets `maxpool` begin level 1, as upstream does, rather than putting the pool in the stem: the
+  pyramid is now the clean `2, 4, 8, 16, 32`, which is what lets the head's upsample be a real 2x.
+  `layer1`'s parameters move from `levels.1.*` to `levels.1.1.*`, and no checkpoint of ours exists
+  to invalidate.
 - **Training.** `torch.save({... "val_acc": trainer.callback_metrics["val_acc"]})` raised `KeyError`
   *after* a full run for any task that does not log it, throwing away the result.
   `config.precision`, `config.accumulate_grad_batches` and `config.gradient_clip_val` were read by

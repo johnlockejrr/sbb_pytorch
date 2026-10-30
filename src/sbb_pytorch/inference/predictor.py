@@ -139,7 +139,6 @@ class Predictor:
         config: SBBConfig | str | Path | None = None,
         model: str | None = None,
         device: str | None = "auto",
-        pairing: str = "aligned",
     ) -> Predictor:
         """Restore the weights in ``model_dir`` and the configuration saved next to them.
 
@@ -151,8 +150,6 @@ class Predictor:
                 repeating ``--config``; the legacy script read ``<dir>/config.json`` the same way.
             model: Registry key overriding the config-derived architecture (``--model``).
             device: See :class:`Predictor`.
-            pairing: Decoder skip pairing; ``"legacy"`` for checkpoints trained against the old
-                ``models_pytorch.ResNet50UNet``.
 
         Raises:
             FileNotFoundError: no checkpoint in ``model_dir``.
@@ -165,7 +162,7 @@ class Predictor:
         checkpoint = Checkpoint.load(checkpoint_file)
 
         resolved = cls._resolve_config(config, checkpoint)
-        built = create_model(resolved, model=model, pretrained=False, pairing=pairing)
+        built = create_model(resolved, model=model, pretrained=False)
         checkpoint.apply_to(built)
         return cls(built, resolved, device=device)
 

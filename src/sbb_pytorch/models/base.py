@@ -19,11 +19,11 @@ pass. The one variant that ran (``ResNet50UNet``) worked only because it special
 
 :class:`UNetDecoder` here is the single implementation the whole package uses. It pairs each
 decoder block with the encoder feature map of the *same* level (the
-`segmentation-models <https://github.com/qubvel-org/segmentation_models.pytorch>`_ convention),
-sizes every fusion by ``F.interpolate`` to the skip's actual shape rather than assuming a clean
-pyramid (levels 0 and 1 of a torchvision ResNet are both at ``H/4``, so
-``Upsample(scale_factor=2)`` is wrong for one of them), and exposes ``pairing="legacy"`` so
-checkpoints trained against ``ResNet50UNet``'s off-by-one decoder still load.
+`segmentation-models <https://github.com/qubvel-org/segmentation_models.pytorch>`_ convention,
+and the pairing the upstream model uses), sized by ``F.interpolate`` to the skip's actual shape
+instead of a fixed ``Upsample(scale_factor=2)`` -- exact for any input size, including the ones
+that are not a clean power of two. The port's second shape, ``pairing="legacy"``, is gone: it
+reproduced the off-by-one decoder only so its checkpoints could be loaded, and there are none.
 
 Three more cross-cutting fixes live here:
 
@@ -31,8 +31,8 @@ Three more cross-cutting fixes live here:
   optimiser setting and now lives in ``training/factory.py``.
 * The head dropped the upstream ``Conv2D(32, 3x3)`` that fuses the input image at full
   resolution and only then predicts a class map, so the shipped models were an interpolation of
-  an ``H/4`` prediction rather than a prediction. :class:`SegmentationHead` rebuilds that stage
-  (plus the segmentation-only ``BatchNormalization`` on the logits) for ``pairing="aligned"``.
+  a downsampled prediction rather than a prediction. :class:`SegmentationHead` rebuilds that
+  stage, plus the segmentation-only ``BatchNormalization`` on the logits, on every model.
 * The legacy models disagreed about activations: ``ResNet50UNet`` returned raw logits for
   segmentation and ``sigmoid`` otherwise, while ``ResNet50UNetLight`` and both ViT variants
   returned ``softmax``. A ``CrossEntropyLoss`` on softmaxed logits normalises twice, so those
@@ -43,34 +43,32 @@ Three more cross-cutting fixes live here:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
 
-from sbb_pytorch.config.models import TaskType
-
 __all__ = [
     "RESNET_LEVELS",
     "RESNET_STRIDES",
     "AttentionBlock",
     "ConvBlock",
+    "FUSION_CHANNELS",
     "ResNetEncoder",
     "SegmentationHead",
     "UNetDecoder",
     "probs",
     "resize_to_input",
-    "resolve_head",
 ]
 
-Pairing = Literal["aligned", "legacy"]
+#: The width of the head's fusion conv -- ``32`` on every upstream model, full and light alike.
+FUSION_CHANNELS: int = 32
 
 #: ``{variant: (channels per level, shallowest -> deepest)}`` for the supported ResNets.
-#: Level 0 is the stem (``conv1 -> bn -> relu -> maxpool``) and level 1 the first residual
-#: stage; both are 4x smaller than the input because ``maxpool`` lives inside the stem and
-#: ``layer1`` does not downsample, which is why the pyramid is not a clean halving per level.
+#: Level 0 is ``conv1 -> bn -> relu``, level 1 ``maxpool -> layer1`` and levels 2-4 the remaining
+#: residual stages -- the tap points the upstream model uses, so ``layer1``'s parameters live at
+#: ``levels.1.1.*`` rather than the ``levels.1.*`` a plain torchvision stem would give them.
 RESNET_LEVELS: dict[str, tuple[int, ...]] = {
     "resnet18": (64, 64, 128, 256, 512),
     "resnet34": (64, 64, 128, 256, 512),
@@ -79,16 +77,16 @@ RESNET_LEVELS: dict[str, tuple[int, ...]] = {
 }
 
 #: Downsampling factor from the model input to each level's output, same order as the values in
-#: :data:`RESNET_LEVELS`: the stem halves twice (``conv1`` stride 2 + ``maxpool`` stride 2) and
-#: only ``layer2``-``layer4`` halve again, so levels 0 and 1 share ``H/4`` and the deepest is
-#: ``H/32``. Every ResNet variant shares this pyramid.
+#: :data:`RESNET_LEVELS`: ``2, 4, 8, 16, 32``, one halving per level, because level 0 is
+#: ``conv1`` alone (stride 2) and the ``maxpool`` (stride 2) that starts level 1 does the second.
+#: Every ResNet variant shares this pyramid.
 #:
 #: This constant exists because ``models/vit.py`` used to compute the deepest map as
 #: ``height // 2**stage`` -- ``H/16``, a factor off for a *stride-2 stem*, so a model built for
 #: a 448x448 page sized its position embeddings for a 28x28 grid while the encoder actually
 #: produced 14x14. Any code that needs a feature-map size asks here (or the encoder's own
 #: :attr:`ResNetEncoder.strides`) instead of re-deriving it.
-RESNET_STRIDES: tuple[int, ...] = (4, 4, 8, 16, 32)
+RESNET_STRIDES: tuple[int, ...] = (2, 4, 8, 16, 32)
 
 
 def probs(logits: torch.Tensor, task_binary: bool = False) -> torch.Tensor:
@@ -168,109 +166,58 @@ class AttentionBlock(nn.Module):
         return x * spatial
 
 
-def resolve_head(
-    image_fusion: bool | None = None,
-    pairing: Pairing = "aligned",
-    logits_norm: bool | None = None,
-    task: TaskType | None = None,
-) -> tuple[bool, bool]:
-    """The two head rules -- ``(image_fusion, logits_norm)`` -- in the one place they are stated.
-
-    An unset ``image_fusion`` follows the pairing: only the aligned head exists upstream, so a
-    legacy head stays the bare ``Conv2d`` its checkpoint was written against. An unset
-    ``logits_norm`` follows upstream's own rule, ``task == "segmentation"``, but only on a fused
-    head -- and asking for a norm on an unfused one is refused rather than ignored, because it
-    adds parameters the checkpoint that pairing exists to load cannot supply.
-
-    Raises:
-        ValueError: ``image_fusion`` on a pairing that has no fusion weights, or ``logits_norm``
-            without ``image_fusion``.
-    """
-    fused = pairing == "aligned" if image_fusion is None else bool(image_fusion)
-    if fused and pairing != "aligned":
-        raise ValueError(
-            f"image_fusion needs pairing='aligned', got {pairing!r}: that pairing reproduces the "
-            "class the checkpoint came from, and its head has no fusion weights to fill"
-        )
-    normalise = (
-        fused and task is TaskType.SEGMENTATION if logits_norm is None else bool(logits_norm)
-    )
-    if normalise and not fused:
-        raise ValueError(
-            "logits_norm needs image_fusion: the unfused head is the bare Conv2d its checkpoints "
-            "were written against, and a BatchNorm2d has no weights there"
-        )
-    return fused, normalise
-
-
 class SegmentationHead(nn.Module):
-    """The output stage every segmentation model shares: optional image fusion, then the 1x1.
+    """The upstream output stage: fuse the image at full resolution, then predict with a 1x1.
 
-    ``image_fusion=True`` is the Keras tail -- ``unet_decoder`` in the upstream
-    ``training/models.py:294-306``, the same six lines on every architecture they ship:
-    upsample the decoder output to the image, ``concatenate([o, img])``,
-    ``Conv2D(32, 3x3) -> BatchNormalization -> ReLU``, then ``Conv2D(n_classes, 1x1)``. The
-    0.1.0 port dropped that stage and resized the ``H/4`` logits to the input instead, so the
-    class conv never looked at a single input pixel -- a one-pixel textline became a blur, and
-    the "prediction" at full resolution was an interpolation of a prediction at a quarter of it.
+    This is ``unet_decoder``'s tail in the upstream ``training/models.py:294-306``, the same six
+    lines on every architecture they ship, ``resnet50_unet`` and ``resnet50_unet_light`` alike::
 
-    ``logits_norm`` is the ``BatchNormalization`` upstream puts on the logits when
-    ``task == "segmentation"`` and omits on the sigmoid tasks, which is why it is a flag rather
-    than part of the convolution.
+        o = UpSampling2D((2, 2), interpolation="bilinear")(o)   # to the image's own size
+        o = concatenate([o, img])                                # the input pixels themselves
+        o = Conv2D(32, (3, 3), padding="valid") -> BN -> ReLU    # FUSION_CHANNELS
+        o = Conv2D(n_classes, (1, 1))                            # then BN if task == segmentation
+
+    The port had only the ``Conv2D(n_classes, 1x1)``, run on the decoder's map and resized
+    afterwards, so a "full resolution" class map was an interpolation of a prediction that had
+    never looked at an input pixel -- a one-pixel textline became a blur.
 
     Args:
-        in_channels: Channels the decoder hands over.
+        in_channels: Channels the decoder hands over; the head consumes ``in_channels + 3`` once
+            the image is concatenated.
         n_classes: Head width.
-        image_fusion: Fuse the input image at full resolution before the class conv. Needs a
-            3-channel input, and it is what a ``pairing="aligned"`` model must build to be the
-            upstream network at all.
-        fusion_channels: Width of the fusion conv; upstream uses ``32`` on every model.
-        logits_norm: Apply ``BatchNorm2d(n_classes)`` to the logits.
+        logits_norm: ``BatchNorm2d(n_classes)`` on the logits -- upstream's
+            ``if task == "segmentation"``, which the caller resolves from the task.
 
     Raises:
-        ValueError: if a channel count is not positive, or fusion was asked for on a model whose
-            input is not 3 channels.
+        ValueError: if ``in_channels`` or ``n_classes`` is not positive, or the input given to
+            ``forward`` is not 3 channels.
     """
 
-    def __init__(
-        self,
-        in_channels: int,
-        n_classes: int,
-        *,
-        image_fusion: bool = False,
-        fusion_channels: int = 32,
-        logits_norm: bool = False,
-    ) -> None:
+    def __init__(self, in_channels: int, n_classes: int, *, logits_norm: bool = False) -> None:
         super().__init__()
-        if min(in_channels, n_classes, fusion_channels) < 1:
+        if in_channels < 1 or n_classes < 1:
             raise ValueError(
-                f"channel counts must be positive, got in={in_channels} classes={n_classes} "
-                f"fusion={fusion_channels}"
+                f"channel counts must be positive, got in={in_channels} classes={n_classes}"
             )
         self.n_classes = int(n_classes)
-        self.image_fusion = image_fusion
-        if image_fusion:
-            self.fusion: ConvBlock | None = ConvBlock(in_channels + 3, int(fusion_channels))
-            head_in = int(fusion_channels)
-        else:
-            self.fusion = None
-            head_in = int(in_channels)
-        self.classify = nn.Conv2d(head_in, self.n_classes, kernel_size=1)
+        self.fusion = ConvBlock(in_channels + 3, FUSION_CHANNELS)
+        self.classify = nn.Conv2d(FUSION_CHANNELS, self.n_classes, kernel_size=1)
         self.norm = nn.BatchNorm2d(self.n_classes) if logits_norm else None
 
     def forward(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
-        """``features`` is the decoder output, ``image`` the model input it must line up with."""
-        size = (image.shape[-2], image.shape[-1])
-        if self.fusion is None:
-            logits = resize_to_input(self.classify(features), size)
-        else:
-            if image.shape[1] != 3:
-                raise ValueError(
-                    f"{type(self).__name__} fuses the input image into the head, so it needs 3 "
-                    f"input channels, got {image.shape[1]}"
-                )
-            fused = torch.cat((resize_to_input(features, size), image), dim=1)
-            logits = self.classify(self.fusion(fused))
+        """``features`` is the decoder output; ``image`` is the input whose size it matches.
+
+        Raises:
+            ValueError: the head concatenates the input onto the features, so it needs a
+                3-channel batch.
+        """
+        if image.shape[1] != 3:
+            raise ValueError(
+                f"SegmentationHead fuses the input image into the head, so it needs 3 input "
+                f"channels, got {image.shape[1]}"
+            )
+        upsampled = resize_to_input(features, (image.shape[-2], image.shape[-1]))
+        logits = self.classify(self.fusion(torch.cat((upsampled, image), dim=1)))
         return logits if self.norm is None else self.norm(logits)
 
 
@@ -308,15 +255,20 @@ class ResNetEncoder(nn.Module):
         # per-class constructors (``models.resnet50(...)``), which are deprecated aliases of it.
         resnet = builder(weights=weights)
 
-        # Level 0 is the stem; levels 1-4 are the residual stages.
-        stem = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-        )
+        # The levels follow the upstream tap points rather than torchvision's grouping. Upstream
+        # takes ``f1`` from ``conv1 -> bn -> relu`` at ``H/2``, *before* the pool -- the only way
+        # the decoder's last block can sit at ``H/2`` and upsample exactly once into the
+        # full-resolution head -- and ``f2`` from ``maxpool -> layer1`` at ``H/4``. torchvision
+        # keeps the pool inside the stem, so this split moves layer1's parameters one level
+        # deeper (``levels.1.*`` -> ``levels.1.1.*``).
         self.levels = nn.ModuleList(
-            [stem, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4]
+            [
+                nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu),
+                nn.Sequential(resnet.maxpool, resnet.layer1),
+                resnet.layer2,
+                resnet.layer3,
+                resnet.layer4,
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
@@ -335,17 +287,8 @@ class UNetDecoder(nn.Module):
         encoder_channels: Channels per encoder level, **shallowest first**, e.g.
             ``(64, 256, 512, 1024, 2048)`` for ResNet50.
         decoder_channels: Output channels per decoder block, **deepest first** -- the order the
-            legacy lists were written in, e.g. ``(1024, 512, 256, 128, 64)`` for the full model
-            and ``(512, 256, 128, 64, 32)`` for the light one. Length must match
-            ``encoder_channels``.
-        pairing: Which encoder feature each block fuses.
-
-            * ``"aligned"`` (default) -- the block at level *j* fuses the deeper decoder output
-              with ``encoder[j]``; this is the correct pairing.
-            * ``"legacy"`` -- reproduces ``models_pytorch.ResNet50UNet``'s off-by-one
-              (``[f5, f3, f2, f1, f1]``, so ``f4`` is never used and ``f1`` twice), which
-              reproduces that file's exact ``Conv2d`` shapes
-              (``2048->1024, 1536->512, 768->256, 320->128, 192->64``) so its weights load.
+            upstream lists are written in, ``(1024, 512, 256, 128, 64)`` for the full model and
+            ``(512, 512, 256, 128, 64)`` for the light one. Length must match ``encoder_channels``.
         attention: Add an :class:`AttentionBlock` to each block (the enhancement model did this).
 
     Raises:
@@ -356,7 +299,6 @@ class UNetDecoder(nn.Module):
         self,
         encoder_channels: Sequence[int] = (64, 256, 512, 1024, 2048),
         decoder_channels: Sequence[int] = (1024, 512, 256, 128, 64),
-        pairing: Pairing = "aligned",
         attention: bool = False,
     ) -> None:
         super().__init__()
@@ -370,18 +312,19 @@ class UNetDecoder(nn.Module):
             )
         if any(c <= 0 for c in dec):
             raise ValueError(f"decoder_channels must be positive integers, got {dec}")
-        if pairing not in ("aligned", "legacy"):
-            raise ValueError(f"pairing must be 'aligned' or 'legacy', got {pairing!r}")
 
         self.encoder_channels = enc
         self.decoder_channels = dec
-        self.pairing: Pairing = pairing
-        self.skip_indices = self._skip_indices(len(enc), pairing)
+        # Block *i* of the deepest-first decoder fuses encoder level ``len(enc) - 1 - i`` -- the
+        # pairing upstream uses, and the only one here now. The port's ``pairing="legacy"``
+        # alternative (``[f5, f3, f2, f1, f1]``, ``f4`` never used, ``f1`` twice) existed to load
+        # weights that were never trained, so the model built it as a second shape rather than
+        # fixing the first.
+        self.skip_indices = list(reversed(range(len(enc))))
 
         # Channel count of every block input, and therefore the exact Conv2d it needs.
         # The deepest block is a 1x1 projection (a projection, not a convolution over space);
-        # every other block is 3x3 -- the same pattern ``models_pytorch`` used, and the one that
-        # keeps ``state_dict`` shapes compatible with its checkpoints.
+        # every other block is 3x3, and every conv in front of a BatchNorm is unbiased.
         blocks = nn.ModuleList()
         previous = enc[-1]  # the deepest level feeds the deepest block
         for position, (skip_index, out_channels) in enumerate(
@@ -393,10 +336,6 @@ class UNetDecoder(nn.Module):
                     in_channels,
                     out_channels,
                     kernel_size=1 if position == 0 else 3,
-                    # The legacy convs all carried a bias even in front of a BatchNorm (where the
-                    # convention is none); keeping it for the legacy pairing is what lets a
-                    # checkpoint trained on models_pytorch load with strict=True.
-                    bias=pairing == "legacy",
                 )
             ]
             if attention:
@@ -406,23 +345,12 @@ class UNetDecoder(nn.Module):
 
         self.blocks = blocks
 
-    @staticmethod
-    def _skip_indices(levels: int, pairing: Pairing) -> list[int]:
-        """Encoder level index each decoder block fuses, deepest block first."""
-        if pairing == "aligned":
-            return list(reversed(range(levels)))
-        # models_pytorch.ResNet50UNet: f5 (as the input), then f3, f2, f1, then f1 again.
-        if levels == 1:
-            return [0]
-        return [levels - 1, *reversed(range(levels - 2)), 0]
-
     @property
     def output_channels(self) -> int:
         """Channels produced by the final block -- what the head consumes.
 
-        With ``decoder_channels`` ordered deepest-first, that is the last entry: ``64`` for the
-        full model and ``32`` for the light one, matching the legacy
-        ``final_conv = nn.Conv2d(64, n_classes, 1)`` / ``nn.Conv2d(32, n_classes, 1)``.
+        With ``decoder_channels`` ordered deepest-first, that is the last entry: ``64`` on both the
+        full and the light model, which is what the upstream head is built to accept.
         """
         return self.decoder_channels[-1]
 

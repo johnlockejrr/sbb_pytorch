@@ -231,21 +231,21 @@ def test_declared_patch_grid_is_verified_against_the_shipped_config() -> None:
 # ------------------------------------------------------------------ decoder pairing
 
 
-def test_aligned_pairing_uses_every_encoder_level_once() -> None:
+def test_the_decoder_pairs_every_encoder_level_once() -> None:
     """``ResNet50UNet`` consumed ``[f5, f3, f2, f1, f1]``: f4 unused, f1 twice."""
     assert build("resnet50_unet").decoder.skip_indices == [4, 3, 2, 1, 0]
-    assert build("resnet50_unet", pairing="legacy").decoder.skip_indices == [4, 2, 1, 0, 0]
 
 
-def test_legacy_pairing_reproduces_the_original_conv_shapes() -> None:
-    """Every ``Conv2d`` of ``models_pytorch.ResNet50UNet``, so its checkpoints load with ``strict``.
+def test_every_decoder_conv_is_sized_from_its_real_input() -> None:
+    """The ``Conv2d`` each block needs once its input is computed, not guessed.
 
-    The shapes below are what that file built -- ``2048->1024`` as a 1x1 projection, then the
-    off-by-one concatenations ``1536->512``, ``768->256``, ``320->128``, ``192->64``. Any change
-    to the legacy decoder silently invalidates trained weights, which no amount of
-    ``strict=False`` catches.
+    Block 0 is a 1x1 projection of ``f5`` and every later block sees its predecessor's width
+    concatenated with the skip of the same level: ``2048 -> 1024``, then ``1024+1024``,
+    ``512+512``, ``256+256``, ``128+64``. The off-by-one decoder this replaced asked for
+    ``1536``, ``768`` and ``320`` -- widths that came from pairing block ``i`` with level
+    ``i-1`` -- which is why four of the five copied decoders raised on their first forward pass.
     """
-    model = build("resnet50_unet", pairing="legacy")
+    model = build("resnet50_unet")
     weights = {
         key: tuple(value.shape)
         for key, value in model.state_dict().items()
@@ -253,9 +253,9 @@ def test_legacy_pairing_reproduces_the_original_conv_shapes() -> None:
     }
     assert weights == {
         "decoder.blocks.0.0.conv.weight": (1024, 2048, 1, 1),
-        "decoder.blocks.1.0.conv.weight": (512, 1536, 3, 3),
-        "decoder.blocks.2.0.conv.weight": (256, 768, 3, 3),
-        "decoder.blocks.3.0.conv.weight": (128, 320, 3, 3),
+        "decoder.blocks.1.0.conv.weight": (512, 2048, 3, 3),
+        "decoder.blocks.2.0.conv.weight": (256, 1024, 3, 3),
+        "decoder.blocks.3.0.conv.weight": (128, 512, 3, 3),
         "decoder.blocks.4.0.conv.weight": (64, 192, 3, 3),
     }
 
@@ -284,7 +284,12 @@ def test_encoder_strides_match_the_feature_maps_it_produces() -> None:
     with torch.no_grad():
         features = encoder(IMAGE)
     assert [IMAGE.shape[-1] // f.shape[-1] for f in features] == list(RESNET_STRIDES)
+    assert RESNET_STRIDES == (2, 4, 8, 16, 32), "f1 is conv1's H/2 output, taken before the pool"
     assert [f.shape[1] for f in features] == [64, 256, 512, 1024, 2048]
+    # The pool belongs to level 1, as it does upstream: conv1 keeps the level-0 keys and layer1
+    # moves one container deeper, which is the rename section 3.2 records.
+    keys = encoder.state_dict()
+    assert "levels.0.0.weight" in keys and "levels.1.1.0.conv1.weight" in keys
 
 
 # ----------------------------------------------------------------------- patch math
@@ -333,7 +338,7 @@ def test_the_fused_head_is_the_stage_the_port_dropped() -> None:
     """The Keras head upsamples, concatenates the image, convolves 64+3 -> 32, normalises,
     then predicts with a 1x1 -- and the port had only the 1x1, run at ``H/4`` and resized."""
     head = build("resnet50_unet").head  # decoder ends at 64 channels, the image adds 3
-    assert head.fusion is not None and tuple(head.fusion.conv.weight.shape) == (
+    assert tuple(head.fusion.conv.weight.shape) == (
         FUSION_CHANNELS,
         FULL_DECODER_CHANNELS[-1] + 3,
         3,
@@ -348,21 +353,7 @@ def test_both_resnet_unets_end_at_the_same_head_widths() -> None:
     fusion conv into the last decoder block and halved every width below the first."""
     assert LIGHT_DECODER_CHANNELS == (512, 512, 256, 128, 64)
     for name in ("resnet50_unet", "resnet50_unet_light"):
-        head = build(name).head
-        assert head.fusion is not None
-        assert tuple(head.fusion.conv.weight.shape) == (FUSION_CHANNELS, 64 + 3, 3, 3)
-
-
-def test_an_unfused_head_stays_the_bare_conv_and_refuses_a_norm() -> None:
-    """``pairing="legacy"`` exists to load a checkpoint whose head is one ``Conv2d``: no fusion
-    block to fill, no normalisation to fill, and asking for either is the caller's bug."""
-    legacy = build("resnet50_unet", pairing="legacy").head
-    assert legacy.fusion is None and legacy.norm is None
-    assert tuple(legacy.classify.weight.shape) == (3, FULL_DECODER_CHANNELS[-1], 1, 1)
-    with pytest.raises(ValueError, match=r"image_fusion needs pairing='aligned'"):
-        build("resnet50_unet", pairing="legacy", image_fusion=True)
-    with pytest.raises(ValueError, match="logits_norm needs image_fusion"):
-        build("resnet50_unet", pairing="legacy", logits_norm=True)
+        assert tuple(build(name).head.fusion.conv.weight.shape) == (FUSION_CHANNELS, 64 + 3, 3, 3)
 
 
 def test_only_a_segmentation_task_gets_normalised_logits() -> None:

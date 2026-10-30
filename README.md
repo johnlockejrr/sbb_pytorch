@@ -106,7 +106,6 @@ Builds the model, the Lightning module, the trainer and the callbacks from one f
 | `--patches / --no-patches` | Sliding-window inference (`--patches` was a `pass` statement in `inference_pytorch.py`) |
 | `-c, --config` | Config used to rebuild the architecture; default is the checkpoint's own `model_config.json`, which is what lets `sbb infer runs/textline -i pages/` work without repeating every training option |
 | `--architecture` | Registry key override (in one legacy script `--model` meant this, in another it meant the weights path) |
-| `--pairing` | `aligned` (default) or `legacy`, for checkpoints trained against the old off-by-one `ResNet50UNet` decoder |
 | `-d, --device`, `--limit` | Device as above; stop after N pages |
 
 ### `sbb gt generate` and `sbb gt visualize`

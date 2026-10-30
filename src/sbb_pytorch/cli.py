@@ -394,7 +394,6 @@ def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -
     default=None,
     help="Registry key overriding the architecture (what --model meant in one legacy script).",
 )
-@click.option("--pairing", type=click.Choice(["aligned", "legacy"]), default="aligned")
 @click.option(
     "-d", "--device", default=None, callback=_device_value, help="auto|cpu|cuda|cuda:N|mps."
 )
@@ -411,7 +410,6 @@ def infer(
     patches: bool | None,
     config_path: Path | None,
     architecture: str | None,
-    pairing: str,
     device: str | None,
     limit: int | None,
 ) -> None:
@@ -429,7 +427,6 @@ def infer(
         config=config_path,
         model=architecture,
         device=device,
-        pairing=pairing,
     )
     files = _collect_inputs([*inputs, *extra_inputs], limit=limit)
     if not files:
