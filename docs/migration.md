@@ -192,6 +192,11 @@ each other and the disagreement is the point.
 | **`label_for` looked the region type up under the wrong spelling.** It normalises `TextRegion/@type` (`paragraph`) and then queried the dict keyed the way the JSON spells it (`rest_as_paragraph`), so any region under a config using the `rest_as_` form was unlabelled and -- because a page with no labelled regions is skipped -- produced no output at all. Both sides are normalised now. Same class of defect as the next row: one side spells a key one way, the other queries it another. | **fix** |
 | **`columns_width` was unlookupable.** The field is `{column count: page width}` but was filled by `_int_map`, which stringifies keys (right for region *names*, wrong for numbers -- JSON writes `{"1": 1000}`), while `_column_size` looks the page's column count up as an `int`. Every lookup missed, so the column-normalising resize the docstring promises never ran -- for either shipped page2label file. A key-coercing `_columns_width_map` fills it, and a non-numeric key now raises instead of passing silently. | **fix** |
 
+| **Eleven behaviours that `tests/test_gt.py` first pinned and then fixed**, in three groups by module; each one had a `# TODO(file.py:line)` marker in the test at the commit that added it, and the marker became an ordinary assertion when the code changed. | **fix** |
+| **`reading_order.generate_pairs` could not produce a sample for any input size but the page's own.** `_layout_channel` resampled the layout channel to `input_height`/`input_width` while `region_label_map` and `header_separator_mask` painted theirs at page size, so the `np.stack` assembling the modal image raised `ValueError: all input arrays must have the same shape` -- the docstring's "the label maps are rasterised at this size directly" described what the code did not do. One `_canvas(shape, target_size)` rule now sizes all three (they scale: `reading_order.py:248`). Two more in the same file: `_is_header` compared `@type` against the literal `"header"` and so gave no separator band to a `heading` region or to the `rest_as_header` spelling its own `page` argument exists to consult (`reading_order.py:206`), and `write_pair` wrote `pair.name` while ignoring `pair.suffix`, leaving the marker-doubling that `generate_pairs` had already folded into the name (`reading_order.py:123`). | **fix** |
+| **Four `render` defects.** `background` skipped the `uint8` range check the entry labels get and reached `np.full` with the value, so a mistyped `background=999` answered numpy's `OverflowError` (`render.py:191`); `edge = stroked & ~filled` made the default 1-pixel `outline_color` invisible, because the stroke coincides exactly with the boundary the fill already covers (the ring is now the outline and the fill keeps the rest: 70 outline + 266 fill for the 336-pixel test rectangle, `render.py:272`); a region whose `@ID` has no digits took its class from `hash((kind, type)) % 19`, which CPython randomises per process, so the same page rendered with different class ids on consecutive runs -- now `zlib.crc32`, stable and 4 for `(tableregion, table)` (`render.py:418`); and `crop_to` let numpy clip the slice, so a box hanging over an edge produced a smaller image and a box starting outside produced a zero-length one where `make_image_from_bb` clamps (`render.py:458`). | **fix** |
+| **Four `generator` defects.** `from_dict` defaulted `case_label` to `artificial_class_label` before `1`, so a config setting only the boundary class silently reused `9` as the region class against its own docstring's "legacy implicitly `1`" (`generator.py:249`); `_layout_map` documented big-over-small paint order but appended in document order, so a header declared before the paragraph containing it vanished from the map (`generator.py:534`); `_find_image` matched any file by stem, so with the XML filed in `images_dir` the `.xml` sorted before `1800.png`, `read_image` returned `None` and the page's photo went uncopied (`generator.py:683`); and `output_stem` used `Path.stem` + `partition("-")`, answering `b-c` where the ported `split('-')[1].split('.')[0]` wrote `b` and `1800.tar` where it wrote `1800` -- the second half of the naming row above, which claimed the rule was preserved (`generator.py:700`). | **fix** |
+
 ### 3.9 Packaging and license
 
 | Change | Marker |
@@ -286,37 +291,7 @@ instead of being made.
    TensorFlow → PyTorch port) both describe files this branch deletes.** They are being rewritten
    rather than dropped; confirm whether the TensorFlow-port history belongs in `CHANGELOG.md`, in
    `TECHNICAL_CHANGELOG.md`, or in a `docs/legacy/` folder.
-10. **`tests/test_gt.py` pins eleven behaviours it found without changing any of them.** The
-    serious one is `gt/reading_order.py:315`: `generate_pairs(page, input_height=..., input_width=...)`
-    raises `ValueError: all input arrays must have the same shape` for *every* size other than the
-    page's own, because `_layout_channel` resizes to the requested input size while the two
-    `region_label_map` channels stay at page size and the `np.stack` that follows refuses the
-    mismatch -- the same call with the default size returns its `n * (n - 1)` pairs, which is why no
-    command exercises it (`sbb gt reading-order` does not exist yet, item 6). The other ten are the
-    `# TODO(module.py:line)` markers inside that file: `generator.py:534` documents big-over-small
-    contour order ("a drop-capital is not buried by the paragraph that contains it") and appends in
-    document order, so a header declared before its paragraph disappears from the layout map;
-    `reading_order.py:206` `_is_header(page, region)` ignores its `page` argument and matches the
-    literal `"header"` only, so a `heading` or `rest_as_header` region gets no separator band even
-    though parser and generator both normalise those spellings; `generator.py:700` `output_stem`
-    diverges from the ported rule the row in 3.8 claims is preserved (`a-b-c.xml` → `b-c` where
-    legacy gave `b`, `000123456-1800.tar.gz` → `1800.tar` where legacy gave `1800`); `generator.py:249`
-    falls back `case_label → artificial_class_label`, so a config setting only the boundary class
-    silently reuses `9` as the region class where its docstring promises legacy's implicit `1`;
-    `generator.py:683` `_find_image` matches any file by stem and sorts the directory, so an XML
-    filed in the images directory wins over the `1800.png` and the source-image copy is dropped
-    without a log line; `render.py:272` computes `edge = stroked & ~filled`, which is empty at the
-    default 1-pixel outline, so `outline_color` does nothing until `outline_thickness > 1`;
-    `render.py:191` range-checks the entry labels with a friendly `ValueError` but passes
-    `background` straight to `np.full`, so `background=999` raises `OverflowError`; `render.py:418`
-    gives a region whose `@ID` holds no digits the class id `hash((kind, type)) % 19`, which CPython
-    randomises per process, so the same page renders with different ids on different runs;
-    `reading_order.py:123` accepts a `suffix` that `write_pair` never applies (the `_missed` marker
-    only reaches file names because `generate_pairs` bakes it into `name`); and `render.py:458`
-    `crop_to` silently returns a smaller crop than asked for when the box exceeds the image, where
-    `make_image_from_bb` clamps its boxes. Each fix changes rendered output or output names, so the
-    pin and the fix have to flip in one commit -- say which of the eleven to take and in what order.
-11. **Sandbox artifacts in the repository root** (`.bashrc`, `.bash_profile`, `.profile`, `.zshrc`,
+10. **Sandbox artifacts in the repository root** (`.bashrc`, `.bash_profile`, `.profile`, `.zshrc`,
    `.zprofile`, `.gitconfig`, `.mcp.json`, `.vscode`, `.idea`, `.ripgreprc`, `__pycache__/`,
    `.pytest_cache/`, `.ruff_cache/`) are tracked/untracked leftovers of the environment, and
    `.gitmodules` is an empty file with no submodule. The planned `.gitignore` excludes them; the
@@ -331,8 +306,8 @@ For any entry above, the order to check it in:
 2. Run the matching test file: `tests/test_metrics.py`, `test_losses.py`, `test_models.py`,
    `test_dataset.py`, `test_augmentations.py`, `test_datamodule.py`, `test_images.py`,
    `test_checkpoint.py`, `test_config.py`, `test_inference.py`, `test_training.py`,
-   `test_training_factory.py`, `test_gt.py` (the last one covers every row in section 3.8 and the
-   pins listed in section 5.10 -- a row fixed without its pin updated shows up as a failure there).
+   `test_training_factory.py`, `test_gt.py` (the last one holds an assertion for every row of
+   section 3.8 that came from it, so a row changed without its test updated shows up as a failure).
 3. For a **breaking** number, re-run one of your own historic configs with the legacy code and
    the package side by side and compare the two logged values against the formula in section 3 --
    the change should be explainable arithmetically, not just by "the old code was wrong".

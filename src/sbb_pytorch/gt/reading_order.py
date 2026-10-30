@@ -53,7 +53,7 @@ from .geometry import (
     mask_of,
     scale_contour,
 )
-from .parser import Page, Region, RegionKind
+from .parser import Page, Region, RegionKind, normalise_text_type
 from .render import DEFAULT_LABEL_PALETTE, overlay, render_page, to_uint8_bgr, write_image
 
 __all__ = [
@@ -61,6 +61,7 @@ __all__ = [
     "DEFAULT_MAX_AREA_FRACTION",
     "HEADER_LABEL",
     "HEADER_SEPARATOR_BAND_WIDTH",
+    "HEADER_TYPE_NAMES",
     "IMAGE_REGION_LABEL",
     "QUERY_LABEL",
     "ReadingOrderPair",
@@ -90,6 +91,12 @@ QUERY_LABEL: Final = 1
 IMAGE_REGION_LABEL: Final = 2
 #: Label written over headers and the separator band beneath them.
 HEADER_LABEL: Final = 3
+
+#: Every ``@type`` spelling that means "header".  The parser normalises ``rest_as_header``
+#: to ``header`` and the legacy annotation set carried ``heading`` alongside it, so a
+#: header written either way gets its separator band here -- the first version compared
+#: the raw type against ``"header"`` alone and silently dropped the other two.
+HEADER_TYPE_NAMES: Final = frozenset({"header", "heading"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,23 +196,51 @@ def header_separator_mask(
     The legacy tool wrote ``img_header_and_sep[y_max:y_max + 12, x_min:x_max] = 1``
     for each header contour — a fixed-height strip below the header's bottom edge,
     standing in for the separator rule that separates a header from its body text.
+    The raster is drawn at *target_size* when one is given (see :func:`_canvas`), so
+    the band and the contour scaled into it live on the same grid.
     """
-    mask = np.zeros(shape, dtype=np.uint8)
+    canvas = _canvas(shape, target_size)
+    mask = np.zeros(canvas, dtype=np.uint8)
     scale_x, scale_y = _scales(shape, target_size)
     headers = [region for region in page.regions if _is_header(page, region)]
-    for feature in contour_features([_scaled(r.contour, scale_x, scale_y) for r in headers], shape):
+    for feature in contour_features(
+        [_scaled(r.contour, scale_x, scale_y) for r in headers], canvas
+    ):
         x, y, w, h = feature.bbox
-        band_top = min(y + h, max(shape[0] - 1, 0))
-        band_bottom = min(band_top + HEADER_SEPARATOR_BAND_WIDTH, shape[0])
+        band_top = min(y + h, max(canvas[0] - 1, 0))
+        band_bottom = min(band_top + HEADER_SEPARATOR_BAND_WIDTH, canvas[0])
         if w <= 0 or band_bottom <= band_top:
             continue
-        mask[band_top:band_bottom, x : min(x + max(w, 1), shape[1])] = HEADER_LABEL
+        mask[band_top:band_bottom, x : min(x + max(w, 1), canvas[1])] = HEADER_LABEL
     return mask
 
 
 def _is_header(page: Page, region: Region) -> bool:
-    """True when *region* is typed as a header for this page's config."""
-    return region.type_name == "header"
+    """True when *region* is typed as a header, in whichever spelling the page uses.
+
+    ``@type`` goes through :func:`~.parser.normalise_text_type` with the page's own
+    declared types, so a page that spells its header ``rest_as_header`` -- the way a
+    page-to-label config does -- is recognised, and the legacy ``heading`` spelling
+    counts too.  Both are what the parser and the generator normalise; comparing against
+    the literal ``"header"`` left every other header without a separator band, and that
+    was the only thing the *page* argument was there for.
+    """
+    if region.kind is not RegionKind.TEXT:
+        return False
+    declared = [other.type_name for other in page.regions if other.kind is RegionKind.TEXT]
+    return normalise_text_type(region.type_name, declared) in HEADER_TYPE_NAMES
+
+
+def _canvas(shape: tuple[int, int], target_size: tuple[int, int] | None) -> tuple[int, int]:
+    """``(height, width)`` of the raster a labelled output is drawn on.
+
+    *target_size* when the caller named one, *shape* otherwise: scaling a contour into the
+    network grid while still painting onto a page-sized raster left the two label maps of
+    :func:`generate_pairs` at page size and its layout channel at the network size, and
+    ``np.stack`` refused the three of them -- so every page whose configured input size
+    differed from the page itself raised instead of producing a sample.
+    """
+    return (int(target_size[0]), int(target_size[1])) if target_size else shape
 
 
 def _scales(shape: tuple[int, int], target_size: tuple[int, int] | None) -> tuple[float, float]:
@@ -242,13 +277,17 @@ def region_label_map(
     Note the difference from the legacy code, which built ``(y_len, x_len, N)`` and
     resized the whole stack with ``cv2.resize``: OpenCV refuses more than four
     channels, so any page with more than four text regions raised ``cv2.error``.
-    Scaling the contour coordinates (:func:`~.geometry.scale_contour`) replaces that.
+    Scaling the contour coordinates (:func:`~.geometry.scale_contour`) replaces that, and
+    the raster itself is sized like the scaled contour (see :func:`_canvas`) -- a
+    page-sized raster holding a network-sized contour was the second half of the
+    ``np.stack`` failure in :func:`generate_pairs`.
     """
+    canvas = _canvas(shape, target_size)
     scale_x, scale_y = _scales(shape, target_size)
-    mask = mask_of(_scaled(region_contour, scale_x, scale_y), shape, fill_value=QUERY_LABEL)
+    mask = mask_of(_scaled(region_contour, scale_x, scale_y), canvas, fill_value=QUERY_LABEL)
     images = [region.contour for region in page.regions if region.kind is RegionKind.IMAGE]
     if images:
-        image_mask = mask_of([_scaled(c, scale_x, scale_y) for c in images], shape, fill_value=1)
+        image_mask = mask_of([_scaled(c, scale_x, scale_y) for c in images], canvas, fill_value=1)
         mask = np.where(image_mask.astype(bool), IMAGE_REGION_LABEL, mask)
     if header_mask is None:
         header_mask = header_separator_mask(page, shape, target_size=target_size)
@@ -310,7 +349,7 @@ def generate_pairs(
         missed = bool(misses[i]) if misses is not None else False
         pairs.append(
             ReadingOrderPair(
-                name=f"{page.file_name}_{index_start + counter}{'_missed' if missed else ''}",
+                name=f"{page.file_name}_{index_start + counter}",
                 class_type=_pair_label(filtered.order_index, i, j),
                 modal_image=np.stack([label_maps[i], layout_channel, label_maps[j]], axis=-1),
                 missed=missed,
@@ -366,13 +405,18 @@ def write_pair(
 ) -> tuple[Path, Path]:
     """Write *pair*'s modal image and its label, returning both paths.
 
-    Reproduces the legacy output contract: ``<name>.png`` into the image directory and
-    ``<name>.npy`` holding the scalar class into the classes directory.  The class file
-    is written as a 0-d array so a plain ``np.load`` returns the same value the legacy
-    ``np.save(..., class_type)`` produced.
+    Reproduces the legacy output contract: ``<name><suffix>.png`` into the image directory
+    and the same stem as a ``.npy`` holding the scalar class.  The class file is written as
+    a 0-d array so a plain ``np.load`` returns the same value the legacy
+    ``np.save(..., class_type)`` produced.  The ``_missed`` marker comes from
+    :attr:`ReadingOrderPair.suffix` and is composed here -- ``name`` holds the stem alone,
+    so a pair built by :func:`generate_pairs` and one built by hand land on the same file
+    name, which they did not while ``generate_pairs`` folded the marker into ``name`` and
+    this function ignored the property.
     """
-    image_path = write_image(Path(images_dir) / f"{pair.name}.png", pair.modal_image)
-    class_path = Path(classes_dir) / f"{pair.name}.npy"
+    stem = f"{pair.name}{pair.suffix}"
+    image_path = write_image(Path(images_dir) / f"{stem}.png", pair.modal_image)
+    class_path = Path(classes_dir) / f"{stem}.npy"
     class_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(class_path, np.asarray(pair.class_type, dtype=np.int8))
     return image_path, class_path
