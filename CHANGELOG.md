@@ -433,6 +433,20 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `binarization` write the `PrintSpace` outline alone instead of the bogus regions they used to add,
   and `word`/`glyph` answer `ClickException` naming the use case). The output of the reference page
   the user supplied validates, and a page written twice is the same bytes.
+- **A single-class config refused the labels of its own class.** Training on
+  `{"use_case": "textline", "case_label": 1}` with `n_classes: 2` -- the user's own dataset, and the
+  shape `configs/textline.json` has -- died before the first batch with `no class id configured for
+  label values [1] in 2-class setup`; the shipped file, whose layout ids survive beside `case_label`,
+  failed one check later with `class id 2 for stored value 2 is outside [0, 2)`. Both came from
+  `SegmentationDataset._resolve_mapping` deriving its `{stored_value: class_id}` map from
+  `Page2Label.class_ids()`, which answers "which ids do the *regions* use" -- empty for a table that
+  names its class in `case_label`, and for the shipped file a six-id table whose every entry past `1`
+  exceeds the `n_classes` printed beside it. The pair of use cases that answers the question the
+  config actually asks lived in `gt/generator.py`, which `config` cannot import, so
+  `SINGLE_CLASS_USE_CASES` and `_CASE_LABEL_USE_CASES` move to `config/models.py` as the public
+  `SINGLE_CLASS_USE_CASES` / `CASE_LABEL_USE_CASES` (the generator imports them), `Page2Label` gains
+  `legal_class_ids()` -- `{0, case_label}` for those use cases, `{0, *class_ids()}` for the rest, so
+  a layout config's mapping is exactly what it was -- and the loader asks it.
 
 ### Removed
 

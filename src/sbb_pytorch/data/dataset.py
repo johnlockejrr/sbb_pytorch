@@ -221,21 +221,27 @@ class SegmentationDataset(Dataset):
 
         An SBB label PNG *stores the class id in channel 0*, so a page-to-label config gives the
         set of valid ids rather than a remap: the derived mapping is the identity over
-        :meth:`~sbb_pytorch.config.models.Page2Label.class_ids`, which is exactly what
+        :meth:`~sbb_pytorch.config.models.Page2Label.legal_class_ids`, which is exactly what
         ``storage.remap_mask`` needs in order to reject a label holding an unconfigured value.
         An explicit ``{stored_value: class_id}`` dict overrides it (that is the ``0/255`` case).
 
-        ``class_ids()`` only ever lists the ids the *regions* use, so 0 -- the background every
-        other pixel of a rendered label carries -- was missing from the derived mapping, and
-        ``remap_mask`` refused a generated label image with "no class id configured for label
-        values [0]". Background maps to class 0, which is what ``n_classes`` counts for it.
+        Two configs used to be refused by their own mapping. ``class_ids()`` lists only the ids the
+        *regions* use, so 0 -- the background every other pixel of a rendered label carries -- was
+        missing, and a generated label image failed with "no class id configured for label values
+        ``[0]``". And for a single-class use case it is the wrong table outright: ``configs/
+        textline.json`` pairs ``n_classes: 2`` with the layout ids 1-6, so every entry past ``1``
+        failed ``remap_mask``'s range check ("class id 2 for stored value 2 is outside [0, 2)") and
+        the config could not train on any label at all. ``legal_class_ids()`` answers the question
+        the use case actually asks -- ``{0, case_label}`` there, ``{0, *class_ids()}`` for layout --
+        so background maps to class 0, which is what ``n_classes`` counts for it, and the id the
+        model predicts is the one its config names.
         """
         if isinstance(mapping, Page2Label):
-            return {class_id: class_id for class_id in sorted({*mapping.class_ids(), 0})}
+            return {class_id: class_id for class_id in sorted(mapping.legal_class_ids())}
         if mapping is not None:
             return dict(mapping)
         if config is not None and config.page2label is not None:
-            return {class_id: class_id for class_id in sorted({*config.page2label.class_ids(), 0})}
+            return {class_id: class_id for class_id in sorted(config.page2label.legal_class_ids())}
         return None
 
     def _default_transform(self, config: SBBConfig | None) -> A.Compose:

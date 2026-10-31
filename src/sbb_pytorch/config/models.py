@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import (
     AliasChoices,
@@ -183,6 +183,21 @@ class UseCase(str, Enum):
             raise ValueError(f"unknown use case {value!r}") from exc
 
 
+#: Use cases where every annotated element shares one class (the legacy single-class branch), as
+#: opposed to :attr:`UseCase.LAYOUT`, where each region type has its own. Declared here, beside
+#: :class:`UseCase`, because :class:`Page2Label` needs it and ``config`` cannot import from ``gt``;
+#: :mod:`sbb_pytorch.gt.generator` re-exports both sets instead of keeping its own copy, which is
+#: what let the two definitions drift apart from the config that reads them.
+SINGLE_CLASS_USE_CASES: Final[frozenset[UseCase]] = frozenset(
+    {UseCase.TEXTLINE, UseCase.WORD, UseCase.GLYPH, UseCase.PRINTSPACE}
+)
+
+#: Use cases whose regions are labelled with :attr:`Page2Label.case_label`: the four above, plus
+#: ``binarization``, whose single class is the print space itself (its label map still comes from
+#: the layout branch, so only the class id comes from here).
+CASE_LABEL_USE_CASES: Final[frozenset[UseCase]] = SINGLE_CLASS_USE_CASES | {UseCase.BINARIZATION}
+
+
 class OptimizerType(str, Enum):
     """``initialization.py`` hard-coded ``torch.optim.Adam`` while the config carried an unused
     ``"optimizer": "adam"`` string; that string is now the field that actually selects one."""
@@ -280,6 +295,18 @@ class Page2Label(BaseModel):
         for name, value in self.all_regions().items():
             inverted.setdefault(int(value), []).append(name)
         return inverted
+
+    def legal_class_ids(self) -> set[int]:
+        """Every class id a label image may carry under this config, background included.
+
+        :meth:`class_ids` names only the ids the *regions* use, which answers a ``layout`` question;
+        for a use case that labels everything with :attr:`case_label` it is the wrong table -- a
+        single-class config with the layout tables cleared yields ``{0: []}`` alone here, so a label
+        image holding ``0`` and ``1`` was refused as "no class id configured for label values [1]".
+        """
+        if self.use_case in CASE_LABEL_USE_CASES:
+            return {0, self.case_label}
+        return {0, *self.class_ids()}
 
 
 class ScalesConfig(BaseModel):

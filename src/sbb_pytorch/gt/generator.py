@@ -29,7 +29,12 @@ from typing import Any, Final
 import cv2
 import numpy as np
 
-from ..config.models import OutputType, UseCase
+from ..config.models import (
+    CASE_LABEL_USE_CASES,
+    SINGLE_CLASS_USE_CASES,
+    OutputType,
+    UseCase,
+)
 from ..storage.images import IMAGE_SUFFIXES
 from .geometry import (
     DEFAULT_MIN_AREA_FRACTION,
@@ -70,25 +75,15 @@ __all__ = [
 ]
 
 
-#: ``UseCase`` is declared once, in :mod:`sbb_pytorch.config.models`, and re-exported here: the
-#: schema and ``gt`` used to ship two copies with different members.
-#:
-#: Use cases where every annotated element shares one class (the legacy single-class
-#: branch), as opposed to :attr:`UseCase.LAYOUT`, where each region type has its own.
-SINGLE_CLASS_USE_CASES: Final[frozenset[UseCase]] = frozenset(
-    {UseCase.TEXTLINE, UseCase.WORD, UseCase.GLYPH, UseCase.PRINTSPACE}
-)
+#: ``UseCase``, :data:`SINGLE_CLASS_USE_CASES` and :data:`CASE_LABEL_USE_CASES` are declared once,
+#: in :mod:`sbb_pytorch.config.models`, and re-exported here: the schema and ``gt`` used to ship two
+#: copies of the enum with different members.
 
 #: The region kinds those use cases label — everything but ``layout``, where each
 #: region kind and type has its own class id.
 _SINGLE_CLASS_REGION_KINDS: Final[frozenset[RegionKind]] = frozenset(
     {RegionKind.TEXTLINE, RegionKind.WORD, RegionKind.GLYPH, RegionKind.PRINTSPACE}
 )
-
-#: Use cases whose regions are labelled with :attr:`GroundTruthConfig.case_label`: the
-#: four above, plus ``binarization``, whose single class is the print space itself (its
-#: label map still comes from :func:`_layout_map`, so only the class id comes from here).
-_CASE_LABEL_USE_CASES: Final[frozenset[UseCase]] = SINGLE_CLASS_USE_CASES | {UseCase.BINARIZATION}
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +259,7 @@ class GroundTruthConfig:
         label the page's PrintSpace with ``1`` even with ``printspace_as_class_in_layout``
         unset, so a page it could not label produced an image instead of being skipped.
         """
-        if self.use_case in _CASE_LABEL_USE_CASES and region.kind in _SINGLE_CLASS_REGION_KINDS:
+        if self.use_case in CASE_LABEL_USE_CASES and region.kind in _SINGLE_CLASS_REGION_KINDS:
             return self.case_label
         if region.kind in {RegionKind.BORDER, RegionKind.PRINTSPACE}:
             return self.printspace_as_class_in_layout

@@ -15,12 +15,16 @@ from sbb_pytorch.config.loaders import (
     load_scales,
 )
 from sbb_pytorch.config.models import (
+    CASE_LABEL_USE_CASES,
+    SINGLE_CLASS_USE_CASES,
     Page2Label,
     SBBConfig,
     ScalesConfig,
+    UseCase,
     validate_pair,
 )
 from sbb_pytorch.exceptions import ConfigError
+from sbb_pytorch.gt import generator as gt_generator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -109,6 +113,32 @@ def test_the_shipped_textline_config_is_single_class() -> None:
     assert config.page2label is not None
     assert config.page2label.use_case.value == "textline"
     assert config.page2label.case_label == 1  # the field the model lacked and the file implies
+    assert config.page2label.legal_class_ids() == {0, 1}  # not the six ids the file's table lists
+
+
+def test_legal_class_ids_follows_the_use_case_not_only_the_regions() -> None:
+    """``class_ids()`` answers "which ids do the regions use"; the data loader needs "which ids may
+    a label image carry", and for a single-class use case those are different questions.
+
+    ``SINGLE_CLASS_USE_CASES`` / ``CASE_LABEL_USE_CASES`` move here from ``gt/generator.py``, which
+    had its own copy of the pair -- the reason ``Page2Label`` could not ask the same question the
+    generator asks.
+    """
+    single = frozenset({UseCase.TEXTLINE, UseCase.WORD, UseCase.GLYPH, UseCase.PRINTSPACE})
+    assert single == SINGLE_CLASS_USE_CASES
+    assert single | {UseCase.BINARIZATION} == CASE_LABEL_USE_CASES
+    # The generator re-exports both instead of defining them, so the two cannot drift again.
+    assert gt_generator.SINGLE_CLASS_USE_CASES is SINGLE_CLASS_USE_CASES
+    assert gt_generator.CASE_LABEL_USE_CASES is CASE_LABEL_USE_CASES
+
+    layout = Page2Label(use_case="layout", textregions={"<a>": 1, "<b>": 2}, imageregion=4)
+    assert layout.legal_class_ids() == {0, 1, 2, 4}  # unchanged: the region table, plus background
+
+    for use_case in CASE_LABEL_USE_CASES:
+        assert Page2Label(use_case=use_case, case_label=3).legal_class_ids() == {0, 3}
+        assert Page2Label(
+            use_case=use_case, case_label=3, textregions={"<a>": 1, "<b>": 7}
+        ).legal_class_ids() == {0, 3}
 
 
 def test_page2label_carries_the_five_fields_the_legacy_file_has(tmp_path: Path) -> None:
@@ -128,6 +158,9 @@ def test_page2label_carries_the_five_fields_the_legacy_file_has(tmp_path: Path) 
     # unchanged by fields that describe the run rather than its regions.
     assert label.all_regions() == {}
     assert label.class_ids() == {}
+    # The set the data loader consults is not that inversion: for this use case it is the
+    # background plus case_label, which class_ids() leaves out while the field names it.
+    assert label.legal_class_ids() == {0, 1}
 
     # The flat legacy shape carried these keys beside ``use_case``; they fold into ``page2label``
     # instead of being left at the top level, where ``extra="forbid"`` would reject the file.

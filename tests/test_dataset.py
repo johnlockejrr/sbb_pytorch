@@ -178,7 +178,7 @@ def test_page2label_supplies_the_identity_mapping_over_configured_ids(tmp_path: 
     every pixel matched no class without anyone noticing."""
     root = tmp_path / "data"
     write_pair(root, "page", label_values=(1, 2))
-    page2label = Page2Label(use_case="textline", textregions={"<textlines>": 1}, imageregion=2)
+    page2label = Page2Label(use_case="layout", textregions={"<textlines>": 1}, imageregion=2)
     dataset = SegmentationDataset(root, config=make_config(n_classes=3, page2label=page2label))
     # 0 is not one of the region ids the page2label lists, but it is what every background pixel
     # of a rendered label stores, so the derived mapping covers it (see _resolve_mapping).
@@ -187,9 +187,33 @@ def test_page2label_supplies_the_identity_mapping_over_configured_ids(tmp_path: 
 
     # The same folder with a mapping that does not cover the stored values is an error, not a
     # silently all-zero one-hot row.
-    unconfigured = Page2Label(use_case="textline", textregions={"<a>": 0})
+    unconfigured = Page2Label(use_case="layout", textregions={"<a>": 0})
     with pytest.raises(ValueError, match=r"no class id configured for label values \[1, 2\]"):
         SegmentationDataset(root, config=make_config(page2label=unconfigured))[0]
+
+
+def test_single_class_config_trains_on_the_class_its_case_label_names(tmp_path: Path) -> None:
+    """``{"use_case": "textline", "case_label": 1}`` with ``n_classes: 2`` used to refuse its own
+    labels: the derived mapping came from ``class_ids()``, the *region* table, which a single-class
+    config leaves empty (or fills with the layout ids, whose every entry past 1 then failed
+    ``remap_mask``'s ``[0, n_classes)`` range check). ``sbb train`` on the user's textline dataset
+    died on ``no class id configured for label values [1] in 2-class setup``."""
+    root = tmp_path / "data"
+    write_pair(root, "page", label_values=(0, 1))
+    page2label = Page2Label(use_case="textline", case_label=1)
+    dataset = SegmentationDataset(root, config=make_config(n_classes=2, page2label=page2label))
+    assert dataset._mapping == {0: 0, 1: 1}
+    assert set(dataset[0][1].unique().tolist()) == {0, 1}
+
+    # A single-class table that still carries the layout ids -- configs/textline.json's shape --
+    # maps the same pair, not the six ids the table lists.
+    with_tables = Page2Label(
+        use_case="textline",
+        case_label=1,
+        textregions={"rest_as_paragraph": 1, "header": 2, "heading": 2},
+        imageregion=4,
+    )
+    assert with_tables.legal_class_ids() == {0, 1}
 
 
 def test_unreadable_pair_raises_with_the_path(dataset_root: Path) -> None:
