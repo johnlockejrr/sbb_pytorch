@@ -174,6 +174,13 @@ def test_logged_val_keys_names_the_two_metrics_a_run_produces(stub: nn.Module) -
     assert module.logged_val_keys == ("val_loss", "val_accuracy")
 
 
+def test_bar_keys_are_the_pair_the_run_is_judged_on(stub: nn.Module) -> None:
+    """The bar shows ``val_loss`` + ``val_accuracy``; the per-class detail stays in the logs."""
+    module = SBBLightningModule(make(), stub)
+    assert module.bar_keys("val") == {"val_loss", "val_accuracy"}
+    assert module.bar_keys("train") == set()  # the train losses are flagged in training_step
+
+
 def test_logged_val_keys_without_metrics_has_no_best(stub: nn.Module) -> None:
     """Enhancement and reading order log a loss only; the second checkpoint has to notice."""
     module = SBBLightningModule(make(), stub, val_metrics={})
@@ -240,14 +247,24 @@ def test_build_callbacks_turns_both_verbases_on_together(stub: nn.Module, tmp_pa
     assert [callback.verbose for callback in loud] == [True] * 4
 
 
-def test_early_stopping_fields_names_the_wait_of_every_attached_callback(tmp_path: Path) -> None:
-    """The bar's ``early_stopping/val_loss: 3/10``: epochs waited over the configured patience."""
+def test_early_stopping_fields_collapse_the_pair_into_one_field(tmp_path: Path) -> None:
+    """One ``early_stopping: 3/4`` for the pair -- epochs waited over the configured patience.
+
+    It used to be one field per monitored metric (``early_stopping/val_loss`` *and*
+    ``early_stopping/val_accuracy``), which on the bar read as two more copies of the metric names
+    with the values left out, beside the same numbers already shown as ``val_loss: 0.449``. The
+    callback closest to stopping answers for both.
+    """
     config = make(patience=4)
     stopping = early_stopping_for(config, "val_loss")
     stopping.wait_count = 3
-    assert early_stopping_fields(SimpleNamespace(callbacks=[stopping])) == {
-        "early_stopping/val_loss": "3/4"
+    other = early_stopping_for(config, "val_accuracy")
+    other.wait_count = 1
+    assert early_stopping_fields(SimpleNamespace(callbacks=[stopping, other])) == {
+        "early_stopping": "3/4"
     }
+    assert early_stopping_fields(SimpleNamespace(callbacks=[stopping])) == {"early_stopping": "3/4"}
+    assert early_stopping_fields(SimpleNamespace(callbacks=[])) == {}
 
 
 def test_progress_bar_carries_the_counters_alongside_the_losses(
@@ -263,8 +280,15 @@ def test_progress_bar_carries_the_counters_alongside_the_losses(
     trainer.progress_bar_metrics["val_loss"] = torch.tensor(0.5)
     items = bar.get_metrics(trainer, module)
     assert items["val_loss"] == pytest.approx(0.5)
-    assert items["early_stopping/val_loss"] == "0/10"
-    assert items["early_stopping/val_accuracy"] == "0/10"
+    assert items["early_stopping"] == "0/10"
+    assert "early_stopping/val_loss" not in items and "early_stopping/val_accuracy" not in items
+
+
+def test_progress_bar_leaves_the_epochs_it_finished_on_screen() -> None:
+    """``leave=True``: rich repaints one live panel, so without it epoch 0's line is erased by
+    epoch 1 and a finished run leaves a single line -- the last epoch, not the run."""
+    assert SBBProgressBar()._leave is True  # the parent keeps it private, no public getter
+    assert SBBProgressBar(leave=False)._leave is False  # the parent's own opt-out still reachable
 
 
 def test_build_callbacks_pairs_each_metric_with_its_stopping(
@@ -439,6 +463,9 @@ def test_fit_trains_one_epoch_and_writes_model_pt(
     assert saved.model_state.keys() == stub.state_dict().keys()
     # epoch-end logging is what produces these; the legacy code logged them per batch instead
     assert "train_accuracy" in trainer.callback_metrics
+    # ...and only the pair the run is judged on reaches the bar: train_accuracy is logged, not shown
+    assert "train_accuracy" not in trainer.progress_bar_metrics
+    assert "val_accuracy" in trainer.progress_bar_metrics
     # the sidecar the checkpoint schema promises, so tooling can read the config unpickled
     assert (tmp_path / "model_config.json").exists()
 

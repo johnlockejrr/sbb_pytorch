@@ -447,6 +447,23 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `SINGLE_CLASS_USE_CASES` / `CASE_LABEL_USE_CASES` (the generator imports them), `Page2Label` gains
   `legal_class_ids()` -- `{0, case_label}` for those use cases, `{0, *class_ids()}` for the rest, so
   a layout config's mapping is exactly what it was -- and the loader asks it.
+- **The `sbb train` bar kept only the epoch it was on, and two of its numbers.** `SBBProgressBar` is
+  a `RichProgressBar`, and it inherited that class's `leave=False`: rich paints one *live* panel and
+  repaints it in place, so epoch 0's line was erased the moment epoch 1 started and a finished run
+  left a single line on the terminal -- the last epoch, not the run. The subclass defaults to
+  `leave=True` now, which the parent implements by printing the finished frame before rebuilding the
+  live display, so every epoch's line survives with the numbers it ended on. The numbers were the
+  other half: the bar renders exactly the metrics logged with `prog_bar=True`, and the module flagged
+  `train_loss` and `val_loss` alone, so `train_loss_step` -- whose own comment says it exists to keep
+  the bar live -- and `val_accuracy` were in the logs and in the checkpoint filenames while the bar
+  showed neither. The bar now carries the pair a run is judged on plus the step loss
+  (`training.module.SBBLightningModule.bar_keys`), and leaves `val_miou`, the two dice scores and the
+  per-class `iou/2`/`recall/2`/`support/2` to the logs -- flagging *everything* instead turned a
+  six-class run's line into a wall of `train_support/4: 1408.000` entries that pushed the losses off
+  the screen. `early_stopping_fields` printed `early_stopping/val_loss: 0/10` *and*
+  `early_stopping/val_accuracy: 0/10` -- the metric names twice more, values left out, beside the same
+  numbers shown as values -- and emits one `early_stopping: 0/10`, from the callback closest to
+  stopping.
 
 ### Removed
 

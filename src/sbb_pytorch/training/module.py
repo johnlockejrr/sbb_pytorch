@@ -200,10 +200,12 @@ class SBBLightningModule(pl.LightningModule):
         logits = self(images)
         loss = self.criterion(logits, targets)
 
-        # `train_loss` is the epoch value (the key legacy code had), `train_loss_step` keeps the
-        # progress bar live during the epoch.
+        # `train_loss` is the epoch value (the key legacy code had), `train_loss_step` the running
+        # one. Both carry prog_bar=True: a bar that shows only the epoch value sits on the last
+        # epoch's number for a whole epoch, and the progress bar shows only what is logged with the
+        # flag -- so the step value this class exists to publish never reached the bar until now.
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train_loss_step", loss, on_step=True, on_epoch=False)
+        self.log("train_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True)
         for metric in self.train_metrics.values():
             metric.update(logits, targets)
         return loss
@@ -237,14 +239,24 @@ class SBBLightningModule(pl.LightningModule):
         """Compute every accumulated metric once, log the flat dict, then clear the accumulators.
 
         ``compute_and_reset`` is the metrics API's own pair (:class:`~sbb_pytorch.metrics.Metric`),
-        so a phase's numbers come from one pass over its counts instead of one pass per batch.
+        so a phase's numbers come from one pass over its counts instead of one pass per batch. The
+        keys :meth:`bar_keys` names are logged with ``prog_bar=True`` -- the bar renders exactly the
+        flagged set -- and the rest reaches the logger alone.
         """
         if not metrics:
             return
         values: dict[str, float] = {}
         for metric in metrics.values():
             values.update(metric.compute_and_reset())
-        self.log_dict({f"{phase}_{key}": value for key, value in values.items()})
+        computed = {f"{phase}_{key}": value for key, value in values.items()}
+        on_bar = self.bar_keys(phase) & computed.keys()
+        if on_bar:
+            self.log_dict(
+                {key: value for key, value in computed.items() if key in on_bar}, prog_bar=True
+            )
+        rest = {key: value for key, value in computed.items() if key not in on_bar}
+        if rest:
+            self.log_dict(rest)
 
     # ------------------------------------------------------------- optimization
 
@@ -267,6 +279,20 @@ class SBBLightningModule(pl.LightningModule):
         }
 
     # ------------------------------------------------------------------ naming
+
+    def bar_keys(self, phase: str) -> set[str]:
+        """The metric keys of *phase* the progress bar shows -- not every key the metrics compute.
+
+        ``val`` shows the pair a run is judged on (:attr:`logged_val_keys`: ``val_loss`` plus the
+        best-not-by-loss metric, ``val_accuracy`` on a task that has metrics). ``train`` shows nothing
+        through here -- the two losses ``training_step`` logs itself are flagged there, and its epoch
+        metrics are not. Listing everything was the bug this method exists to keep out: with every key
+        flagged, a six-class run's bar became a wall of ``train_support/4: 1280.000`` entries that
+        pushed ``val_loss`` off the screen.
+        """
+        if phase != "val":
+            return set()
+        return set(self.logged_val_keys)
 
     @property
     def logged_val_keys(self) -> tuple[str, str | None]:

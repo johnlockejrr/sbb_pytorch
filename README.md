@@ -98,8 +98,8 @@ when the `safetensors` dependency is installed.
 | `--page2label`, `--scales` | Attach a page-to-label / enhancement-scales file (or use a config with them inlined) |
 | `--every-n-steps` | Also save a mid-epoch checkpoint every N batches (the old `--save-interval`, whose callback never fired) |
 | `--logger / --no-logger` | TensorBoard logs when tensorboard is importable, CSV logs otherwise |
-| `--progress-bar / --no-progress-bar` | The `rich` bar pytorch-lightning uses when `rich` is installed |
-| `--verbose-metrics / --no-verbose-metrics` | Print `Metric val_loss improved. New best score: 0.449` on every improvement, as `training.py` did. Off by default: the bar carries the same numbers as `early_stopping/val_loss: 3/10` |
+| `--progress-bar / --no-progress-bar` | The `rich` bar pytorch-lightning uses when `rich` is installed -- `training.SBBProgressBar`, whose `leave=True` keeps every finished epoch's line on screen instead of repainting one live bar (`SBBProgressBar(leave=False)` in code is the old behaviour) |
+| `--verbose-metrics / --no-verbose-metrics` | Print `Metric val_loss improved. New best score: 0.449` on every improvement, as `training.py` did. Off by default: the bar carries the same numbers as `early_stopping: 3/10`, beside `train_loss`, `train_loss_step`, `val_loss` and `val_accuracy` (the pair `training.SBBLightningModule.bar_keys` says a run is judged on; the per-class detail stays in the logs) |
 | `--dry-run` | One train and one validation batch, no `model.pt`: turns a bad config into a two-second failure |
 
 ### `sbb infer MODEL [INPUT...]`

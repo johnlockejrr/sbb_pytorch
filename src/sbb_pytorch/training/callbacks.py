@@ -167,28 +167,49 @@ def early_stopping_for(
 
 
 def early_stopping_fields(trainer: Any) -> dict[str, str]:
-    """``{"early_stopping/val_loss": "3/10"}`` for every ``EarlyStopping`` attached to *trainer*.
+    """``{"early_stopping": "3/10"}`` -- one field for every ``EarlyStopping`` on *trainer*.
 
     The bar's version of what the ``verbose=True`` prints said: epochs a monitor has gone without
-    improving, over the patience that ends the run. Two callbacks watching one metric collapse to
-    one field.
+    improving, over the patience that ends the run. The two callbacks this package registers (one per
+    monitored metric) used to each add a field -- ``early_stopping/val_loss: 3/10`` and
+    ``early_stopping/val_accuracy: 3/10`` -- which on the bar read as two more copies of the metric
+    *names* with the values left out, right next to the same numbers as ``val_loss: 0.449``. One
+    field now, carrying the callback closest to stopping (largest ``wait_count``, then the shortest
+    ``patience``); ``verbose=True`` still prints a line per callback for whoever wants both.
     """
-    fields: dict[str, str] = {}
-    for callback in getattr(trainer, "callbacks", ()):
-        if not isinstance(callback, EarlyStopping) or callback.monitor is None:
-            continue
-        fields[f"early_stopping/{callback.monitor}"] = f"{callback.wait_count}/{callback.patience}"
-    return fields
+    counts = [
+        (callback.wait_count, callback.patience)
+        for callback in getattr(trainer, "callbacks", ())
+        if isinstance(callback, EarlyStopping) and callback.monitor is not None
+    ]
+    if not counts:
+        return {}
+    wait, patience = max(counts, key=lambda pair: (pair[0], -pair[1]))
+    return {"early_stopping": f"{wait}/{patience}"}
 
 
 class SBBProgressBar(RichProgressBar):
-    """``RichProgressBar`` with the early-stopping counters added to the numbers it shows.
+    """``RichProgressBar`` that leaves every finished epoch's line on screen, counters included.
 
-    The bar lists ``trainer.callback_metrics`` -- ``v_num``, ``train_loss_step``, ``val_loss`` --
-    and says nothing about the two ``EarlyStopping``\\ s registered beside it, so a run's remaining
-    patience was only ever visible as the ``Metric ...`` lines this package silenced. Those numbers
-    belong on the bar: :func:`early_stopping_fields` adds ``early_stopping/val_loss: 3/10``.
+    Two changes to the parent, both about what a bar is for:
+
+    ``leave=True`` (the parent defaults to ``False``)
+        Rich paints one *live* panel and repaints it in place, so with the default an epoch's bar is
+        erased the moment the next epoch starts and a finished run leaves one line behind -- the last
+        epoch, not the run. The parent stops and rebuilds the live display at each epoch start when
+        ``leave`` is on, which prints the finished frame first: ``Epoch 0/199 ...`` with the numbers
+        that epoch ended on, then a fresh bar. A ``sbb train`` of 200 epochs ends with 200 lines.
+    :func:`early_stopping_fields` on the metrics line
+        The parent lists ``trainer.callback_metrics`` and says nothing about the two
+        ``EarlyStopping``\\ s registered beside it, so a run's remaining patience was only ever
+        visible as the ``Metric ...`` lines this package silenced. ``early_stopping: 3/10`` is now
+        part of the line, beside the losses.
     """
+
+    def __init__(self, *args: Any, leave: bool = True, **kwargs: Any) -> None:
+        """``leave`` defaults to ``True``; the parent's own arguments (``refresh_rate``, ``theme``,
+        ``console_kwargs``) pass through unchanged."""
+        super().__init__(*args, leave=leave, **kwargs)
 
     def get_metrics(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> dict[str, Any]:
         """The parent's metrics plus the early-stopping counters, as one dict."""
