@@ -965,6 +965,25 @@ def test_gt_visualize_defaults_to_a_type_named_file(runner: CliRunner, xml_dir: 
     assert (xml_dir / "page_2d.png").exists()
 
 
+def test_gt_visualize_renders_an_escriptorium_page(runner: CliRunner, tmp_path: Path) -> None:
+    """The command used to die on every escriptorium page it was given.
+
+    Their ids are hex -- ``ID="eSc_textblock_ab93aa35"`` -- and the digits of an ``@ID`` *are* the
+    class when no mapping is passed, so the render asked for class ``9335`` on a uint8 map and
+    raised. The suite's own ``ID="r1"`` fitted, so only real files showed it; see
+    ``gt.render._label_of`` for the check and :func:`test_gt`'s version of this case.
+    """
+    xml = tmp_path / "BL_Or_1443_300.xml"
+    xml.write_bytes(
+        PAGE_XML.replace('ID="r1"', 'ID="eSc_textblock_ab93aa35"')
+        .format(size=SIZE, edge=SIZE - 4)
+        .encode("iso-8859-5")
+    )
+    result = invoke(runner, "gt", "visualize", xml, "-o", tmp_path / "rendered.png")
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "rendered.png").exists()
+
+
 def test_gt_generate_dry_run_lists_the_files_it_would_read(
     runner: CliRunner, tmp_path: Path, xml_dir: Path
 ) -> None:

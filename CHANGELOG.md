@@ -369,6 +369,14 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   used an `int`, so the column-normalising resize never ran; and `--use-case` offered
   `config.models.UseCase`'s five members where the generator's own enum has seven, rejecting
   `binarization` and `reading_order`.
+- **`sbb gt visualize` raised on every escriptorium page, and on any id above 255.** The command takes
+  no `--config`, so a region's class comes from the digits of its `@ID` -- the legacy encoding,
+  `paragraph_2` → class 2 -- and escriptorium ids are hex: `eSc_textblock_ab93aa35` reads as class
+  `9335`, and `label_image` refused the map with `ValueError: class id 9335 does not fit a uint8
+  label map`. `render._label_of` range-checked the *configured* ids and never the derived one. Digits
+  are used only while they fit; past 255 the region takes the `zlib.crc32`-of-identity id the
+  no-digits case already used, bounded by the palette. `gt generate` always passes the mapping and the
+  suite's own `ID="r1"` fits, so the path shipped broken and stayed green.
 - **Eleven more, found by `tests/test_gt.py` and fixed in the same commit that retired its
   `TODO` markers.** `generate_pairs` could not build a single sample for any input size other than
   the page's own -- `np.stack` refused the page-sized label maps beside the resampled layout

@@ -1618,6 +1618,20 @@ def test_label_of_without_any_digits_hashes_the_identity() -> None:
     assert render._label_of(subject, None) == 4  # zlib.crc32(b"tableregion:table") % 19
 
 
+def test_an_id_whose_digits_cannot_fit_a_uint8_map_falls_back_to_the_hash() -> None:
+    """escriptorium ids are hex, and their digits are not class ids.
+
+    ``eSc_textblock_ab93aa35`` reads as ``9335``, which no uint8 label map holds -- and because
+    ``sbb gt visualize`` is the one caller that passes no mapping, the command raised
+    ``class id 9335 does not fit a uint8 label map`` for every escriptorium page it was handed
+    (and every ALTO one whose ``ID`` is not a small number). The tests' own ``ID="r1"`` and
+    ``paragraph_2`` both fit, which is how the suite never noticed.
+    """
+    subject = region(parser.RegionKind.TEXT, "eSc_textblock_ab93aa35", RECT, "text_zone")
+    assert render._label_of(subject, None) == 17  # zlib.crc32(b"textregion:text_zone") % 19
+    assert render._label_of(subject, None) <= 255
+
+
 def test_make_image_from_bb_clamps_every_box_to_the_canvas() -> None:
     """``[x, y, w, h]`` boxes on a 10 x 10 canvas: the negative box is clamped to the origin, the
     overflowing box is cut, the off-canvas box is skipped, and the overlap is counted once."""

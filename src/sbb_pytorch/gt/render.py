@@ -415,7 +415,11 @@ def _label_of(region: Region, labels: Mapping[RegionKind, int] | None) -> int:
     if labels is not None and region.kind in labels:
         return int(labels[region.kind])
     digits = "".join(char for char in region.region_id if char.isdigit())
-    if digits:
+    # Only digits that fit the uint8 map `label_image` builds. escriptorium ids are hex
+    # (`eSc_textblock_ab93aa35` -> 9335), so `sbb gt visualize` -- the one caller that passes no
+    # *labels* -- raised `class id 9335 does not fit a uint8 label map` for every page it was
+    # given until the digits were range-checked here.
+    if digits and int(digits) <= 255:
         return int(digits)
     identity = f"{region.kind.value}:{region.type_name}".encode()
     return zlib.crc32(identity) % len(DEFAULT_LABEL_PALETTE)
