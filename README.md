@@ -93,6 +93,7 @@ when the `safetensors` dependency is installed.
 | `-d, --device` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps` -- validated at parse time by `sbb_pytorch.device.resolve_device`, so a device that cannot run is refused before a model is built (a `click.Choice` could not express `cuda:1`; a hard-coded `cuda` default crashed CPU-only boxes) |
 | `-o, --output-dir` | Run directory; default `config.dir_output` |
 | `-e, --epochs`, `-b, --batch-size`, `-w, --num-workers`, `--lr`, `--patience` | Field overrides (`n_epochs`, `n_batch`, `num_workers`, `learning_rate`, `patience`) |
+| `--val-fraction` | Field override (`val_fraction`) -- the share of `dir_train` validation gets when `dir_eval` is empty; `0.2` unless the config or the flag says otherwise |
 | `--resume` | Checkpoint to resume from; the config's `dir_of_start_model` when omitted -- in `train.py` the flag existed and the value was never passed to `fit(ckpt_path=...)` |
 | `--start-weights` | Finetune: a `.pt`, `.pth`, `.ckpt` or `.safetensors` whose weights the model is built from, replacing the config's `init_method` and any ImageNet download. A *new* run -- the optimiser and epoch counter do not come from the file -- so it is refused next to `--resume`, next to an explicit `--pretrained`/`--no-pretrained`, and next to a config whose `continue_training` is true |
 | `--page2label`, `--scales` | Attach a page-to-label / enhancement-scales file (or use a config with them inlined) |

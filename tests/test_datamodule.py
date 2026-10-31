@@ -74,7 +74,7 @@ def test_it_is_the_lightning_class_the_legacy_one_was_not(tmp_path: Path) -> Non
 def test_batch_size_and_workers_come_from_the_config(module: SBBDataModule) -> None:
     """``batch_size=8, num_workers=4`` were arguments to the legacy class while the config said
     otherwise; they are now config fields with a per-call override."""
-    assert (module.batch_size, module.num_workers) == (2, 0)
+    assert (module.batch_size, module.num_workers, module.val_fraction) == (2, 0, 0.2)
     overridden = SBBDataModule(module.config, batch_size=1, num_workers=0)
     assert (overridden.batch_size, overridden.num_workers) == (1, 0)
 
@@ -82,6 +82,22 @@ def test_batch_size_and_workers_come_from_the_config(module: SBBDataModule) -> N
 def test_val_fraction_is_validated(module: SBBDataModule) -> None:
     with pytest.raises(ValueError, match=r"val_fraction must be in \[0, 1\)"):
         SBBDataModule(module.config, val_fraction=1.0)
+
+
+def test_the_configs_val_fraction_is_the_share_the_split_uses(tmp_path: Path) -> None:
+    """Ten training pages at ``0.1`` is one page of validation, because the config now says so.
+
+    ``val_fraction`` was an argument no config file could carry, so a run validated the default
+    fifth of itself -- 100 pages of eval on a 500-page dataset, for a number that arrives after the
+    epoch it describes. It is a field (``--val-fraction`` on the CLI), and the share it names is
+    the share the loaders get.
+    """
+    root = data_root(tmp_path, train=10, evals=0)
+    config = make_config(dir_train=str(root / "train"), dir_eval="", val_fraction=0.1)
+    module = SBBDataModule(config)
+    module.setup("fit")
+    assert module.val_fraction == 0.1
+    assert (len(module.train_dataset), len(module.val_dataset)) == (9, 1)
 
 
 # --------------------------------------------------------------------- where the data is

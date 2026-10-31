@@ -78,6 +78,7 @@ def test_minimal_config_fills_in_every_default() -> None:
     assert config.optimizer.value == "adam"
     assert config.device == "cuda"
     assert config.num_workers == 4
+    assert config.val_fraction == 0.2
     assert config.patience == 10
     assert config.image_size == (672, 448)
     assert config.transformer is None
@@ -493,11 +494,20 @@ def test_cli_flag_names_map_onto_fields() -> None:
     """``--epochs`` / ``--batch-size`` / ``--resume`` had no config home; they do now."""
     config = SBBConfig.model_validate(BASE)
     changed = apply_overrides(
-        config, epochs=30, batch_size=4, lr=1e-3, resume="runs/m.pt", device="cpu"
+        config,
+        epochs=30,
+        batch_size=4,
+        lr=1e-3,
+        patience=7,
+        val_fraction=0.1,
+        resume="runs/m.pt",
+        device="cpu",
     )
     assert changed.n_epochs == 30
     assert changed.n_batch == 4
     assert changed.learning_rate == 1e-3
+    assert changed.patience == 7
+    assert changed.val_fraction == 0.1
     assert changed.dir_of_start_model == Path("runs/m.pt")
     assert changed.device == "cpu"
     assert config.n_epochs == 50  # the original is untouched
@@ -517,6 +527,8 @@ def test_override_validation_still_applies() -> None:
         apply_overrides(config, n_epocs=3)
     with pytest.raises(ConfigError, match="invalid override"):
         apply_overrides(config, n_batch=0)
+    with pytest.raises(ConfigError, match="invalid override"):
+        apply_overrides(config, val_fraction=1.0)  # a whole set is not a share of one
 
 
 def test_json_schema_is_generated_and_dumpable(tmp_path: Path) -> None:

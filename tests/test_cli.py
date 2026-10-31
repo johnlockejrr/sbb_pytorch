@@ -681,9 +681,10 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
     (:func:`sbb_pytorch.cli._regions_for_mask`), which is what a *layout* answer is: the config has
     no ``page2label``, so its task decides the shape and the shape is one flat region per class.
 
-    The class name is the pair the assertion checks. ``class_1`` is not one of the schema's eighteen
-    ``@type`` values, so the writer keeps ``@type`` empty and names the class in ``@custom`` instead,
-    where any string is legal -- and the region that comes back from parsing says the same two things.
+    The class name is the pair the assertion checks. ``class_1`` is the placeholder ``n_classes``
+    stands in for a name a table would give, not a name, so ``@type`` stays empty (the enumeration is
+    closed) and ``@custom`` says the element's own word, ``text_zone`` -- the word escriptorium uses
+    for a block it has no class for, and the one Aletheia accepts.
     """
     page = tmp_path / "page.png"
     imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
@@ -710,8 +711,8 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
         )
         for region in written.regions
     ] == [
-        ("page_1_0", "", "structure {type:class_1;}", (4, 4, 24, 8)),
-        ("page_2_0", "", "structure {type:class_2;}", (4, 16, 24, 8)),
+        ("page_1_0", "", "structure {type:text_zone;}", (4, 4, 24, 8)),
+        ("page_2_0", "", "structure {type:text_zone;}", (4, 16, 24, 8)),
     ]
 
 
@@ -748,7 +749,7 @@ def test_infer_xml_writes_no_region_for_a_predicted_boundary_class(
     result = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", source)
     assert result.exit_code == 0, result.output
     assert [(region.region_id, region.custom) for region in parse_pagexml(source).regions] == [
-        ("page_1_0", "structure {type:class_1;}"),  # the block the line forms
+        ("page_1_0", "structure {type:text_zone;}"),  # the block the line forms
         ("page_1_0_0", "structure {type:text_line;}"),  # and the line itself
     ]
 

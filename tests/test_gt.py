@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -2491,9 +2492,13 @@ def test_custom_for_writes_the_dialect_the_annotation_tools_use() -> None:
     assert vocabulary.custom_for(RegionKind.TEXTLINE) == "structure {type:text_line;}"
     # A line never carries its block's class: the element already says what it is.
     assert vocabulary.custom_for(RegionKind.TEXTLINE, "header") == "structure {type:text_line;}"
-    assert vocabulary.custom_for(RegionKind.TEXT, "class_1") == "structure {type:class_1;}"
     assert vocabulary.custom_for(RegionKind.IMAGE) == ""  # nothing to say, so no attribute
-    assert vocabulary.custom_for(RegionKind.TABLE, "class_3") == "structure {type:class_3;}"
+    # ``class_1`` is the placeholder a number gets when no table names it, and Aletheia rejects a
+    # class it has never heard of, so it counts as no class: the block is named ``text_zone`` the
+    # way escriptorium names every block it has no class for, and a kind with no word of its own
+    # still writes nothing.
+    assert vocabulary.custom_for(RegionKind.TEXT, "class_1") == "structure {type:text_zone;}"
+    assert vocabulary.custom_for(RegionKind.TABLE, "class_3") == ""
 
 
 def test_kind_for_class_name_reads_every_way_a_config_names_a_class() -> None:
@@ -2571,14 +2576,14 @@ def test_a_parsed_page_written_and_parsed_again_is_the_same_page(tmp_path: Path)
     ]
     # The three Metadata elements the schema requires, which this fixture has none of and the old
     # writer never wrote at all: the page's own values when it has them (pinned by
-    # ``test_a_parsed_page_keeps_the_author_and_stamps_a_rewrite_would_erase``) and the writer's
-    # :data:`~sbb_pytorch.gt.writer.CREATOR`/:data:`~sbb_pytorch.gt.writer.DEFAULT_TIMESTAMP` when
-    # it does not, which is the case here.
-    assert (again.creator, again.created, again.last_change) == (
-        writer.CREATOR,
-        writer.DEFAULT_TIMESTAMP,
-        writer.DEFAULT_TIMESTAMP,
+    # ``test_a_parsed_page_keeps_the_author_and_stamps_a_rewrite_would_erase``), and the write's own
+    # instant -- :func:`~sbb_pytorch.gt.writer.timestamp_now`'s shape, in both slots -- when it does
+    # not, which is the case here. The epoch is gone: a viewer shows it as a date, and it lied.
+    assert again.creator == writer.CREATOR
+    assert again.created is not None and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", again.created
     )
+    assert again.created == again.last_change  # LastChange follows Created when both are new
 
 
 def qname(name: str) -> str:
@@ -2684,10 +2689,10 @@ def test_the_three_required_metadata_elements_and_nothing_the_page_has_no_value_
     """``Creator``, ``Created``, ``LastChange`` are required; the old writer wrote one of the three.
 
     A page with no author and no timestamps gets :data:`~sbb_pytorch.gt.writer.CREATOR` and
-    :data:`~sbb_pytorch.gt.writer.DEFAULT_TIMESTAMP` -- the package will not read a clock, so the
-    epoch says plainly that nothing was supplied, and ``--created`` replaces it -- while
-    ``@externalRef`` and ``<Comments>`` stay off the file when the page has no value for them,
-    because an optional attribute written empty is a different answer from one not written.
+    :func:`~sbb_pytorch.gt.writer.timestamp_now` -- the write's own instant, in the ``xs:dateTime``
+    shape the schema types both elements as, and ``--created`` replaces it -- while ``@externalRef``
+    and ``<Comments>`` stay off the file when the page has no value for them, because an optional
+    attribute written empty is a different answer from one not written.
     """
     root = ET.fromstring(
         writer.to_pagexml(parser.Page(path=Path("p.xml"), file_name="p", height=10, width=10))
@@ -2696,9 +2701,10 @@ def test_the_three_required_metadata_elements_and_nothing_the_page_has_no_value_
     assert _names(metadata) == ["Creator", "Created", "LastChange"]
     assert metadata.get("externalRef") is None
     assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Creator").text == writer.CREATOR
-    assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Created").text == writer.DEFAULT_TIMESTAMP
+    created = metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Created").text
+    assert created is not None and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created)
     assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}LastChange").text == (
-        writer.DEFAULT_TIMESTAMP  # LastChange follows Created when the page states neither
+        created  # LastChange follows Created when the page states neither
     )
     assert metadata.find(f"{{{writer.PAGE_NAMESPACE}}}Comments") is None  # no columns, no marker
 
@@ -2851,12 +2857,12 @@ def test_a_type_the_element_cannot_say_is_written_in_custom_instead(tmp_path: Pa
     image = page_element.find(f"{{{writer.PAGE_NAMESPACE}}}ImageRegion")
     assert text_a.get("type") == "header"  # a name in the enumeration is written as @type
     assert text_a.get("custom") == "structure {type:header;}"
-    assert text_b.get("type") is None  # not in it: no @type, and the name still reaches @custom
-    assert text_b.get("custom") == "structure {type:class_1;}"
+    # ``class_1`` is not in it, and it is not a class either: the placeholder counts as no class, so
+    # @type stays empty (nothing to say) and @custom says the element's own word.
+    assert text_b.get("type") is None
+    assert text_b.get("custom") == "structure {type:text_zone;}"
     assert image.get("type") is None  # ImageRegion has no @type attribute to put a name in...
-    assert (
-        image.get("custom") == "structure {type:class_2;}"
-    )  # ...and @custom holds it all the same
+    assert image.get("custom") is None  # ...and with no class it has no @custom either
 
 
 def test_a_loose_textline_is_wrapped_in_the_region_the_schema_wants(tmp_path: Path) -> None:

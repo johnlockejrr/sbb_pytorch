@@ -13,12 +13,13 @@ what the old writer did instead:
 
 ``Metadata`` is ``Creator``, ``Created``, ``LastChange`` in that order, all three required
     The old writer wrote ``Creator`` alone, because the page it was given had no timestamps to
-    write -- v3's answer was ``datetime.now(timezone.utc)`` (``inference.py:791-795``), which made
-    every write a different file and is why this package still refuses to read a clock.  The parser
-    now reads all three attributes off a page that has them, so a rewrite keeps the real
+    write.  v3's answer was ``datetime.now(timezone.utc)`` (``inference.py:791-795``); the port
+    answered with ``1970-01-01T00:00:00Z`` instead, which is a well-formed ``xs:dateTime`` that
+    tells a reader the file was never stamped -- and a PAGE viewer shows it to them as a date.  The
+    parser now reads all three attributes off a page that has them, so a rewrite keeps the real
     ``Creator``/``Created``/``LastChange`` and the ``@externalRef`` beside them; a page with nothing
-    to preserve gets :data:`DEFAULT_TIMESTAMP`, which round-trips and is honest about being a
-    placeholder, and :option:`sbb infer --created` overrides it.
+    to preserve gets :func:`timestamp_now`, the moment it was written, and
+    :option:`sbb infer --created` overrides it.
 ``Page``'s children run ``Border``, ``PrintSpace``, ``ReadingOrder``, *then* the regions
     The old writer emitted the regions first and the reading order last, where the schema puts the
     order before them -- and wrote ``PrintSpace``/``Border`` as members of the region choice, which
@@ -56,6 +57,7 @@ parser read them out of order.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -66,10 +68,10 @@ from .vocabulary import VOCABULARY, RegionKind, ancestor_chain, custom_for, elem
 
 __all__ = [
     "CREATOR",
-    "DEFAULT_TIMESTAMP",
     "PAGE_NAMESPACE",
     "SCHEMA_LOCATION",
     "points_attribute",
+    "timestamp_now",
     "to_pagexml",
     "write_pagexml",
 ]
@@ -99,13 +101,6 @@ _XSI_NAMESPACE: Final = "http://www.w3.org/2001/XMLSchema-instance"
 #: Two spaces, the indent v3 got from ``minidom.toprettyxml(indent="  ")`` (``inference.py:832``).
 _INDENT: Final = "  "
 
-#: ``Metadata/Created`` and ``LastChange`` for a page that has none -- a mask answer, which no file
-#: was read from. The schema types both as ``xsd:dateTime``, so the value has to be a real instant
-#: and the package will not read a clock (see the module docstring); the epoch says plainly "no
-#: timestamp was supplied", round-trips to the same string, and is replaced by the file's own value
-#: the moment there is one, or by ``--created`` on the command line.
-DEFAULT_TIMESTAMP: Final = "1970-01-01T00:00:00Z"
-
 #: ``OrderedGroup/@id`` the tool has written since the eynollah days
 #: (``utils/xml.py:51``: ``OrderedGroupType(id="ro357564684568544579089")``). The port reads only
 #: ``RegionRefIndexed``, never this id, so one constant stands in for the uuid it used to be -- and
@@ -115,6 +110,18 @@ _ORDERED_GROUP_ID: Final = "ro357564684568544579089"
 
 ET.register_namespace("", PAGE_NAMESPACE)
 ET.register_namespace("xsi", _XSI_NAMESPACE)
+
+
+def timestamp_now() -> str:
+    """``Metadata/Created`` and ``LastChange`` for a page that states neither: now, in UTC.
+
+    The schema types both as ``xsd:dateTime``, so the value has to be a real instant. v3 wrote
+    ``datetime.now(timezone.utc)`` (``inference.py:791-795``); the port wrote ``1970-01-01T00:00:00Z``
+    instead, which is well-formed but tells a reader the file was never stamped -- and a PAGE viewer
+    shows it to them as a date. A page parsed from a file keeps its own stamps, so this answers only
+    "when did *this* write happen", and :option:`sbb infer --created` overrides it.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _element(name: str) -> ET.Element:
@@ -183,11 +190,12 @@ def _metadata_element(root: ET.Element, page: Page) -> None:
     The three children are required, which is what the old writer's
     ``<Metadata><Creator/></Metadata>`` failed on, and why a page now has to answer for all three:
     the parsed page's own values when it has them (so a rewrite keeps escriptorium's author and
-    stamps instead of erasing them) and :data:`CREATOR` / :data:`DEFAULT_TIMESTAMP` when it does
-    not. ``Comments`` stays optional and is written only when the page has a column count, whose
+    stamps instead of erasing them), :data:`CREATOR` and :func:`timestamp_now` when it does not --
+    the write's own instant, not the epoch the port used to stamp every unauthored page with.
+    ``Comments`` stays optional and is written only when the page has a column count, whose
     digits run to the next delimiter for the reasons :func:`~.parser._columns_width` gives.
     """
-    created = page.created or DEFAULT_TIMESTAMP
+    created = page.created or timestamp_now()
     metadata = _element("Metadata")
     if page.external_ref:
         # An optional attribute is omitted rather than written empty, and it belongs to Metadata
@@ -236,7 +244,9 @@ def _attributes(kind: RegionKind, region: Region, ids: _IdFactory) -> dict[str, 
     element may say them at all: ``type_for`` is empty for a kind with no ``@type`` attribute or a
     name outside the closed enumeration, and ``custom_for`` carries the class name where ``@type``
     cannot (``structure {type:paragraph;}``), the element's own word where the class does not
-    (``text_line``), and nothing where neither has anything to say.
+    (``text_line``), and nothing where neither has anything to say.  A ``class_1``-style placeholder
+    counts as no class at all, so the block a predicted line forms is written ``text_zone`` -- the
+    word escriptorium uses for it -- and not a class name the vocabulary has never heard of.
     """
     attributes = {"id": ids(kind, region.region_id)}
     if type_name := type_for(kind, region.type_name):

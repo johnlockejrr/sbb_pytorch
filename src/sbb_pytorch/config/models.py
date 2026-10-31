@@ -392,6 +392,13 @@ class SBBConfig(BaseModel):
     momentum: float = Field(default=0.9, ge=0, lt=1)
     device: str = "cuda"
     num_workers: int = Field(default=4, ge=0)
+    #: Share of ``dir_train`` handed to validation when ``dir_eval`` is empty: the legacy pipeline
+    #: took its second folder and called everything in it the eval set, which is a fifth of a
+    #: 500-page dataset on a small run and half a GPU-day for a number nobody reads. ``0.2`` is
+    #: what :class:`~sbb_pytorch.data.datamodule.SBBDataModule` accepted as its argument default and
+    #: what every configless run still gets; ``sbb train --val-fraction`` overrides it per run.
+    #: ``0.0`` is legal and means the split hands everything to training.
+    val_fraction: float = Field(default=0.2, ge=0.0, lt=1.0)
     patience: int = Field(default=10, ge=0)
     accumulate_grad_batches: int = Field(default=1, ge=1)
     gradient_clip_val: float | None = Field(default=None, ge=0)

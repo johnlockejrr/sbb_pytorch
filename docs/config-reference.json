@@ -42,7 +42,7 @@
     },
     "Page2Label": {
       "additionalProperties": false,
-      "description": "``custom_config_page2label.json`` -- which XML element names map to which class ids.\n\nThe legacy ``validate_configs`` required *exactly one* text region for the textline use\ncase; the shipped file defines three (``rest_as_paragraph``, ``header``, ``heading``,\n``marginalia``) so the rule contradicted the project's own config and is dropped. The\nduplicate value (both ``header`` and ``heading`` map to ``2``) is reported by\n:meth:`SBBConfig.warnings` rather than rejected, because it is present in the shipped file.\n\nThe five fields the legacy table carried and this model did not have -- ``case_label``,\n``artificial_class_label``, ``printspace_as_class_in_layout``, ``tableregion``,\n``noiseregion`` -- are here now, which is what lets a single-class config\n(``configs/textline.json``, ``n_classes: 2``) name what its own model predicts instead of\ninheriting the layout table's ids.  :meth:`all_regions` and :meth:`class_ids` keep naming only\nthe elements they always named, so the inversion a ``layout`` config produces is unchanged.",
+      "description": "``custom_config_page2label.json`` -- which XML element names map to which class ids.\n\nThe legacy ``validate_configs`` required *exactly one* text region for the textline use\ncase; the shipped file defines three (``rest_as_paragraph``, ``header``, ``heading``,\n``marginalia``) so the rule contradicted the project's own config and is dropped. The\nduplicate value (both ``header`` and ``heading`` map to ``2``) is reported by\n:meth:`SBBConfig.warnings` rather than rejected, because it is present in the shipped file.\n\nThe five fields the legacy table carried and this model did not have -- ``case_label``,\n``artificial_class_label``, ``printspace_as_class_in_layout``, ``tableregion``,\n``noiseregion`` -- are here now, which is what lets a single-class config\n(``configs/textline.json``, ``n_classes: 3``) name what its own model predicts instead of\ninheriting the layout table's ids: its :attr:`case_label` is the line class and its\n:attr:`artificial_class_label` the boundary ring between lines. :meth:`all_regions` and\n:meth:`class_ids` keep naming only the elements they always named, so the inversion a\n``layout`` config produces is unchanged.",
       "properties": {
         "artificial_class_label": {
           "anyOf": [
@@ -687,6 +687,13 @@
     "type_output": {
       "$ref": "#/$defs/OutputType",
       "default": "2d"
+    },
+    "val_fraction": {
+      "default": 0.2,
+      "exclusiveMaximum": 1.0,
+      "minimum": 0.0,
+      "title": "Val Fraction",
+      "type": "number"
     },
     "weight_decay": {
       "default": 1e-06,

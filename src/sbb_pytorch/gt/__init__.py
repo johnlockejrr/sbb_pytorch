@@ -120,6 +120,7 @@ from .vocabulary import (
     LEGACY_INACTIVE_TEXT_TYPES,
     PAGE_ELEMENT_NAMES,
     REGION_TAGS,
+    SYNTHETIC_CLASS_PATTERN,
     TEXT_REGION_TYPES,
     VOCABULARY,
     RegionKind,
@@ -134,10 +135,10 @@ from .vocabulary import (
 )
 from .writer import (
     CREATOR,
-    DEFAULT_TIMESTAMP,
     PAGE_NAMESPACE,
     SCHEMA_LOCATION,
     points_attribute,
+    timestamp_now,
     to_pagexml,
     write_pagexml,
 )
@@ -233,6 +234,7 @@ __all__ = [
     "LEGACY_INACTIVE_TEXT_TYPES",
     "PAGE_ELEMENT_NAMES",
     "REGION_TAGS",
+    "SYNTHETIC_CLASS_PATTERN",
     "TEXT_REGION_TYPES",
     "VOCABULARY",
     "RegionKind",
@@ -240,16 +242,17 @@ __all__ = [
     "ancestor_chain",
     "custom_for",
     "element_for",
+    "is_synthetic_class_name",
     "kind_for_class_name",
     "kind_for_element",
     "normalise_text_type",
     "type_for",
     # writer — PageXML serialisation
     "CREATOR",
-    "DEFAULT_TIMESTAMP",
     "PAGE_NAMESPACE",
     "SCHEMA_LOCATION",
     "points_attribute",
+    "timestamp_now",
     "to_pagexml",
     "write_pagexml",
 ]

@@ -127,6 +127,13 @@ replacement.
   `model.safetensors` beside the source instead of `model.pt`, with no `model_config.json` beside it
   because a safetensors file carries its own config. An `-o` that names a file keeps that file's
   extension whatever `--format` says.
+- **`val_fraction` is a config field, and `sbb train --val-fraction` is its flag.** The share of
+  `dir_train` handed to validation when `dir_eval` is empty used to exist only as
+  `SBBDataModule(val_fraction=0.2)` -- an argument no config file could carry, so every run validated
+  the default fifth of its training folder: 100 pages of eval on a 500-page dataset, scored every
+  epoch for a number that arrives after the epoch it describes. `0.2` stays the default,
+  `"val_fraction": 0.1` is the tenth the same run wanted, `--val-fraction 0.1` overrides it per run,
+  and `0.0` (legal, `ge=0.0, lt=1.0`) hands everything to training.
 
 ### Changed
 
@@ -414,8 +421,10 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   even when the parsed one was empty (`<Element>_<n>`, counted per element name, which keeps the
   output byte-stable), gives the `<OrderedGroup>` the `@id` it had left off while its own
   `_ORDERED_GROUP_ID` sat unused in the same file, and writes `Created`/`LastChange` from the parsed
-  page -- falling back to `--created`, and without that to `1970-01-01T00:00:00Z`, the no-clock
-  promise kept as an argument rather than a hash pretending to be a date.
+  page -- falling back to `--created`, and without that to `writer.timestamp_now()`: the current UTC
+  second. The epoch (`1970-01-01T00:00:00Z`, `writer.DEFAULT_TIMESTAMP`, now gone) was a legal
+  `xs:dateTime` that every tool opened and displayed as 1970, which is the difference between a date
+  the schema accepts and a date the person opening the file believes.
 - **`gt/vocabulary.py` is the PageXML element and `@type` table, and the schema is its authority.**
   Three places spelled these names before, and all three disagreed with the xsd: `gt.parser` kept ten
   text types and four graphic ones where the schema has eighteen and eleven (so a `caption`, `footer`
@@ -427,7 +436,13 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `TEXT_REGION_TYPES`, `GRAPHIC_REGION_TYPES` and `REGION_TAGS` are aliases of the new table and
   `normalise_text_type` moved there rather than being copied a sixth time; `cli._class_name` is gone,
   its only caller asking `type_for`/`custom_for` instead -- `Predictor._class_names` keeps the comma
-  join for `Prediction.label`, which is not an XML attribute. `cli._regions_for_mask` now shapes the
+  join for `Prediction.label`, which is not an XML attribute. The table now answers a fourth set of
+  names too: `class_1`, `class_2`, the placeholder `n_classes` gives a class id when no `page2label`
+  table names one (`is_synthetic_class_name`). The xsd permits it in `@custom`, where any string is
+  legal, and Aletheia does not -- the dialect it checks lists the classes a page may name, and a
+  numbered stand-in is not one of them -- so it counts as the *absence* of a class and the region is
+  named `structure {type:text_zone;}`, the word escriptorium itself writes for a block with no class,
+  where this writer had written `structure {type:class_1;}`. `cli._regions_for_mask` now shapes the
   answer by use case (`textline` groups lines into blocks via `gt.geometry.group_contours_into_blocks`
   and `convex_hull` and nests them, `layout` writes one region per class, `printspace` and
   `binarization` write the `PrintSpace` outline alone instead of the bogus regions they used to add,

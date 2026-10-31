@@ -305,6 +305,12 @@ def main(ctx: click.Context, verbose: bool) -> None:
 @click.option("--lr", "learning_rate", type=float, default=None)
 @click.option("--patience", type=int, default=None)
 @click.option(
+    "--val-fraction",
+    type=float,
+    default=None,
+    help="Share of dir_train kept for validation when dir_eval is empty; the config's when omitted.",
+)
+@click.option(
     "--resume",
     type=click.Path(exists=True, dir_okay=True, allow_dash=False, path_type=Path),
     default=None,
@@ -365,6 +371,7 @@ def train(
     workers: int | None,
     learning_rate: float | None,
     patience: int | None,
+    val_fraction: float | None,
     resume: Path | None,
     start_weights: Path | None,
     page2label: Path | None,
@@ -417,6 +424,7 @@ def train(
         workers=workers,
         lr=learning_rate,
         patience=patience,
+        val_fraction=val_fraction,
         resume=str(resume) if resume else None,
         pretraining=pretrained,
     )

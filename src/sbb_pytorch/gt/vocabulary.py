@@ -22,6 +22,7 @@ never again.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
@@ -31,6 +32,7 @@ __all__ = [
     "LEGACY_INACTIVE_TEXT_TYPES",
     "PAGE_ELEMENT_NAMES",
     "REGION_TAGS",
+    "SYNTHETIC_CLASS_PATTERN",
     "TEXT_REGION_TYPES",
     "VOCABULARY",
     "RegionKind",
@@ -38,6 +40,7 @@ __all__ = [
     "ancestor_chain",
     "custom_for",
     "element_for",
+    "is_synthetic_class_name",
     "kind_for_class_name",
     "kind_for_element",
     "normalise_text_type",
@@ -274,15 +277,37 @@ def kind_for_class_name(name: str) -> RegionKind | None:
     return None
 
 
+#: ``class_1``, ``class_02``: the name a class id gets when no ``page2label`` table has one, from
+#: :func:`sbb_pytorch.cli._class_labels` (``configs/textline.json`` cleared its tables down to
+#: ``case_label``, so every class it has is now named this way) and from
+#: :meth:`sbb_pytorch.inference.predictor.Predictor._class_names` for a config with no table at all.
+#: It is a stand-in for a name, never one: the schema lets ``@custom`` hold any string, and Aletheia
+#: checks the string against the classes it knows and rejects this one.
+SYNTHETIC_CLASS_PATTERN: Final = re.compile(r"^class_\d+$")
+
+
+def is_synthetic_class_name(name: str) -> bool:
+    """True for the ``class_<id>`` placeholder a number gets when no table names it, not a name.
+
+    What a region writes in ``@custom`` has to be a class the vocabulary knows, so both
+    :func:`type_for` and :func:`custom_for` treat this shape as the absence of a name -- which is
+    what escriptorium writes for the same block (``text_zone``), and what cleared the page whose
+    ``structure {type:class_1;}`` Aletheia refused to open.
+    """
+    return bool(SYNTHETIC_CLASS_PATTERN.match(name.strip()))
+
+
 def type_for(kind: RegionKind, name: str = "") -> str:
     """The ``@type`` a region of *kind* whose class is *name* may carry, or ``""`` for none.
 
     Empty is the answer more often than it looks: five of the fifteen page-level elements have a
     ``@type`` at all, and the enumerations are closed -- ``"header, heading"``, ``"<imageregion>"``
     and ``"rest_as_paragraph"`` (all three of which this package used to write) come back empty and
-    are carried in ``@custom`` instead, where any string is legal.
+    are carried in ``@custom`` instead, where any string is legal.  So does
+    :func:`is_synthetic_class_name`, which is the absence of a name rather than an odd spelling of
+    one.
     """
-    if not name:
+    if not name or is_synthetic_class_name(name):
         return ""
     normalised = normalise_text_type(name)
     types = VOCABULARY[kind].types
@@ -298,9 +323,16 @@ def custom_for(kind: RegionKind, name: str = "") -> str:
     the schema cannot say what they mean, and on the lines and words that have no ``@type`` at all),
     and this is the one spelling of it the package uses.  A kind with no class and no default word
     of its own writes no ``@custom``.
+
+    The value named has to be a class the vocabulary knows: a joined name such as
+    ``"header, heading"`` is legal here and the schema's only home for it, while
+    :func:`is_synthetic_class_name` is the absence of a class, so it goes where an absent name goes
+    (to the element's word, ``text_zone``, or to nothing) instead of naming a class Aletheia has
+    never heard of.
     """
     vocabulary = VOCABULARY[kind]
-    labelled = normalise_text_type(name) if name and vocabulary.custom_from_class else ""
+    named = name if name and not is_synthetic_class_name(name) else ""
+    labelled = normalise_text_type(named) if named and vocabulary.custom_from_class else ""
     value = labelled or vocabulary.custom
     return f"structure {{type:{value};}}" if value else ""
 

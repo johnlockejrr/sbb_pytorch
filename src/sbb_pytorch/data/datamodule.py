@@ -112,11 +112,12 @@ class SBBDataModule(pl.LightningDataModule):
 
     Args:
         config: The resolved config: directories, ``n_classes``, sizes, ``n_batch``,
-            ``num_workers``, the augmentation flags and the ``patches`` switch.
+            ``num_workers``, ``val_fraction``, the augmentation flags and the ``patches`` switch.
         train_pairs: Pre-paired ``(image, label)`` paths. Given, ``dir_train`` is not listed and
             nothing is generated -- the way ``train.py`` used ``imgs_list``/``segs_list``.
         val_pairs: Same, for validation; given, ``dir_eval`` and ``val_fraction`` are skipped.
-        val_fraction: Share of the training folder used for validation when ``dir_eval`` is empty.
+        val_fraction: Override of ``config.val_fraction`` -- the share of the training folder used
+            for validation when ``dir_eval`` is empty.
         batch_size: Override of ``config.n_batch``.
         num_workers: Override of ``config.num_workers``.
         pin_memory: Override of the device-derived choice
@@ -133,21 +134,22 @@ class SBBDataModule(pl.LightningDataModule):
         *,
         train_pairs: list[tuple[Path, Path]] | None = None,
         val_pairs: list[tuple[Path, Path]] | None = None,
-        val_fraction: float = 0.2,
+        val_fraction: float | None = None,
         batch_size: int | None = None,
         num_workers: int | None = None,
         pin_memory: bool | None = None,
     ) -> None:
         self.roots = resolve_roots(config)  # ConfigError when the config describes no data
-        if not 0.0 <= val_fraction < 1.0:
-            raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+        fraction = config.val_fraction if val_fraction is None else float(val_fraction)
+        if not 0.0 <= fraction < 1.0:
+            raise ValueError(f"val_fraction must be in [0, 1), got {fraction}")
 
         super().__init__()
         self.config = config
         self.batch_size = config.n_batch if batch_size is None else int(batch_size)
         self.num_workers = config.num_workers if num_workers is None else int(num_workers)
         self.pin_memory = pin_memory
-        self.val_fraction = val_fraction
+        self.val_fraction = fraction
         self._pairs: dict[str, list[tuple[Path, Path]] | None] = {
             "train": list(train_pairs) if train_pairs is not None else None,
             "val": list(val_pairs) if val_pairs is not None else None,
