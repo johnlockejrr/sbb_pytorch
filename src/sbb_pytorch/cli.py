@@ -63,11 +63,13 @@ from sbb_pytorch.gt import (
     VOCABULARY,
     GroundTruthConfig,
     Page,
+    PageGeometry,
     Region,
     RegionKind,
     contour_bbox,
     contours_of_image,
     convex_hull,
+    deintersect_polygons,
     discover_xml_files,
     generate_ground_truth,
     generate_pairs,
@@ -75,6 +77,7 @@ from sbb_pytorch.gt import (
     kind_for_class_name,
     parse_pagexml,
     render_page,
+    simplify_contours,
     write_image,
     write_pagexml,
     write_pair,
@@ -595,6 +598,32 @@ def _advisories(config_path: Path, page2label: Path | None, config: SBBConfig) -
     "keeps its own; this names the page that was not. Default: 1970-01-01T00:00:00Z.",
 )
 @click.option(
+    "--simplify-epsilon",
+    "simplify_epsilon",
+    type=float,
+    default=None,
+    help="Douglas-Peucker tolerance in pixels applied to every predicted region's contour before "
+    "it is written -- the answer to a PageXML whose straight edges are one vertex per pixel. The "
+    "tolerance actually used grows with the contour's own perimeter (0.2% of it, floored at this "
+    "value), so a full page needs less than this number says. Default: the config's, 0, which "
+    "keeps every vertex the model produced.",
+)
+@click.option(
+    "--deintersect/--no-deintersect",
+    "deintersect",
+    default=None,
+    help="Trim the area two overlapping regions share off *both* of them instead of letting one "
+    "region's fill paint over its neighbour's edge (needs the `shapely` package). Default: the "
+    "config's, off.",
+)
+@click.option(
+    "--intersection-gap",
+    "intersection_gap",
+    type=float,
+    default=None,
+    help="How far apart two de-intersected neighbours are left, in pixels; default the API's 1.5.",
+)
+@click.option(
     "-c",
     "--config",
     "config_path",
@@ -627,6 +656,9 @@ def infer(
     ground_truth: Path | None,
     xml_file: Path | None,
     created: str | None,
+    simplify_epsilon: float | None,
+    deintersect: bool | None,
+    intersection_gap: float | None,
     config_path: Path | None,
     architecture: str | None,
     device: str | None,
@@ -671,6 +703,18 @@ def infer(
     use_patches = predictor.config.patches if patches is None else bool(patches)
     # The same flag-or-config rule as --patches: save_visualisation decides, --save/--no-save wins.
     should_save = predictor.config.save_visualisation if save is None else bool(save)
+    # ... and the same rule again for the shape of the regions written out: the three geometry
+    # flags win when given, the config's own three answer when they are not. Built once here, so
+    # the PageXML and anything else that writes regions cannot disagree about the geometry in use.
+    geometry = PageGeometry(
+        simplify_epsilon=(
+            predictor.config.simplify_epsilon if simplify_epsilon is None else simplify_epsilon
+        ),
+        deintersect=predictor.config.deintersect if deintersect is None else bool(deintersect),
+        intersection_gap=(
+            predictor.config.intersection_gap if intersection_gap is None else intersection_gap
+        ),
+    )
     if overlap is not None and not use_patches:
         raise click.BadParameter("--overlap tunes the --patches window; give --patches, or drop it")
 
@@ -699,6 +743,7 @@ def infer(
                     _page_xml_for(path, xml_file, single_page=len(files) == 1),
                     predictor.config,
                     created,
+                    geometry,
                 )
             if ground_truth is not None:
                 scores.append((path, _score_prediction(prediction, path, ground_truth)))
@@ -851,6 +896,30 @@ def _mask_labels(mask: np.ndarray, config: SBBConfig | None = None) -> list[int]
     return [value for value in values if value in config.page2label.region_class_ids()]
 
 
+def _prepared_contours(contours: list[np.ndarray], geometry: PageGeometry) -> list[np.ndarray]:
+    """The contours of one predicted class, as the page geometry says to write them.
+
+    Simplified first, then separated -- the order :class:`~sbb_pytorch.gt.simplify.PageGeometry`
+    documents, because separating two stair-stepped outlines trims the wrong area (the stairs are
+    the overlap) where simplifying first trims what the two shapes actually share.
+
+    With the switches off -- the config default, and every run so far -- the list comes back as it
+    was given, and a two-point contour a neighbour would have swallowed is kept: this function
+    changes the geometry only when it was asked to.
+    """
+    if geometry.is_off:
+        return list(contours)
+    simplified = [
+        contour
+        for contour in simplify_contours(contours, geometry.simplify_epsilon)
+        if contour.shape[0] >= 3
+    ]
+    if not geometry.deintersect or len(simplified) < 2:
+        return simplified
+    trimmed = deintersect_polygons(simplified, gap=geometry.intersection_gap)
+    return [contour for contour in trimmed if contour.shape[0] >= 3]
+
+
 #: The use case a mask answer takes its shape from when the config has no ``page2label`` to name one.
 #: The three tasks left over (classification, enhancement, reading order) answer with a label rather
 #: than a mask, so their entry only matters for a config that produces one anyway -- and the answer
@@ -871,7 +940,12 @@ def _use_case_for_mask(config: SBBConfig) -> UseCase:
     return _MASK_USE_CASE_BY_TASK[config.task]
 
 
-def _regions_for_mask(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+def _regions_for_mask(
+    source: Path,
+    config: SBBConfig,
+    mask: np.ndarray,
+    geometry: PageGeometry | None = None,
+) -> list[Region]:
     """The regions a mask answer describes, in the shape its use case annotates.
 
     Asking the use case is the whole fix for a textline model whose output looked like a layout page:
@@ -901,12 +975,19 @@ def _regions_for_mask(source: Path, config: SBBConfig, mask: np.ndarray) -> list
         )
     if use_case in (UseCase.PRINTSPACE, UseCase.BINARIZATION):
         return []  # every pixel of the answer goes into Page/PrintSpace; see ``_printspace_from_mask``
+    # The geometry the caller asked for, which is the config's unless `sbb infer` overrode it.
+    geometry = PageGeometry.from_sbb(config) if geometry is None else geometry
     if use_case is UseCase.TEXTLINE:
-        return _textline_regions(source, config, mask)
-    return _flat_regions(source, config, mask)
+        return _textline_regions(source, config, mask, geometry)
+    return _flat_regions(source, config, mask, geometry)
 
 
-def _flat_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+def _flat_regions(
+    source: Path,
+    config: SBBConfig,
+    mask: np.ndarray,
+    geometry: PageGeometry | None = None,
+) -> list[Region]:
     """One region per contour of every class on the page -- the layout shape, and the old behaviour.
 
     v3 built one ``TextRegion`` per class from that class's contours and put each contour in as a
@@ -923,7 +1004,10 @@ def _flat_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Reg
         # first and asks geometry for the contours of one region at a time).
         kind = _kind_for_class(config, label)
         name = _class_name(config, label)
-        contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
+        contours = _prepared_contours(
+            contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0),
+            PageGeometry.from_sbb(config) if geometry is None else geometry,
+        )
         for index, contour in enumerate(contours):
             regions.append(
                 Region(
@@ -936,7 +1020,12 @@ def _flat_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Reg
     return regions
 
 
-def _textline_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Region]:
+def _textline_regions(
+    source: Path,
+    config: SBBConfig,
+    mask: np.ndarray,
+    geometry: PageGeometry | None = None,
+) -> list[Region]:
     """``TextRegion`` blocks holding the predicted ``TextLine``\\ s -- the shape lines need.
 
     A textline model predicts lines and nothing else, so the question is not which regions to write
@@ -948,7 +1037,10 @@ def _textline_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list
     """
     regions: list[Region] = []
     for label in _mask_labels(mask, config):
-        contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
+        contours = _prepared_contours(
+            contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0),
+            PageGeometry.from_sbb(config) if geometry is None else geometry,
+        )
         kind = _kind_for_class(config, label)
         name = _class_name(config, label)
         for block_index, group in enumerate(group_contours_into_blocks(contours)):
@@ -1014,6 +1106,7 @@ def _page_from_prediction(
     config: SBBConfig,
     existing: Page | None,
     created: str | None = None,
+    geometry: PageGeometry | None = None,
 ) -> Page:
     """The page *source* is now that it has a prediction, keeping what the file already knew.
 
@@ -1059,7 +1152,7 @@ def _page_from_prediction(
             height=height,
             width=width,
             columns_width=existing.columns_width if existing else None,
-            regions=_regions_for_mask(source, config, prediction.mask),
+            regions=_regions_for_mask(source, config, prediction.mask, geometry),
             printspace_contour=printspace,
             printspace_bbox=(
                 contour_bbox(printspace, (height, width))
@@ -1093,6 +1186,7 @@ def _write_page_xml(
     target: Path,
     config: SBBConfig,
     created: str | None = None,
+    geometry: PageGeometry | None = None,
 ) -> int:
     """Fold one page's answer into its PageXML and write the file; returns 1.
 
@@ -1105,9 +1199,14 @@ def _write_page_xml(
     from the prediction and written. ``--no-save`` still writes the XML: asking for it *is* the
     request, the way ``--save-logits`` is. *created* is ``--created``, passed through to
     :func:`_page_from_prediction` for the pages that have no timestamp of their own to keep.
+    *geometry* is ``--simplify-epsilon``/``--deintersect``/``--intersection-gap`` (or, from the
+    library, whatever :class:`~sbb_pytorch.gt.simplify.PageGeometry` to write the regions with);
+    omitted, it is the config's, and the config's is nothing.
     """
     existing = parse_pagexml(target) if target.is_file() else None
-    write_pagexml(_page_from_prediction(source, prediction, config, existing, created), target)
+    write_pagexml(
+        _page_from_prediction(source, prediction, config, existing, created, geometry), target
+    )
     return 1
 
 
@@ -1271,6 +1370,32 @@ def gt() -> None:
     default=None,
     help="Smallest contour kept, as a page fraction; overrides the --config value.",
 )
+@click.option(
+    "--simplify-epsilon",
+    "simplify_epsilon",
+    type=float,
+    default=None,
+    help="Douglas-Peucker tolerance in pixels applied to every labelled contour before it is "
+    "rasterised and written -- the answer to a label drawn from an XML whose straight edges are "
+    "one vertex per pixel. Grows with each contour's perimeter (0.2% of it, floored at this "
+    "value). Overrides the --config value; 0 there keeps the outline exactly as annotated.",
+)
+@click.option(
+    "--deintersect/--no-deintersect",
+    "deintersect",
+    default=None,
+    help="Trim the area two labelled regions share off *both* of them, so a ring drawn around a "
+    "text line does not paint over the line inside it (needs the `shapely` package). Overrides "
+    "the --config value; off there, which is how every label so far was drawn.",
+)
+@click.option(
+    "--intersection-gap",
+    "intersection_gap",
+    type=float,
+    default=None,
+    help="How far apart two de-intersected neighbours are left, in pixels; overrides the "
+    "--config value, whose default is 1.5.",
+)
 @click.option("--limit", type=int, default=None, help="Process only the first N XML files.")
 @click.option("--dry-run", is_flag=True, help="List what would be generated and stop.")
 @click.pass_context
@@ -1288,6 +1413,9 @@ def gt_generate(
     dedupe_pages: bool,
     legacy_stem: bool,
     min_area: float | None,
+    simplify_epsilon: float | None,
+    deintersect: bool | None,
+    intersection_gap: float | None,
     limit: int | None,
     dry_run: bool,
 ) -> None:
@@ -1330,6 +1458,15 @@ def gt_generate(
     )
     if min_area is not None:
         gt_config = replace(gt_config, min_area=min_area)
+    # The three polygon switches are overridden by the same rule as --min-area: the flag wins when
+    # given, the file answers when it is not, and both default to leaving the annotated outline
+    # exactly as it is (see sbb_pytorch.gt.simplify.PageGeometry, which build_label_map consults).
+    if simplify_epsilon is not None:
+        gt_config = replace(gt_config, simplify_epsilon=simplify_epsilon)
+    if deintersect is not None:
+        gt_config = replace(gt_config, deintersect=bool(deintersect))
+    if intersection_gap is not None:
+        gt_config = replace(gt_config, intersection_gap=intersection_gap)
     # ``--type-output`` and the config's ``type_output`` answer one question, and the flag used to
     # settle it with its own ``3d`` default even when the file said ``2d`` -- the same outranking
     # ``sbb infer --save`` once had over ``save_visualisation``. The flag has no default now, so
@@ -1405,12 +1542,49 @@ def _summarise(result: object) -> str:
 )
 @click.option("--size", nargs=2, type=int, default=None, metavar="H W", help="Render at this size.")
 @click.option("--type-output", "output_type", type=click.Choice(["2d", "3d"]), default="3d")
+@click.option(
+    "--simplify-epsilon",
+    "simplify_epsilon",
+    type=float,
+    default=0.0,
+    help="Douglas-Peucker tolerance in pixels to render every region's outline with, growing with "
+    "each contour's perimeter (0.2% of it, floored at this value). 0, the default, draws the "
+    "outline exactly as annotated. This command takes no --config, so this is the only place the "
+    "page geometry can be asked for; sbb gt generate reads the same switch from its config.",
+)
+@click.option(
+    "--deintersect/--no-deintersect",
+    "deintersect",
+    default=False,
+    help="Separate overlapping regions before drawing them, so a ring drawn around a text line "
+    "loses the band it paints over instead of covering the line (needs the `shapely` package).",
+)
+@click.option(
+    "--intersection-gap",
+    "intersection_gap",
+    type=float,
+    default=1.5,
+    help="How far apart two de-intersected neighbours are left, in pixels.",
+)
 def gt_visualize(
-    xml: Path, output: Path | None, size: tuple[int, int] | None, output_type: str
+    xml: Path,
+    output: Path | None,
+    size: tuple[int, int] | None,
+    output_type: str,
+    simplify_epsilon: float,
+    deintersect: bool,
+    intersection_gap: float,
 ) -> None:
     """Render one ALTO/PageXML file as an image (the old notebook's single-page view)."""
     page = parse_pagexml(xml)
-    image = render_page(page, size=tuple(size) if size else None, output_type=output_type)
+    image = render_page(
+        page,
+        size=tuple(size) if size else None,
+        output_type=output_type,
+        simplify_epsilon=simplify_epsilon,
+        deintersect=deintersect,
+        intersection_gap=intersection_gap,
+    )
     # Beside the XML, not in the current directory: the render belongs with the page it came from.
     destination = (
         Path(output) if output is not None else xml.with_name(f"{xml.stem}_{output_type}.png")

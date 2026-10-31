@@ -467,6 +467,21 @@ class SBBConfig(BaseModel):
     #: decides whether predicted images are written at all (see ``cli.infer``).
     save_visualisation: bool = True
 
+    #: ``sbb infer``'s ``--simplify-epsilon`` default: the Douglas-Peucker tolerance, in pixels,
+    #: applied to every predicted region's contour before it is written.  The effective tolerance
+    #: grows with the contour's own perimeter (``gt.simplify.DEFAULT_SIMPLIFY_EPSILON_FRACTION``),
+    #: so this is a floor rather than the answer for a full-page outline.  ``0``, the default,
+    #: writes every vertex the model produced -- which is what every page so far has been written
+    #: with, and what a config that says nothing keeps getting.
+    simplify_epsilon: float = Field(default=0.0, ge=0)
+    #: Trim the area two overlapping predictions share off *both* of them, instead of letting one
+    #: region's fill paint over its neighbour's edge (``gt.deintersect``, which needs the
+    #: ``shapely`` package).  The ``--deintersect/--no-deintersect`` default.
+    deintersect: bool = False
+    #: How far apart two de-intersected neighbours are left, in pixels -- the
+    #: ``--intersection-gap`` default and the gap ``gt.deintersect`` subtracts.
+    intersection_gap: float = Field(default=1.5, ge=0)
+
     @model_validator(mode="before")
     @classmethod
     def _fold_legacy_keys(cls, data: Any) -> Any:

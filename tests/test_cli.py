@@ -28,7 +28,7 @@ from sbb_pytorch import __version__, cli
 from sbb_pytorch.cli import main
 from sbb_pytorch.config import SBBConfig, TaskType
 from sbb_pytorch.exceptions import ConfigError
-from sbb_pytorch.gt import contour_bbox, parse_pagexml
+from sbb_pytorch.gt import contour_bbox, parse_pagexml, render_page, write_image
 from sbb_pytorch.inference import Prediction
 from sbb_pytorch.models import create_model
 from sbb_pytorch.storage import Checkpoint, load_checkpoint, safetensors_available, save_checkpoint
@@ -75,6 +75,18 @@ PAGE_XML_TWO = """<?xml version="1.0" encoding="UTF-8"?>
     </TextRegion>
     <TextRegion ID="r2" type="paragraph">
       <Coords points="18,4 28,4 28,14 18,14"/>
+    </TextRegion>
+  </Page>
+</PcGts>"""
+
+# A rectangle whose bottom-right corner is cut in three 4-pixel steps -- the shape a rasterised
+# annotation really has, and the one the ``--simplify-epsilon`` tests need: a plain rectangle
+# rasterises the same at every epsilon, so its render would prove nothing about the value used.
+STAIRCASE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<PcGts xmlns="http://schema.primaresearch.org/PAGE/gts/schema/v2019.07.24">
+  <Page imageFilename="page.png" imageWidth="32" imageHeight="32">
+    <TextRegion ID="r1" type="paragraph">
+      <Coords points="4,4 28,4 28,20 24,20 24,24 20,24 20,28 4,28"/>
     </TextRegion>
   </Page>
 </PcGts>"""
@@ -716,6 +728,39 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
     ]
 
 
+def test_infer_simplify_epsilon_shortens_the_predicted_contours_it_writes(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--simplify-epsilon`` reaches the contours a run writes, on the ``--xml-file`` path.
+
+    A predicted region's contour is a rasterised outline -- the disc below is 36 vertices where the
+    shape has four corners' worth of information, because ``CHAIN_APPROX_SIMPLE`` compresses only
+    the runs a contour happens to contain -- and the flag answers it with the four corners of that
+    same bounding box.  Two runs of one stubbed prediction, so the only difference between the two
+    files is the flag: without it, every vertex the model produced is written, as always.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    y, x = np.mgrid[0:SIZE, 0:SIZE]
+    mask = (((x - 16) ** 2 + (y - 16) ** 2) <= 100).astype(np.uint8)  # a disc of radius 10
+    _stub_predictor(monkeypatch, Prediction(task=TaskType.SEGMENTATION, mask=mask))
+
+    plain, smoothed = tmp_path / "plain.xml", tmp_path / "smoothed.xml"
+    for target, extra in ((plain, ()), (smoothed, ("--simplify-epsilon", "4"))):
+        target.write_text(PAGE_XML.format(size=SIZE, edge=28))
+        result = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", target, *extra)
+        assert result.exit_code == 0, result.output
+
+    written = [parse_pagexml(target).regions[0] for target in (plain, smoothed)]
+    assert [region.region_id for region in written] == ["page_1_0", "page_1_0"]
+    assert (
+        contour_bbox(written[0].contour, (SIZE, SIZE))
+        == contour_bbox(written[1].contour, (SIZE, SIZE))
+        == (6, 6, 21, 21)
+    )
+    assert [len(region.contour) for region in written] == [36, 4]
+
+
 def test_infer_xml_writes_no_region_for_a_predicted_boundary_class(
     runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -982,6 +1027,33 @@ def test_gt_visualize_renders_an_escriptorium_page(runner: CliRunner, tmp_path: 
     result = invoke(runner, "gt", "visualize", xml, "-o", tmp_path / "rendered.png")
     assert result.exit_code == 0, result.output
     assert (tmp_path / "rendered.png").exists()
+
+
+def test_gt_visualize_simplify_epsilon_renders_what_render_page_would(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """This command takes no ``--config`` -- which is exactly what the hex-id crash was about -- so
+    its own ``--simplify-epsilon`` is the only place a caller can ask for the page geometry, and the
+    image it writes is byte for byte the one ``render_page`` produces when handed the same value.
+
+    The page is :data:`STAIRCASE_XML`, whose corner steps a non-zero epsilon smooths into a
+    diagonal: a plain rectangle renders identically at every epsilon and would pass this test even
+    if the flag were ignored.
+    """
+    xml = tmp_path / "page.xml"
+    xml.write_text(STAIRCASE_XML)
+    result = invoke(
+        runner, "gt", "visualize", xml, "-o", tmp_path / "smooth.png", "--simplify-epsilon", "4"
+    )
+    assert result.exit_code == 0, result.output
+
+    page = parse_pagexml(xml)
+    smoothed = tmp_path / "direct-smooth.png"
+    unsmoothed = tmp_path / "direct-plain.png"
+    write_image(smoothed, render_page(page, simplify_epsilon=4.0))
+    write_image(unsmoothed, render_page(page))
+    assert (tmp_path / "smooth.png").read_bytes() == smoothed.read_bytes()
+    assert smoothed.read_bytes() != unsmoothed.read_bytes()
 
 
 def test_gt_generate_dry_run_lists_the_files_it_would_read(
@@ -1262,6 +1334,66 @@ def test_gt_generate_type_output_flag_beats_the_config(
     )
     assert result.exit_code == 0, result.output
     assert set(np.unique(read_mask(out / "page.png")).tolist()) == {0, 255}
+
+
+def test_gt_generate_simplify_epsilon_comes_from_the_config_and_from_the_flag(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The two routes the geometry has into ``sbb gt generate`` must agree: the ``--config`` whose
+    ``simplify_epsilon`` ``GroundTruthConfig.from_dict`` reads, and the ``--simplify-epsilon`` flag
+    merged over it with ``replace`` the way ``--min-area`` is (``generator.py:258-263`` for the
+    read, ``cli.py`` for the merge).  Both are compared against the same page generated with nothing
+    set, which is the run every existing label came from.
+
+    :data:`STAIRCASE_XML` is the page that makes the comparison mean something: its corner steps are
+    what a non-zero epsilon removes, where a plain rectangle labels the same either way.
+    """
+    xml_dir = tmp_path / "xml"
+    xml_dir.mkdir()
+    (xml_dir / "page.xml").write_text(STAIRCASE_XML)
+    # ``2d`` so the label holds class ids and not the palette's colours -- the reason the label
+    # written here can be read back as ``{0, 1}`` (see the type_output test above for the 3d shape).
+    page2label = {"use_case": "layout", "textregions": {"paragraph": 1}}
+    quiet = tmp_path / "quiet.json"
+    quiet.write_text(
+        json.dumps({"use_case": "layout", "type_output": "2d", "page2label": page2label})
+    )
+    asked = tmp_path / "asked.json"
+    asked.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": page2label,
+                "simplify_epsilon": 4.0,
+            }
+        )
+    )
+
+    def generate(config: Path, folder: str, *extra: str) -> np.ndarray:
+        result = invoke(
+            runner,
+            "gt",
+            "generate",
+            "--xml",
+            xml_dir,
+            "-o",
+            tmp_path / folder,
+            "--config",
+            config,
+            *extra,
+        )
+        assert result.exit_code == 0, result.output
+        return read_mask(tmp_path / folder / "page.png")
+
+    default, from_config, from_flag = (
+        generate(quiet, "default"),
+        generate(asked, "from-config"),
+        generate(quiet, "from-flag", "--simplify-epsilon", "4"),
+    )
+    assert np.array_equal(from_config, from_flag)  # the flag and the field take the same road
+    assert not np.array_equal(from_config, default)  # and both differ from the default run
+    assert set(np.unique(from_config).tolist()) == {0, 1}  # still a labelled page, not a blank one
 
 
 def test_gt_enhance_writes_a_degraded_page_and_its_label_per_scale(

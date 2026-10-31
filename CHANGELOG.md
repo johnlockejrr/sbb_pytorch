@@ -136,6 +136,36 @@ replacement.
   epoch for a number that arrives after the epoch it describes. `0.2` stays the default,
   `"val_fraction": 0.1` is the tenth the same run wanted, `--val-fraction 0.1` overrides it per run,
   and `0.0` (legal, `ge=0.0, lt=1.0`) hands everything to training.
+- **Polygon simplification and polygon separation, both opt-in: `gt/simplify.py` and
+  `gt/deintersect.py`.** A PageXML `@points` list is a *rasterised* outline -- every pixel of a
+  straight edge is a vertex of its own -- and `cv2.findContours(..., CHAIN_APPROX_SIMPLE)` is a
+  storage trick rather than a simplification, so `sbb infer` on a page of `BL_Or_1443_300`'s shape
+  hands the writer thousands of vertices per predicted region and the PageXML it writes is the same
+  fact from the file-size side. `simplify.simplify_polygon` and `simplify_polyline` are the port of
+  `oxygraphos-ocr`'s `surya-seg/surya_seg/lib/simplify_geometry.py` -- itself the refactor of
+  `regnetx-seg/regnetx_seg/lib/simplify_geometry.py`, whose split open/closed API surya-seg folded
+  away and which is ported back here because a `TextLine/@points` baseline *is* an open line -- with
+  the epsilon policy taken from `rfdetr-seg`'s `rfdetr_seg/engine/infer.py:67-73`
+  (`max(base, 0.002 * perimeter)`) rather than surya-seg's fixed 1.5 px, so a full-resolution page
+  gets a tolerance scaled to its own size where a 60x60 crop keeps a small one.
+  `deintersect.deintersect_polygons` is the port of
+  `dfine-det/dfine_det/serialization/deintersect.py` (byte-identical in that workspace's three
+  detection siblings, and the same three functions `surya-seg` ships under other names) over
+  `shapely`: two labelled zones that overlap share the pixels between them, a label image paints one
+  over the other, and the boundary the annotation drew is then not the boundary the model is
+  supervised on -- so the intersection is buffered by half the gap and subtracted from *both* sides,
+  which is the polygon boolean work `cv2` has no equivalent of. The three switches in front of both
+  -- `simplify_epsilon`, `deintersect`, `intersection_gap` -- exist on `SBBConfig` and on
+  `GroundTruthConfig`, reach `sbb infer` and `sbb gt generate` as flags and `sbb gt visualize` as
+  its only source (that command takes no `--config`), and all three default to *off* (`0`, `False`,
+  `1.5`), so every image and every XML file the package produced before this change is what it
+  produces now; `simplify.PageGeometry.prepare` is the single implementation the renderer, the label
+  map and the two mask-to-region CLI builders call. `shapely>=2.0` joins the runtime dependencies --
+  the one of the seven legacy packages that came back, for boolean work and not for the areas
+  `cv2.contourArea` measures ([docs/migration.md](docs/migration.md) 5.7) -- and an explicit request
+  to de-intersect where the package cannot be imported raises the new `GeometryError` rather than
+  quietly producing un-trimmed output, the `Checkpoint.save` rule for `.safetensors` applied to a
+  second optional dependency.
 
 ### Changed
 

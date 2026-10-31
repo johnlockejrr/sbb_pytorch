@@ -40,18 +40,29 @@ classifiers = [
 # This list is what src/ imports, plus the tooling the entry points need. Seven packages the
 # legacy requirements.txt carried are not in it, because the port imports none of them: Pillow
 # (images are read with cv2, not PIL.Image), scikit-learn (metrics.py imported sklearn and never
-# called it), shapely (areas come from cv2.contourArea), matplotlib and seaborn (Keras-era
+# called it), matplotlib and seaborn (Keras-era
 # plotting, superseded by rich). scipy and tqdm were dropped for the same reason and still install
 # on their own -- albumentations requires scipy>=1.10 and pytorch_lightning requires tqdm -- so
 # their pins (the .ndimage alias note that justified scipy>=1.11 among them) went with them.
 # docs/migration.md 5.7 records the decision; PyYAML stays because dev declares types-PyYAML and
 # the config loaders are the documented place a YAML config would be added.
+# shapely is the one of those seven that came back, in 0.2.0 and for one job: the polygon boolean
+# work cv2 has no equivalent of -- separating overlapping regions in gt/deintersect.py. The note
+# above conflated two uses of it. The legacy code asked shapely for *areas*, and those do come from
+# cv2.contourArea here (the two disagree on collinear and self-intersecting rings, which is the
+# reason for one source); what it never asked for, and what this package now needs, is intersecting
+# one region with another and subtracting the overlap. docs/migration.md 3.9 and the 5.6 item on
+# those seven packages record the return; gt/deintersect.py's own docstring says what is ported.
 dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "pytorch_lightning>=2.0",
     "numpy>=1.24,<3",
     "opencv-python-headless>=4.8",
+    # Declared, and still guarded at runtime by gt.deintersect.shapely_available() the way
+    # safetensors is below: a venv that predates the install imports the package fine, and only an
+    # explicit --deintersect refuses (see gt/deintersect.py's docstring for the rule).
+    "shapely>=2.0",
     # albumentations <1.4.5 cannot import against numpy 2.x.
     "albumentations>=1.4.5",
     "pydantic>=2.5",

@@ -113,6 +113,7 @@ when the `safetensors` dependency is installed.
 | `-o, --output-dir` | Default `predictions/` beside the checkpoint |
 | `--save / --no-save`, `--save-layout / --no-save-layout` | Which renderings to write; asking for one the task did not produce is an error, not a silently missing file |
 | `--patches / --no-patches` | Sliding-window inference (`--patches` was a `pass` statement in `inference_pytorch.py`) |
+| `--simplify-epsilon`, `--deintersect / --no-deintersect`, `--intersection-gap` | The predicted regions' geometry: the Douglas-Peucker tolerance every predicted contour is simplified with, whether two overlapping regions are separated before one paints over the other (needs `shapely`), and the gap a trimmed pair is left apart. Like `--save`, each defaults to its config field, and those default to `0` / `False` / `1.5` -- every vertex the model produced kept, nothing trimmed (`gt/simplify.py`, `gt/deintersect.py`) |
 | `-c, --config` | Config used to rebuild the architecture; default is the checkpoint's own `model_config.json`, which is what lets `sbb infer runs/textline -i pages/` work without repeating every training option |
 | `--architecture` | Registry key override (in one legacy script `--model` meant this, in another it meant the weights path) |
 | `-d, --device`, `--limit` | Device as above; stop after N pages |
@@ -123,7 +124,11 @@ when the `safetensors` dependency is installed.
 `--config` (a `GroundTruthConfig` JSON, the shape of `custom_config_page2label.json`) or
 `--use-case`, which the old script made you edit as a constant. `--type-output` is `2d` or `3d`
 (`--type` before), `--printspace` and `--min-area` carry over, and `--dry-run` lists the XML files
-it found without writing anything. `--xml` is searched inside subfolders too, so a *parent* of
+it found without writing anything. `--simplify-epsilon`, `--deintersect/--no-deintersect` and
+`--intersection-gap` override the three geometry fields the config carries -- contour
+simplification and the separating of overlapping regions, `gt/simplify.py` and
+`gt/deintersect.py` -- merged over the config with `replace` exactly as `--min-area` is.
+`--xml` is searched inside subfolders too, so a *parent* of
 child datasets (`smp-private/` holding one folder per export) is one command and their pages all
 land in the flat `-o`; `--no-recursive` reads only the files directly inside the folder given. A
 page filed as both `X.xml` and `X.alto.xml` is labelled once, from the PageXML --
@@ -133,8 +138,12 @@ name (`mss-021/page-000.xml` → `mss-021_page-000.png`) so several datasets' pa
 flat `-o`; `--legacy-stem` writes the upstream shortening (`039.png`) instead. A `rich` bar tracks
 the files when stdout is a terminal.
 
-`sbb gt visualize XML [-o OUT] [--size H W] [--type-output 2d|3d]` renders a single ALTO/PageXML
-page -- the view that previously required opening the notebook.
+`sbb gt visualize XML [-o OUT] [--size H W] [--type-output 2d|3d] [--simplify-epsilon N]
+[--deintersect/--no-deintersect] [--intersection-gap N]` renders a single ALTO/PageXML page -- the
+view that previously required opening the notebook. This command takes no `--config`, so its own
+three geometry flags are the only place its page geometry can be asked for; at their defaults the
+page is drawn exactly as annotated, and at `--simplify-epsilon 4` it is drawn the way
+`sbb gt generate` would label the same page.
 
 ### `sbb export CHECKPOINT`
 

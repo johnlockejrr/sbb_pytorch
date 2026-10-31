@@ -353,6 +353,55 @@ def test_theta_accepts_the_legacy_misspelling_and_the_fix() -> None:
     assert SBBConfig.model_validate(make(theta=[3, -3])).thetha == (3.0, -3.0)
 
 
+def test_page_geometry_fields_default_to_off() -> None:
+    """The three fields 0.2.0 added for ``sbb infer``'s polygon handling all mean *off* at their
+    defaults: ``simplify_epsilon`` 0 (every vertex the model produced kept) and ``deintersect``
+    False, with ``intersection_gap`` holding the value ``gt.deintersect`` itself uses (1.5 px).
+    A config that says nothing keeps getting exactly the pages it got before (``models.py:470-483``,
+    and ``gt/simplify.py`` / ``gt/deintersect.py`` for what each switch does)."""
+    config = SBBConfig.model_validate(make())
+    assert config.simplify_epsilon == 0.0
+    assert config.deintersect is False
+    assert config.intersection_gap == 1.5
+
+
+@pytest.mark.parametrize("field", ["simplify_epsilon", "intersection_gap"])
+def test_a_negative_tolerance_is_refused_rather_than_read_as_off(field: str) -> None:
+    """``ge=0`` on both, because ``0`` is the one way to say "off": a negative number is not a
+    second spelling of it but a value ``cv2.approxPolyDP`` and ``shapely`` would each refuse, far
+    from the config that produced it -- which is why the bound sits on the field and not in the
+    two call sites that read it."""
+    with pytest.raises(Exception, match=field):
+        SBBConfig.model_validate(make(**{field: -0.5}))
+
+
+def test_the_ground_truth_config_carries_the_same_three_fields_and_reads_them() -> None:
+    """``sbb gt generate`` reads a :class:`~sbb_pytorch.gt.generator.GroundTruthConfig` and not an
+    ``SBBConfig``, so the same three fields sit on it too -- and ``from_dict`` names each one, the
+    ``type_output`` lesson being that a key a JSON carries and the reader skips is a key that
+    silently does nothing (``generator.py:258-263``).
+
+    The nested spelling is checked alongside the flat one: an ``SBBConfig`` keeps the three at its
+    top level while the region tables live inside ``page2label``, and the merge that reconciles the
+    two must not lose them.
+    """
+    defaults = gt_generator.GroundTruthConfig()
+    assert defaults.simplify_epsilon == 0.0
+    assert defaults.deintersect is False
+    assert defaults.intersection_gap == 1.5
+
+    asked = gt_generator.GroundTruthConfig.from_dict(
+        {"min_area": 12, "simplify_epsilon": 3.5, "deintersect": True, "intersection_gap": 2.25}
+    )
+    assert (asked.simplify_epsilon, asked.deintersect, asked.intersection_gap) == (3.5, True, 2.25)
+    assert asked.min_area == 12  # the neighbour every other field is read beside
+
+    nested = gt_generator.GroundTruthConfig.from_dict(
+        {"page2label": {"min_area": 4}, "simplify_epsilon": 6.0, "deintersect": True}
+    )
+    assert (nested.simplify_epsilon, nested.deintersect, nested.min_area) == (6.0, True, 4)
+
+
 # -------------------------------------------------------------------- loaders
 
 

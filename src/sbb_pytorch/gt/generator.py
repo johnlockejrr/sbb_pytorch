@@ -61,6 +61,7 @@ from .render import (
     to_label_map,
     write_image,
 )
+from .simplify import PageGeometry
 
 __all__ = [
     "BOUNDARY_RATES",
@@ -162,6 +163,12 @@ class GroundTruthConfig:
         Column count -> canonical page width, for the column-normalising resize.
     min_area, max_area:
         Region size bounds as fractions of the page area.
+    simplify_epsilon, deintersect, intersection_gap:
+        The polygon switches -- the Douglas-Peucker tolerance applied to every region outline,
+        whether overlapping regions are separated first, and the gap left between the two; see
+        :class:`~sbb_pytorch.gt.simplify.PageGeometry`.  All three default to off, and the three
+        ``sbb gt generate`` flags of the same names override them exactly as ``--min-area``
+        overrides ``min_area``.
     type_output:
         How each label image is written -- ``2d`` (class id per pixel, replicated across the
         three channels) or ``3d`` (RGB from the palette).  The field the schema always had and
@@ -187,6 +194,9 @@ class GroundTruthConfig:
     columns_width: dict[int, int] = field(default_factory=dict)
     min_area: float = DEFAULT_MIN_AREA_FRACTION
     max_area: float = 1.0
+    simplify_epsilon: float = 0.0
+    deintersect: bool = False
+    intersection_gap: float = 1.5
     source: Path | None = None
 
     @classmethod
@@ -245,6 +255,12 @@ class GroundTruthConfig:
             columns_width=_columns_width_map(data.get("columns_width")),
             min_area=float(data.get("min_area", DEFAULT_MIN_AREA_FRACTION)),
             max_area=float(data.get("max_area", 1.0)),
+            # Read here as every other field is: the `type_output` lesson is that a key a JSON file
+            # carries and this reader skips is a key that silently does nothing.  An SBBConfig keeps
+            # the three at its top level, which the merge above already surfaced.
+            simplify_epsilon=float(data.get("simplify_epsilon", 0.0)),
+            deintersect=bool(data.get("deintersect", False)),
+            intersection_gap=float(data.get("intersection_gap", 1.5)),
             source=source,
         )
 
@@ -496,8 +512,18 @@ def build_label_map(page: Page, config: GroundTruthConfig) -> np.ndarray | None:
     Dispatches between the two legacy branches: :func:`_single_class_map` for
     textline/word/glyph/printspace, :func:`_layout_map` for the layout use case.
     Returns ``None`` when the page carries nothing the config labels.
+
+    The page's geometry is prepared first (:class:`~sbb_pytorch.gt.simplify.PageGeometry`) -- a
+    simplification or a de-intersection the config asked for is applied here, so the label image
+    and every contour the same run reports are the geometry the config asked for and not the raw
+    outline the XML carried.  With the defaults it is the same page object, unchanged.
     """
     shape = (page.height, page.width)
+    page = PageGeometry(
+        simplify_epsilon=config.simplify_epsilon,
+        deintersect=config.deintersect,
+        intersection_gap=config.intersection_gap,
+    ).prepare(page)
     if config.use_case in SINGLE_CLASS_USE_CASES:
         return _single_class_map(page, config, shape)
     return _layout_map(page, config, shape)

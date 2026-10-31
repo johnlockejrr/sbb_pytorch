@@ -36,6 +36,7 @@ import numpy as np
 from ..config.models import OutputType
 from .geometry import BoundingBox, contour_area, mask_of
 from .parser import Page, Region, RegionKind
+from .simplify import PageGeometry
 
 __all__ = [
     "ARTIFICIAL_CLASS_COLOR",
@@ -361,6 +362,9 @@ def render_page(
     output_type: OutputType | str = OutputType.THREE_D,
     palette: Palette = DEFAULT_LABEL_PALETTE,
     labels: Mapping[RegionKind, int] | None = None,
+    simplify_epsilon: float = 0.0,
+    deintersect: bool = False,
+    intersection_gap: float = 1.5,
 ) -> np.ndarray:
     """Render *page*'s regions, as ``3d`` RGB or ``2d`` class-id image.
 
@@ -383,7 +387,15 @@ def render_page(
         ``RegionKind -> class id``.  When omitted, ids are derived from each region's
         ``@ID`` digits, which suits visualisation; generation always passes the
         configured mapping.
+    simplify_epsilon, deintersect, intersection_gap:
+        The polygon switches of :class:`~sbb_pytorch.gt.simplify.PageGeometry`, applied to the
+        page before anything is drawn: a Douglas-Peucker tolerance for the outlines, and whether
+        overlapping regions are separated first (needs ``shapely``) and how far apart the two
+        halves are left.  All three off by default, and with them off the page is drawn exactly as
+        it was before they existed -- which is the point: ``sbb gt visualize`` has no ``--config``
+        to read them from, so these arguments *are* its ``--simplify-epsilon`` and friends.
     """
+    page = PageGeometry(simplify_epsilon, deintersect, intersection_gap).prepare(page)
     target = size if size is not None else (page.height, page.width)
     pairs: list[tuple[Region, int]] = [
         (region, _label_of(region, labels)) for region in page.regions

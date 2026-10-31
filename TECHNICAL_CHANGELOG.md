@@ -47,6 +47,7 @@ Three argument-parsing styles became one group, so the same idea no longer spell
 | `python generate_gt_for_training.py ...` (six click commands) | `sbb gt generate`, `sbb gt visualize` | `pagexml2label` -> `gt generate`, the `visualize_*` commands -> `gt visualize`. `image_enhancement` and `machine_based_reading_order` have no `sbb gt` equivalent yet -- `docs/migration.md` lists `gt enhance` and `gt reading-order` as their replacements; the modules exist ([gt/generator.py](src/sbb_pytorch/gt/generator.py), [gt/reading_order.py](src/sbb_pytorch/gt/reading_order.py)) but the subcommands are not in [cli.py](src/sbb_pytorch/cli.py) yet. `--xml` is now searched in the folder's subfolders too (`--recursive/--no-recursive`, recursive by default), so one `gt generate` or `gt reading-order` can cover a parent folder whose children are datasets; the legacy command took `--dir_xml` one level deep. A page filed in both formats is labelled once (`--dedupe-pages/--no-dedupe-pages`, PageXML preferred over ALTO), where the legacy listing wrote one label per file. Outputs are named after the file that produced them -- `901234567-039.xml` → `901234567-039.png`, plus the folders above it joined in (`mss-021/page-000.xml` → `mss-021_page-000.png`) -- where the legacy script wrote `039.png` (`--legacy-stem` still does). |
 | `python build_model_load_pretrained_weights_and_save.py` (edit constants, run) | `sbb export CHECKPOINT [-o OUT]` | |
 | reading `config_params.json` and its hand-written table | `sbb validate CONFIG [--strict]`, `sbb config-schema [-o OUT]` | |
+| *(no legacy flag simplified or separated a polygon -- the contours were written as the model or the annotation produced them)* | `sbb infer --simplify-epsilon/--deintersect/--intersection-gap`, and the same three on `sbb gt generate` and `sbb gt visualize` | Added after the 0.2.0 cut and off by default: `gt/simplify.py` (Douglas-Peucker, ported from `oxygraphos-ocr`'s `surya-seg`/`regnetx-seg` `simplify_geometry.py` with `rfdetr-seg`'s perimeter-scaled epsilon) and `gt/deintersect.py` (shapely overlap trimming, ported from `dfine-det`'s `serialization/deintersect.py`). [docs/migration.md](docs/migration.md) 3.7 and 3.8 hold the rows; `gt enhance` and `gt reading-order` take no geometry. |
 
 ## 3. Changes that move a number
 
@@ -120,7 +121,9 @@ markers, and section 4 is the symbol-by-symbol import table.
   handed to OpenCV, so keeping the order keeps the colours identical.
 - **Packaging and license** (3.9). `requirements.txt` -> `pyproject.toml`, `sacred` dropped, the
   package installable, and the README's MIT claim corrected to the Apache-2.0 that `LICENSE` has
-  always contained.
+  always contained. `shapely>=2.0` came back afterwards for the polygon boolean work in
+  `gt/deintersect.py` -- the one of the seven packages the port dropped and 0.2.0 took back,
+  declared *and* guarded at runtime by `shapely_available()`, the `safetensors_available()` shape.
 
 ## 4. Config file deltas
 

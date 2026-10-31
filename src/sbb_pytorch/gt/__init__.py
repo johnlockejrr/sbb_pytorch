@@ -23,13 +23,26 @@ define (``GRAPHIC_REGION_TYPES``, ``LEGACY_INACTIVE_TEXT_TYPES``, ``TEXT_REGION_
 ``RegionKind``, ``normalise_text_type``) are re-exported from here as its aliases, so
 ``from sbb_pytorch.gt.parser import RegionKind`` still resolves.
 
-Modules here depend only on the standard library, ``numpy`` and ``cv2``; :mod:`.writer`
-needs nothing beyond the standard library's ``xml.etree``.  The legacy
-``gt_gen_utils.py`` additionally imported ``shapely`` and ``matplotlib``; neither is
-needed (see :mod:`.geometry` and :mod:`.render`), and ``click`` lives in the package's
-single CLI entry point, never in a library module.
+Modules here depend on the standard library, ``numpy`` and ``cv2``, plus ``shapely`` for exactly
+one job -- separating overlapping polygons in :mod:`.deintersect`.  The legacy
+``gt_gen_utils.py`` imported both ``shapely`` and ``matplotlib``: the areas it asked shapely for
+come from ``cv2.contourArea`` in :mod:`.geometry` (the two disagree on collinear and
+self-intersecting polygons, which is recorded in :mod:`.geometry`), its polygon *boolean* work is
+what :mod:`.deintersect` now does, and the plotting is what :mod:`.render` replaced.
+``click`` lives in the package's single CLI entry point, never in a library module.
 """
 
+from .deintersect import (
+    DEFAULT_GAP,
+    DEFAULT_MAX_PASSES,
+    DEFAULT_MIN_INTERSECTION_AREA,
+    DEFAULT_SIMPLIFY_TOLERANCE,
+    deintersect_polygons,
+    polish_polygon,
+    polygon_from_points,
+    separate_intersecting_pair,
+    shapely_available,
+)
 from .generator import (
     BOUNDARY_RATES,
     SINGLE_CLASS_BOUNDARY_RATES,
@@ -120,6 +133,16 @@ from .render import (
     to_uint8_bgr,
     write_image,
 )
+from .simplify import (
+    DEFAULT_SIMPLIFY_EPSILON_BASE,
+    DEFAULT_SIMPLIFY_EPSILON_FRACTION,
+    PageGeometry,
+    collapse_axis_aligned_redundant,
+    simplify_contour,
+    simplify_contours,
+    simplify_polygon,
+    simplify_polyline,
+)
 from .vocabulary import (
     GRAPHIC_REGION_TYPES,
     LEGACY_INACTIVE_TEXT_TYPES,
@@ -190,6 +213,16 @@ __all__ = [
     "rotated_rect_with_max_area",
     "scale_contour",
     "update_region_contours",
+    # deintersect — separating overlapping polygons (needs shapely)
+    "DEFAULT_GAP",
+    "DEFAULT_MAX_PASSES",
+    "DEFAULT_MIN_INTERSECTION_AREA",
+    "DEFAULT_SIMPLIFY_TOLERANCE",
+    "deintersect_polygons",
+    "polygon_from_points",
+    "polish_polygon",
+    "separate_intersecting_pair",
+    "shapely_available",
     # render — rasterising regions
     "ARTIFICIAL_CLASS_COLOR",
     "BINARY_BACKGROUND_COLOR",
@@ -211,6 +244,15 @@ __all__ = [
     "to_label_map",
     "to_uint8_bgr",
     "write_image",
+    # simplify — polygon simplification
+    "DEFAULT_SIMPLIFY_EPSILON_BASE",
+    "DEFAULT_SIMPLIFY_EPSILON_FRACTION",
+    "PageGeometry",
+    "collapse_axis_aligned_redundant",
+    "simplify_contour",
+    "simplify_contours",
+    "simplify_polygon",
+    "simplify_polyline",
     # reading_order — pairwise training samples
     "HEADER_SEPARATOR_BAND_WIDTH",
     "BACKGROUND_LABEL",

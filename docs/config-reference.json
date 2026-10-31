@@ -366,6 +366,11 @@
       "title": "Degrading",
       "type": "boolean"
     },
+    "deintersect": {
+      "default": false,
+      "title": "Deintersect",
+      "type": "boolean"
+    },
     "device": {
       "default": "cuda",
       "title": "Device",
@@ -470,6 +475,12 @@
       "exclusiveMinimum": 0,
       "title": "Input Width",
       "type": "integer"
+    },
+    "intersection_gap": {
+      "default": 1.5,
+      "minimum": 0,
+      "title": "Intersection Gap",
+      "type": "number"
     },
     "is_loss_soft_dice": {
       "default": false,
@@ -658,6 +669,12 @@
       },
       "title": "Shuffle Indexes",
       "type": "array"
+    },
+    "simplify_epsilon": {
+      "default": 0.0,
+      "minimum": 0,
+      "title": "Simplify Epsilon",
+      "type": "number"
     },
     "task": {
       "$ref": "#/$defs/TaskType"

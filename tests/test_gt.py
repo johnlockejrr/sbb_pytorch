@@ -1,6 +1,6 @@
 """Tests for :mod:`sbb_pytorch.gt` -- ALTO/PageXML in, label images out.
 
-The six ``gt`` modules are covered here at unit level; until now they were only reached through
+Every ``gt`` module is covered here at unit level; until now they were only reached through
 the CLI paths of ``tests/test_cli.py``. Expected values are derived from the geometry or from the
 legacy contract each docstring states rather than read back off the implementation: contour areas
 are ``cv2.contourArea`` arithmetic written out, a rendered label image is compared pixel-for-pixel
@@ -31,13 +31,17 @@ import cv2
 import numpy as np
 import pytest
 
+from sbb_pytorch.config.models import SBBConfig
+from sbb_pytorch.exceptions import GeometryError
 from sbb_pytorch.gt import (
     RegionKind,
+    deintersect,
     generator,
     geometry,
     parser,
     reading_order,
     render,
+    simplify,
     vocabulary,
     writer,
 )
@@ -90,6 +94,13 @@ TRIANGLE = np.array([[0, 0], [4, 0], [0, 3]], dtype=np.int32)
 COLLINEAR = np.array([[1, 1], [5, 5], [9, 9]], dtype=np.int32)
 STRIP = np.array([[10, 20], [15, 20], [15, 35], [10, 35]], dtype=np.int32)
 
+# The two shapes the simplify section needs and those four cannot give it: a 20x5 rectangle whose
+# top edge carries one extra collinear vertex -- a PageXML ``@points`` outline in miniature, and
+# surya-seg's own test input -- and the 0..98 diagonal in 2 px steps regnetx-seg tests a baseline
+# with.  As plain point lists, because that is the type the two ported functions speak.
+RECT_WITH_COLLIER = [(0, 0), (10, 0), (20, 0), (20, 5), (0, 5)]
+DIAGONAL = [(i, i) for i in range(0, 100, 2)]
+
 
 def xml_document(
     regions: str,
@@ -133,6 +144,31 @@ def region(
 ) -> parser.Region:
     """A :class:`~sbb_pytorch.gt.parser.Region` built by hand, for the sections XML cannot express."""
     return parser.Region(kind=kind, type_name=type_name, region_id=region_id, contour=contour)
+
+
+def square(x: int, y: int, side: int = 10) -> np.ndarray:
+    """The ``side`` x ``side`` square with its top-left corner at *x*, *y*.
+
+    The shape the deintersect section pairs up, because everything about it is closed-form: area
+    ``side ** 2``, and the overlap of two offset by *d* along one axis is ``(side - d) * side`` --
+    so the areas the trimming must produce are arithmetic, not measurements taken off the run.
+    """
+    return np.array([[x, y], [x + side, y], [x + side, y + side], [x, y + side]], dtype=np.int32)
+
+
+def sbb_config(**overrides: object) -> SBBConfig:
+    """The five required :class:`~sbb_pytorch.config.models.SBBConfig` fields plus whatever a
+    section cares about -- ``tests/test_config.py``'s ``BASE``/``make`` pair, whose own helper is
+    not importable from this file.
+    """
+    base: dict[str, object] = {
+        "task": "segmentation",
+        "backbone_type": "nontransformer",
+        "n_classes": 3,
+        "input_height": 672,
+        "input_width": 448,
+    }
+    return SBBConfig.model_validate({**base, **overrides})
 
 
 # ------------------------------------------------------------------------------------- parser
@@ -3164,3 +3200,424 @@ def test_write_pagexml_keeps_a_name_that_says_xml_and_otherwise_adds_it(tmp_path
     named = tmp_path / "explicit.xml"
     assert writer.write_pagexml(page, named) == named
     assert named.read_text() == writer.to_pagexml(page)
+
+
+# ----------------------------------------------------------------------------------- simplify
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        # The port's own two cases -- the same numbers in regnetx-seg/tests/test_simplify_geometry.py
+        # and in surya-seg's twin: a 50-point horizontal run and a 20-point vertical one, each
+        # collapsing to exactly its two endpoints.
+        ([(279 + 24 * i, 1803) for i in range(50)], [(279, 1803), (1455, 1803)]),
+        ([(100, 10 + 5 * i) for i in range(20)], [(100, 10), (100, 105)]),
+    ],
+    ids=["horizontal-run", "vertical-run"],
+)
+def test_collapse_axis_aligned_redundant_keeps_the_ends_of_a_straight_run(
+    run: list[tuple[int, int]], expected: list[tuple[int, int]]
+) -> None:
+    """Every middle vertex of an axis-aligned run is dropped and the two ends kept -- the function
+    both siblings share byte for byte (``simplify_geometry.py:23``), and the answer to a PageXML
+    ``@points`` list, where a straight 900-pixel edge arrives as 900 documented corners."""
+    assert simplify.collapse_axis_aligned_redundant(run) == expected
+
+
+def test_simplify_polygon_drops_the_collinear_run_a_rasterised_outline_carries() -> None:
+    """surya-seg's own case (``tests/test_simplify_geometry.py``): :data:`RECT_WITH_COLLIER` at
+    ``epsilon=1.0`` takes five vertices in and hands back the four corners of the 20x5 rectangle.
+
+    The extra vertex on the top edge is a corner the file had no reason to omit, and it is the
+    axis-collapse step -- not ``approxPolyDP``, which counts it as shape at any epsilon -- that
+    recognises it as the middle of a straight run (``simplify_geometry.py:40``).
+    """
+    assert simplify.simplify_polygon(RECT_WITH_COLLIER, 1.0) == [(0, 0), (20, 0), (20, 5), (0, 5)]
+
+
+def test_simplify_polygon_at_epsilon_zero_is_the_off_switch() -> None:
+    """``epsilon <= 0`` returns the vertices exactly as given: rfdetr-seg's ``0 = raw`` convention
+    (``engine/infer.py:67``), and the reason the package's ``0`` default leaves every output it has
+    ever produced byte-for-byte the same.  Off is a *no*, not a shorter list."""
+    assert simplify.simplify_polygon(RECT_WITH_COLLIER, 0.0) == RECT_WITH_COLLIER
+    assert simplify.simplify_polygon(RECT_WITH_COLLIER, -1.0) == RECT_WITH_COLLIER
+    assert simplify.simplify_polyline(DIAGONAL, 0.0) == DIAGONAL
+
+
+def test_simplify_polygon_strips_the_closing_vertex_and_never_puts_it_back() -> None:
+    """A ring that repeats its first vertex to close itself -- which is every
+    ``cv2.findContours`` output -- is deduplicated before simplifying and comes back open
+    (``simplify_geometry.py:45-47``), and a doubled corner is one vertex rather than two."""
+    closed = [(0, 0), (10, 0), (10, 5), (0, 5), (0, 0)]
+    assert simplify.simplify_polygon(closed, 1.0) == [(0, 0), (10, 0), (10, 5), (0, 5)]
+    doubled = [(0, 0), (0, 0), (10, 0), (10, 5), (0, 5)]
+    assert simplify.simplify_polygon(doubled, 1.0) == [(0, 0), (10, 0), (10, 5), (0, 5)]
+
+
+def test_simplify_polygon_falls_back_on_the_input_rather_than_eating_the_shape() -> None:
+    """The revert-on-degenerate guard (``simplify_geometry.py:69-70``): an epsilon wide enough that
+    ``approxPolyDP`` answers with two points returns the input instead of turning a rectangle into
+    a line.  ``min_points`` is the same rule from the other side -- a request for five vertices of
+    a four-corner rectangle cannot be met, so the input stands."""
+    square = [(10, 20), (30, 20), (30, 35), (10, 35)]
+    assert simplify.simplify_polygon(square, 1000.0) == square
+    assert simplify.simplify_polygon(square, 1.0, min_points=5) == square
+
+
+def test_simplify_polyline_keeps_both_ends_of_a_straight_baseline() -> None:
+    """regnetx-seg's diagonal case (``tests/test_simplify_geometry.py:22-27``): the 50-point
+    :data:`DIAGONAL` comes back as at most four points and keeps both ends, which is all a baseline
+    has to keep -- ``approxPolyDP`` with ``closed=False`` is what a ``TextLine/@points`` outline is,
+    and surya-seg folded this entry point away when it merged the two (``simplify_polygon`` alone
+    cannot answer for an open line)."""
+    out = simplify.simplify_polyline(DIAGONAL, 1.5)
+    assert len(out) <= 4
+    assert out[0] == (0, 0)
+    assert out[-1] == (98, 98)
+
+
+def test_simplify_polyline_of_two_points_is_returned_collapsed_not_simplified() -> None:
+    """Two points *are* the line (``simplify_geometry.py:57-59``): the repeats collapse to the pair
+    and the pair is handed back, because the answer ``approxPolyDP`` gives a two-point open polyline
+    is whichever single end it decides to keep."""
+    assert simplify.simplify_polyline([(12, 19), (12, 19), (48, 19)], 1.5) == [(12, 19), (48, 19)]
+
+
+@pytest.mark.parametrize(
+    ("contour", "expected"),
+    [
+        (RECT, [(10, 20), (30, 20), (30, 35), (10, 35)]),  # the (N, 2) spelling
+        (np.asarray(RECT, dtype=np.float64), [(10, 20), (30, 20), (30, 35), (10, 35)]),
+        (geometry._as_cv_contour(RECT), [(10, 20), (30, 20), (30, 35), (10, 35)]),
+    ],
+    ids=["n-by-2", "float64", "n-by-1-by-2"],
+)
+def test_simplify_contour_takes_every_contour_shape_and_answers_in_one(
+    contour: np.ndarray, expected: list[tuple[int, int]]
+) -> None:
+    """The adapter to *this* package's polygon type: any contour shape and dtype goes in through
+    ``geometry._as_cv_contour`` and an ``(N, 1, 2)`` ``int32`` comes out, so a simplified contour is
+    still something ``contour_area``, ``mask_of`` and ``points_attribute`` all accept."""
+    simplified = simplify.simplify_contour(contour, 1.0)
+    assert simplified.shape == (len(expected), 1, 2)
+    assert simplified.dtype == np.int32
+    assert [tuple(pair) for pair in simplified.reshape(-1, 2)] == expected
+
+
+def test_simplify_contours_takes_one_contour_a_list_or_a_stacked_batch() -> None:
+    """``_iter_contours`` is how the rest of ``gt`` accepts a contour argument, and the batch form
+    uses it, so ``contours_of_image`` output, a generator's per-class list and one contour go
+    through the same call -- always answered with one contour per input, in order."""
+    single = simplify.simplify_contours(RECT, 1.0)
+    assert len(single) == 1 and np.array_equal(single[0], simplify.simplify_contour(RECT, 1.0))
+    batched = simplify.simplify_contours(np.stack([RECT, STRIP]), 1.0)
+    listed = simplify.simplify_contours([RECT, STRIP], 1.0)
+    assert [c.reshape(-1, 2).tolist() for c in batched] == [
+        c.reshape(-1, 2).tolist() for c in listed
+    ]
+    assert [c.reshape(-1, 2).tolist() for c in batched] == [
+        [[10, 20], [30, 20], [30, 35], [10, 35]],
+        [[10, 20], [15, 20], [15, 35], [10, 35]],
+    ]
+
+
+def test_simplify_contour_grows_the_tolerance_with_the_contours_perimeter() -> None:
+    """rfdetr-seg's rule (``engine/infer.py:72``) applied at the contour layer alone: the effective
+    tolerance is ``max(epsilon, 0.002 * arcLength)``, so a 1000x1000 outline asks for 8 px where a
+    60x60 crop is content with 2.
+
+    The proof is the same contour twice: a 5 px bump on the edge of a perimeter-4010 rectangle
+    survives ``simplify_polygon`` at the literal ``epsilon=2.0`` (5 > 2) and vanishes at the
+    contour layer's ``epsilon=2.0`` (5 < 8.02), which is the scaled value.  Keeping the rule out of
+    the two ports is what lets the ported tests test the port and not this policy.
+    """
+    bump = np.array(
+        [[0, 0], [400, 0], [400, -5], [600, -5], [600, 0], [1000, 0], [1000, 1000], [0, 1000]],
+        dtype=np.int32,
+    )
+    points = [(int(x), int(y)) for x, y in bump]
+    assert len(simplify.simplify_polygon(points, 2.0)) == 8  # exact epsilon: the bump is kept
+    assert [tuple(pair) for pair in simplify.simplify_contour(bump, 2.0).reshape(-1, 2)] == [
+        (0, 0),
+        (1000, 0),
+        (1000, 1000),
+        (0, 1000),
+    ]
+
+
+def test_page_geometry_with_both_switches_off_hands_back_the_same_page(tmp_path: Path) -> None:
+    """The shipped defaults -- ``epsilon 0``, ``deintersect False``, and what every config field and
+    every ``render_page`` keyword defaults to -- prepare a page by returning *the object itself*:
+    the reason adding the feature changed nothing that was already being written."""
+    page = standard_page(tmp_path)
+    assert simplify.PageGeometry().is_off
+    assert simplify.PageGeometry().prepare(page) is page
+
+
+def test_page_geometry_from_sbb_reads_the_three_inference_fields() -> None:
+    """``from_sbb`` is the one reading of an :class:`~sbb_pytorch.config.models.SBBConfig`'s
+    geometry, shared by ``sbb infer`` and -- through the matching fields on
+    :class:`~sbb_pytorch.gt.generator.GroundTruthConfig` -- by ``sbb gt generate``, so one
+    ``PageGeometry`` type answers for three CLI commands."""
+    asked = simplify.PageGeometry.from_sbb(
+        sbb_config(simplify_epsilon=4.0, deintersect=True, intersection_gap=2.5)
+    )
+    assert asked == simplify.PageGeometry(
+        simplify_epsilon=4.0, deintersect=True, intersection_gap=2.5
+    )
+    assert not asked.is_off
+    assert simplify.PageGeometry.from_sbb(sbb_config()) == simplify.PageGeometry()
+
+
+def test_page_geometry_rebuilds_a_page_without_touching_the_parsed_one(tmp_path: Path) -> None:
+    """``prepare`` mutates nothing: the page it returns is a ``dataclasses.replace`` carrying new
+    region objects with simplified contours -- both a region's outline (closed) and its baseline
+    (open) -- while the page the caller still holds is exactly what was parsed, because the
+    generator keeps holding it while it writes the label *and* copies the source image beside it.
+
+    The nesting is rewired onto the copies (``Region.children`` points at the prepared line, not at
+    the parsed one) and the print space is simplified alongside the regions.
+    """
+    bumpy = np.array([[0, 0], [10, 0], [20, 0], [20, 5], [10, 5], [0, 5]], dtype=np.int32)
+    line = region(RegionKind.TEXTLINE, "l1", bumpy, "text_line")
+    block = region(RegionKind.TEXT, "block", square(0, 0, 20), "paragraph")
+    block.baseline = bumpy
+    block.children = [line]
+    page = parser.Page(
+        path=tmp_path / "x.xml",
+        file_name="x",
+        height=60,
+        width=60,
+        regions=[block, line],
+        printspace_contour=bumpy,
+    )
+
+    prepared = simplify.PageGeometry(simplify_epsilon=1.0).prepare(page)
+
+    assert prepared is not page
+    assert (prepared.height, prepared.width, prepared.file_name) == (60, 60, "x")
+    new_block, new_line = prepared.regions
+    assert new_block is not block and new_line is not line
+    assert new_block.children == [new_line]  # the link points at the copy, not the parsed line
+    assert [tuple(p) for p in new_line.contour.reshape(-1, 2)] == [(0, 0), (20, 0), (20, 5), (0, 5)]
+    assert [tuple(p) for p in new_block.baseline.reshape(-1, 2)] == [
+        (0, 0),
+        (20, 0),
+        (20, 5),
+        (0, 5),
+    ]
+    assert [tuple(p) for p in prepared.printspace_contour.reshape(-1, 2)] == [
+        (0, 0),
+        (20, 0),
+        (20, 5),
+        (0, 5),
+    ]
+    # The parsed page is byte-for-byte what it was, in every field the preparation rewrote.
+    assert np.array_equal(block.contour, square(0, 0, 20))
+    assert np.array_equal(block.baseline, bumpy)
+    assert np.array_equal(line.contour, bumpy)
+    assert page.printspace_contour is bumpy
+
+
+# --------------------------------------------------------------------------------- deintersect
+
+#: ``tests/test_checkpoint.py`` and ``tests/test_inference.py`` mark their optional dependencies
+#: the same way: a machine without the package skips the tests that need it instead of failing
+#: them, while the tests that prove the *refusal* stay unmarked and always run.
+needs_shapely = pytest.mark.skipif(
+    not deintersect.shapely_available(), reason="needs the shapely package"
+)
+
+
+@needs_shapely
+def test_polygon_from_points_repairs_a_self_intersecting_ring() -> None:
+    """A bowtie -- the ring ``(0,0) (10,10) (10,0) (0,10)`` whose two diagonals cross -- is what
+    ``buffer(0)`` exists for (``deintersect.py:21-26``): shapely reads the raw polygon as invalid
+    with no area at all, and the repaired one is valid and holds the 25 px² the two triangles of
+    the bowtie really enclose.  Upstream returned ``.exterior`` of whatever came back;
+    :func:`~sbb_pytorch.gt.deintersect._largest_polygon` is the widening that fixed the repair."""
+    from shapely import geometry as shapely_geometry
+
+    raw = shapely_geometry.Polygon([(0.0, 0.0), (10.0, 10.0), (10.0, 0.0), (0.0, 10.0)])
+    assert not raw.is_valid
+    assert raw.area == 0.0
+    repaired = deintersect.polygon_from_points([(0, 0), (10, 10), (10, 0), (0, 10)])
+    assert repaired.is_valid
+    assert repaired.area == pytest.approx(25.0)
+
+
+@needs_shapely
+def test_polygon_from_points_refuses_a_contour_that_cannot_enclose_anything() -> None:
+    """Fewer than three vertices is the empty polygon -- upstream's rule at ``deintersect.py:21``,
+    and the reason a two-point "polygon" is refused instead of being closed into a degenerate
+    sliver.  Any shape a contour arrives as is still accepted on the way in."""
+    assert deintersect.polygon_from_points([(1, 1), (5, 5)]).is_empty
+    assert deintersect.polygon_from_points(np.empty((0, 1, 2), dtype=np.int32)).is_empty
+    assert deintersect.polygon_from_points(COLLINEAR).area == pytest.approx(0.0)
+    assert not deintersect.polygon_from_points(geometry._as_cv_contour(RECT)).is_empty
+
+
+@needs_shapely
+def test_polish_polygon_keeps_the_biggest_piece_of_a_multipolygon() -> None:
+    """A boolean difference commonly shatters a polygon into pieces, and the biggest is the one
+    that was the region (``deintersect.py:11-19``, widened from ``Polygon`` to any geometry so a
+    ``MultiPolygon`` -- which is what ``buffer(0)`` hands back for a repaired ring -- has an answer
+    besides ``AttributeError``).  An empty polygon is empty back, unsimplified."""
+    from shapely import geometry as shapely_geometry
+
+    small = shapely_geometry.Polygon([(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)])
+    big = shapely_geometry.Polygon([(10.0, 10.0), (14.0, 10.0), (10.0, 14.0)])
+    assert deintersect.polish_polygon(shapely_geometry.MultiPolygon([small, big])).area == 8.0
+    assert deintersect.polish_polygon(big, simplify_tolerance=0.5).area == pytest.approx(8.0)
+    assert deintersect.polish_polygon(shapely_geometry.Polygon()).is_empty
+
+
+@pytest.mark.parametrize("gap", [0.0, 1.5, 4.0])
+@needs_shapely
+def test_separate_intersecting_pair_leaves_the_pair_the_gap_apart(
+    gap: float,
+) -> None:
+    """Two 10x10 squares overlapping by 4 (shared area 40 px²) come back with the overlap buffered
+    by *half* the gap on each side and subtracted from **both** (``deintersect.py:60-65``) -- so
+    the pair ends up ``gap`` apart instead of touching along the cut, which is what stops the next
+    pass finding the same overlap again.
+
+    The areas are arithmetic, not measurements: the buffered band covers ``4 + gap / 2`` of the
+    10-wide side it is cut out of (the 4-wide overlap plus the half-gap that reaches past it), so
+    each polygon keeps ``10 - (4 + gap / 2)`` of width and ``100 - 10 * (4 + gap / 2)`` px² -- 60,
+    52.5 and 40 for the three gaps below.
+    """
+    first = deintersect.polygon_from_points(square(0, 0))
+    second = deintersect.polygon_from_points(square(6, 0))
+    trimmed_first, trimmed_second, changed = deintersect.separate_intersecting_pair(
+        first, second, gap=gap
+    )
+    assert changed
+    expected = 100.0 - 10.0 * (4.0 + gap / 2.0)
+    assert trimmed_first.area == pytest.approx(expected)
+    assert trimmed_second.area == pytest.approx(expected)
+    assert not trimmed_first.intersects(trimmed_second)
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "min_intersection_area", "changed"),
+    [
+        (square(0, 0), square(50, 50), 1.0, False),  # nowhere near each other
+        (square(0, 0), square(10, 0), 1.0, False),  # touching along an edge: shared area 0
+        (square(0, 0), square(6, 0), 1.0, True),  # the ordinary overlap: 40 px² shared
+        (square(0, 0), square(6, 0), 41.0, False),  # the same overlap, below the configured floor
+        (square(0, 0), square(4, 4, 1), 1.0, False),  # a 1x1 inside a 10x10: see the test below
+    ],
+    ids=["apart", "touching", "overlapping", "below-the-floor", "swallowed"],
+)
+@needs_shapely
+def test_separate_intersecting_pair_refuses_every_pair_it_should_and_says_so(
+    first: np.ndarray, second: np.ndarray, min_intersection_area: float, changed: bool
+) -> None:
+    """``changed`` is ``False`` -- and both polygons come back as the very objects handed in --
+    whenever trimming is not on: no intersection, an overlap under *min_intersection_area*, or a
+    trim that would have eaten one of them (``deintersect.py:65``).  Upstream's third return value,
+    kept here because a caller cannot tell a refusal from a trim by looking at the polygons."""
+    first_polygon = deintersect.polygon_from_points(first)
+    second_polygon = deintersect.polygon_from_points(second)
+    trimmed_first, trimmed_second, reported = deintersect.separate_intersecting_pair(
+        first_polygon, second_polygon, min_intersection_area=min_intersection_area
+    )
+    assert reported is changed
+    if changed:
+        assert trimmed_first is not first_polygon
+    else:
+        assert trimmed_first is first_polygon and trimmed_second is second_polygon
+
+
+@needs_shapely
+def test_deintersect_polygons_hands_back_one_contour_per_contour_given() -> None:
+    """One contour per contour given, in the same order -- upstream appends an empty point list
+    where a polygon was consumed (``deintersect.py:116``) and this port returns the empty
+    ``(0, 1, 2)`` contour in its place, so the caller building regions from the result is the one
+    that decides whether an empty region is written, skipped or merged.
+
+    The four cases are the four answers: nothing in, nothing out; a lone square and a touching pair
+    both unchanged (nothing to trim); an overlapping pair trimmed to the buffered pair of rectangles
+    the pair function returns -- each vertex list the integer truncation of the shapely ring, since
+    this package's contours are open integer vertex lists and not shapely's closed float rings.
+    """
+    empty = np.array(
+        [[0, 0], [4, 5]], dtype=np.int32
+    )  # two points: not a polygon, and still counted
+    cases = {
+        "nothing": ([], []),
+        "lone": ([square(0, 0)], [[[0, 0], [10, 0], [10, 10], [0, 10]]]),
+        "touching": (
+            [square(0, 0), square(10, 0)],
+            [[[0, 0], [10, 0], [10, 10], [0, 10]], [[10, 0], [20, 0], [20, 10], [10, 10]]],
+        ),
+        "consumed": ([empty], [[]]),
+        "overlapping": (
+            [square(0, 0), square(6, 0)],
+            [[[0, 0], [0, 10], [5, 10], [5, 0]], [[16, 10], [16, 0], [10, 0], [10, 10]]],
+        ),
+    }
+    for name, (given, expected) in cases.items():
+        got = deintersect.deintersect_polygons(given)
+        assert [c.reshape(-1, 2).tolist() for c in got] == expected, name
+        assert all(c.dtype == np.int32 and c.ndim == 3 for c in got), name
+
+
+@needs_shapely
+def test_page_geometry_separates_the_children_and_the_roots_it_rebuilds(tmp_path: Path) -> None:
+    """``deintersect`` on a page trims the lines *inside* each region first and the page's own
+    regions second -- the order upstream wrote this for, and the reason a page whose ring web
+    overlaps a fragment is trimmed against the already-trimmed fragment rather than the raw one.
+
+    Both levels are checked here on one page: two overlapping lines inside a block, and two
+    overlapping blocks, all four contours coming back the buffered versions of themselves while
+    ``epsilon=0`` keeps their vertex count otherwise untouched.
+    """
+    block = region(RegionKind.TEXT, "a", square(0, 0), "paragraph")
+    other = region(RegionKind.TEXT, "b", square(6, 0), "paragraph")
+    first_line = region(RegionKind.TEXTLINE, "a1", square(0, 20), "text_line")
+    second_line = region(RegionKind.TEXTLINE, "a2", square(6, 20), "text_line")
+    block.children = [first_line, second_line]
+    first_line.parent = block
+    second_line.parent = block
+    # The flat list the parser produces holds nested regions beside their parents; the nesting is
+    # on ``children``/``parent``, and it is that shape ``prepare`` walks.
+    page = parser.Page(
+        path=tmp_path / "y.xml",
+        file_name="y",
+        height=60,
+        width=60,
+        regions=[block, first_line, second_line, other],
+    )
+
+    prepared = simplify.PageGeometry(deintersect=True).prepare(page)
+    contours = {r.region_id: [tuple(p) for p in r.contour.reshape(-1, 2)] for r in prepared.regions}
+
+    assert sorted(contours) == ["a", "a1", "a2", "b"]
+    assert contours["a"] == [(0, 0), (0, 10), (5, 10), (5, 0)]  # trimmed against "b"
+    assert contours["b"] == [(16, 10), (16, 0), (10, 0), (10, 10)]
+    assert contours["a1"] == [(0, 20), (0, 30), (5, 30), (5, 20)]  # trimmed against its sibling
+    assert contours["a2"] == [(16, 30), (16, 20), (10, 20), (10, 30)]
+    assert [r.region_id for r in prepared.regions[0].children] == ["a1", "a2"]
+
+
+def test_an_explicit_request_without_shapely_is_refused_not_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shapely`` is a declared dependency, so its absence means an incomplete install: asking for
+    de-intersection *raises* :class:`~sbb_pytorch.exceptions.GeometryError` naming the package and
+    the install command rather than quietly producing un-de-intersected output -- the
+    ``Checkpoint.save`` rule for ``.safetensors``, pinned here in the same shape (no ``skipif``:
+    this test runs on a machine that has no shapely, which is the machine it is written for)."""
+    monkeypatch.setattr(deintersect, "shapely_available", lambda: False)
+    deintersect._backend.cache_clear()
+    try:
+        with pytest.raises(GeometryError, match="needs the shapely package"):
+            deintersect._backend()
+        with pytest.raises(GeometryError, match="shapely>=2.0"):
+            deintersect.deintersect_polygons([square(0, 0)])
+    finally:
+        monkeypatch.undo()
+        deintersect._backend.cache_clear()

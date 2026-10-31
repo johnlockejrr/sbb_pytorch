@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "CheckpointError",
     "ConfigError",
+    "GeometryError",
     "ImageReadError",
     "ModelBuildError",
     "PageXMLError",
@@ -28,6 +29,22 @@ class ConfigError(SBBError):
 
     Raised by :mod:`sbb_pytorch.config.loaders` and by :func:`click` parameter callbacks.
     Field-level detail comes from pydantic's ``errors()`` payload.
+    """
+
+
+class GeometryError(SBBError, ValueError):
+    """A polygon cannot be turned into the shape the caller asked for.
+
+    Raised by :mod:`sbb_pytorch.gt.deintersect` when it is asked to separate overlapping polygons
+    in an environment where ``shapely`` cannot be imported -- the
+    :class:`sbb_pytorch.storage.checkpoint.CheckpointError` rule that an explicit request is
+    *refused* rather than quietly skipped.  :mod:`sbb_pytorch.gt.simplify` never raises it: a
+    contour it cannot simplify (fewer than three vertices, simplification off) comes back as the
+    contour it was given.
+
+    Subclasses ``ValueError`` the way :class:`PageXMLError` does, so a caller that already catches
+    that -- the CLI's ``except SBBError``, and the tests written against the sibling projects this
+    code was ported from -- keeps working.
     """
 
 
