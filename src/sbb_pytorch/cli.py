@@ -1244,6 +1244,13 @@ def gt() -> None:
 )
 @click.option("--images-output-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option(
+    "--recursive/--no-recursive",
+    default=True,
+    help="Look inside subfolders of --xml and --images-dir too (the default), so one run can "
+    "cover a parent folder of child datasets; --no-recursive reads only the files directly "
+    "inside them, which is what every run before this flag did.",
+)
+@click.option(
     "--min-area",
     type=float,
     default=None,
@@ -1262,6 +1269,7 @@ def gt_generate(
     printspace: bool,
     images_dir: Path | None,
     images_output_dir: Path | None,
+    recursive: bool,
     min_area: float | None,
     limit: int | None,
     dry_run: bool,
@@ -1275,6 +1283,11 @@ def gt_generate(
     ``--type-output`` falls back to the config's own ``type_output`` when it is not given, so
     ``sbb gt generate -c configs/textline.json`` builds the format that file asks for; with
     ``--use-case`` there is no file to ask, and it is ``3d`` as the legacy command wrote it.
+
+    ``--xml`` may name a folder of XML files or a *parent* folder whose children are datasets --
+    subfolders are searched, so ``--xml smp-private`` covers every export inside it -- and their
+    pages all land in the flat ``-o`` folder, each under its own stem. Pass ``--no-recursive`` for
+    the old single-folder listing.
     """
     if config_path is not None and use_case_raw is not None:
         raise click.BadParameter("give --config or --use-case, not both")
@@ -1298,14 +1311,16 @@ def gt_generate(
     # leaving it out asks the file; naming it still wins. The legacy option had no default either.
     resolved_output_type = OutputType.parse(output_type) if output_type else gt_config.type_output
 
-    xml_files = discover_xml_files(xml_dir)
+    xml_files = discover_xml_files(xml_dir, recursive=recursive)
     if limit is not None:
         xml_files = xml_files[: int(limit)]
     if not xml_files:
         raise click.BadParameter(f"no ALTO/PageXML files in {xml_dir}")
     if dry_run:
         for path in xml_files:
-            click.echo(path.name)
+            # Relative to --xml, so a recursive run says which child folder each page came from
+            # -- three children's ``0113.xml`` all print as ``0113.xml`` next to each other.
+            click.echo(path.relative_to(xml_dir))
         click.secho(f"{len(xml_files)} file(s) in {xml_dir} would produce {output_dir}", fg="green")
         return
 
@@ -1320,6 +1335,7 @@ def gt_generate(
             images_dir=images_dir,
             images_output_dir=images_output_dir,
             xml_files=xml_files,
+            recursive=recursive,
             on_progress=advance,
         )
     state.logger.debug("generation result: %s", result)
@@ -1478,6 +1494,12 @@ def gt_enhance(
     "``<output-dir>/classes``.",
 )
 @click.option(
+    "--recursive/--no-recursive",
+    default=True,
+    help="Read the subfolders of --xml too (the default), so one run covers a parent folder of "
+    "child datasets; --no-recursive reads only the files directly inside it.",
+)
+@click.option(
     "--size", nargs=2, type=int, default=None, metavar="H W", help="Rasters at this size."
 )
 @click.option(
@@ -1500,6 +1522,7 @@ def gt_reading_order(
     xml_dir: Path,
     output_dir: Path,
     classes_dir: Path | None,
+    recursive: bool,
     size: tuple[int, int] | None,
     min_area: float | None,
     max_area: float | None,
@@ -1514,8 +1537,11 @@ def gt_reading_order(
     pair; :func:`~sbb_pytorch.gt.reading_order.generate_pairs` is that code ported and
     :func:`~sbb_pytorch.gt.reading_order.write_pair` keeps its file contract, ``_missed`` marker
     included.
+
+    ``--xml`` is searched in its subfolders as well, so a parent folder of child datasets is one
+    command; ``--no-recursive`` reads only the files directly inside it.
     """
-    xml_files = discover_xml_files(xml_dir)
+    xml_files = discover_xml_files(xml_dir, recursive=recursive)
     if limit is not None:
         xml_files = xml_files[: int(limit)]
     if not xml_files:

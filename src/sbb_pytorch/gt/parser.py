@@ -626,31 +626,51 @@ def _element_region(element: ET.Element, prefix: str) -> Region | None:
     return _read_region(element, prefix, RegionKind(_local_name(element.tag)), None)
 
 
-def discover_xml_files(directory: str | Path) -> list[Path]:
-    """All XML files directly inside *directory*, sorted, extensions matched case-first.
+def discover_xml_files(directory: str | Path, *, recursive: bool = True) -> list[Path]:
+    """Every XML file under *directory*, sorted, extensions matched case-first.
 
     Replaces ``get_content_of_dir`` and the ``dir_imgs`` listings it was paired with: the
     legacy version called ``os.listdir`` once per loop iteration (once per file, in the
     ``pagexml2label`` path) and treated subdirectories as files, so a nested directory
     named ``foo.xml`` was handed to the parser.  Files only, ``.xml``/``.XML``, walked once.
+
+    The walk is ``**``-deep since 0.2.0 because a dataset is often a *parent* folder of child
+    datasets -- ``smp-private/`` holding one folder per export -- and the one-level listing
+    answered such a folder with nothing at all: no files of its own, so
+    ``sbb gt generate --xml <parent>`` said ``no ALTO/PageXML files in <parent>`` and a run that
+    looked like it covered three datasets had read zero of them.  Pass ``recursive=False`` for
+    the old listing, which is what ``sbb gt generate --no-recursive`` now means.
+
+    Sorting is over the full paths, so a nested file sorts by its directory name first; which
+    of two files answers the same stem (:func:`~sbb_pytorch.gt.generator.output_stem`) is
+    therefore decided by folder order, not by the order the folders were created in.
     """
     base = Path(directory)
-    return sorted(
-        entry for entry in base.iterdir() if entry.is_file() and entry.suffix.lower() == ".xml"
-    )
+    if not base.exists():
+        raise FileNotFoundError(f"{directory} does not exist")
+    if not base.is_dir():
+        raise NotADirectoryError(f"{directory} is not a directory")
+    entries = base.rglob("*") if recursive else base.iterdir()
+    return sorted(entry for entry in entries if entry.is_file() and entry.suffix.lower() == ".xml")
 
 
-def image_for(page: Page, directory: str | Path) -> Path | None:
+def image_for(page: Page, directory: str | Path, *, recursive: bool = True) -> Path | None:
     """Locate the raster image matching *page* in *directory*.
 
     Any extension is accepted, matching the legacy
     ``find_format_of_given_filename_in_dir``, which raised ``IndexError`` instead
     of returning ``None``.
+
+    *directory* is searched in subfolders too (``recursive=False`` restricts it to the folder
+    itself), so a page whose photo sits in the same child folder as its XML is still found when
+    the pair is addressed through a parent dataset.  The first match in sorted-path order wins,
+    which is the same rule as the one-level version for a flat folder.
     """
     base = Path(directory)
     if not base.is_dir():
         return None
-    for entry in sorted(base.iterdir()):
+    entries = base.rglob("*") if recursive else base.iterdir()
+    for entry in sorted(entries):
         if entry.is_file() and entry.stem == page.file_name:
             return entry
     return None

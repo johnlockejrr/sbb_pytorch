@@ -655,6 +655,40 @@ def test_discover_xml_files_and_image_lookup(tmp_path: Path) -> None:
     )
 
 
+def test_discovery_descends_into_child_dataset_folders(tmp_path: Path) -> None:
+    """A parent of child dataset folders is one listing now, and ``recursive=False`` is the old one.
+
+    ``smp-private/`` holding one folder per export has no XML file of its own, so the one-level
+    listing answered it with nothing at all -- and a page whose photo sits beside its XML in
+    ``childB/`` was invisible to :func:`~sbb_pytorch.gt.parser.image_for` through the parent, so
+    the source image of every page in a subfolder was dropped quietly.
+    """
+    parent = tmp_path / "smp-private"
+    child_a = parent / "export_doc11040_mss_pagexml"
+    child_b = parent / "sam_44_mss_variants"
+    child_a.mkdir(parents=True)
+    child_b.mkdir(parents=True)
+    write_xml(child_a, "882241214-0113.xml", "<PcGts/>")
+    write_xml(child_b, "901234567-0113.xml", "<PcGts/>")
+
+    assert parser.discover_xml_files(parent) == [
+        child_a / "882241214-0113.xml",
+        child_b / "901234567-0113.xml",
+    ]
+    assert parser.discover_xml_files(parent, recursive=False) == []  # what the old listing said
+    assert parser.discover_xml_files(child_a) == [child_a / "882241214-0113.xml"]  # one child
+    with pytest.raises(NotADirectoryError):
+        parser.discover_xml_files(child_a / "882241214-0113.xml")  # a file is not a folder
+
+    page = parser.Page(
+        path=child_b / "901234567-0113.xml", file_name="901234567-0113", height=5, width=5
+    )
+    (child_b / "901234567-0113.png").write_bytes(b"")
+    assert parser.image_for(page, parent) == child_b / "901234567-0113.png"
+    assert parser.image_for(page, parent, recursive=False) is None
+    assert parser.image_for(page, child_b) == child_b / "901234567-0113.png"
+
+
 @pytest.mark.parametrize(
     ("metadata", "expected"),
     [
@@ -2023,7 +2057,8 @@ def test_two_files_answering_one_stem_now_get_two_files() -> None:
     assert generator.unique_output_stem("901234567-0113.xml", taken) == "901234567-0113"
     assert generator.unique_output_stem("882241214-0113.alto.xml", taken) == "882241214-0113.alto"
     assert generator.unique_output_stem("a-b.xml", taken) == "b"
-    assert generator.unique_output_stem("a-b.xml", taken) == "a-b_1"  # whole stem taken too
+    assert generator.unique_output_stem("a-b.xml", taken) == "a-b"  # the whole file stem
+    assert generator.unique_output_stem("a-b.xml", taken) == "a-b_1"  # legacy and full taken
     assert generator.unique_output_stem("000123456.xml", taken) == "000123456"
     assert generator.unique_output_stem("000123456.xml", taken) == "000123456_1"
 

@@ -361,6 +361,7 @@ def generate_ground_truth(
     images_dir: str | Path | None = None,
     images_output_dir: str | Path | None = None,
     xml_files: Sequence[Path] | None = None,
+    recursive: bool = True,
     on_progress: Callable[[Path], None] | None = None,
 ) -> GenerationResult:
     """Generate ground-truth label images for every PageXML file in *xml_dir*.
@@ -387,6 +388,10 @@ def generate_ground_truth(
         the print-space crop and the column resize to be reproducible on the photos.
     xml_files:
         Pre-resolved file list, e.g. from a progress bar; defaults to *xml_dir*'s contents.
+    recursive:
+        Search *xml_dir* and *images_dir* in their subfolders too, so one call can cover a
+        parent folder of child datasets. ``False`` is the pre-0.2.0 listing: files directly
+        inside each folder and nothing deeper.
     on_progress:
         Called with each file after it is handled, so a caller can drive a progress bar
         without this package depending on ``rich``.
@@ -398,7 +403,11 @@ def generate_ground_truth(
     """
     resolved = GroundTruthConfig.parse(config)
     kind = OutputType.parse(output_type)
-    files = list(xml_files) if xml_files is not None else discover_xml_files(xml_dir)
+    files = (
+        list(xml_files)
+        if xml_files is not None
+        else discover_xml_files(xml_dir, recursive=recursive)
+    )
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -437,7 +446,13 @@ def generate_ground_truth(
             )
         )
         copied = _copy_source_image(
-            page, resolved, images_dir, images_output_dir, printspace=printspace, stem=stem
+            page,
+            resolved,
+            images_dir,
+            images_output_dir,
+            printspace=printspace,
+            stem=stem,
+            recursive=recursive,
         )
         if copied is not None:
             result.images.append(copied)
@@ -657,6 +672,7 @@ def _copy_source_image(
     *,
     printspace: bool = False,
     stem: str | None = None,
+    recursive: bool = True,
 ) -> Path | None:
     """Copy (and match the label's transforms on) the page's source image.
 
@@ -670,7 +686,7 @@ def _copy_source_image(
     """
     if images_dir is None or images_output_dir is None:
         return None
-    source = _find_image(page, images_dir)
+    source = _find_image(page, images_dir, recursive=recursive)
     if source is None:
         return None
     image = read_image(source)
@@ -685,7 +701,7 @@ def _copy_source_image(
     return write_image(Path(images_output_dir) / f"{name}{source.suffix}", image)
 
 
-def _find_image(page: Page, images_dir: str | Path) -> Path | None:
+def _find_image(page: Page, images_dir: str | Path, *, recursive: bool = True) -> Path | None:
     """The photo of *page* in *images_dir*, under either of its two stems.
 
     Only files whose suffix is in :data:`~sbb_pytorch.storage.images.IMAGE_SUFFIXES` are
@@ -693,13 +709,18 @@ def _find_image(page: Page, images_dir: str | Path) -> Path | None:
     the image folder were the same directory -- ``000123456-1800.xml`` sorts before
     ``1800.png`` -- after which ``read_image`` returned ``None`` and the source copy was
     dropped without a word.
+
+    Subfolders are searched too (``recursive=False`` stops at *images_dir* itself), which is
+    what lets ``--xml`` and ``--images-dir`` both name a parent of child datasets: the photo of
+    a page found in ``childB/`` is in ``childB/`` too, and a folder-deep listing is what finds
+    it there.
     """
     base = Path(images_dir)
     if not base.is_dir():
         return None
     wanted = {output_stem(page.path), page.file_name}
-    entries = sorted(base.iterdir())
-    for entry in entries:
+    entries = base.rglob("*") if recursive else base.iterdir()
+    for entry in sorted(entries):
         if entry.is_file() and entry.suffix.lower() in IMAGE_SUFFIXES and entry.stem in wanted:
             return entry
     return None

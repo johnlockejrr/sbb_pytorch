@@ -977,6 +977,69 @@ def test_gt_generate_dry_run_lists_the_files_it_would_read(
     assert not out.exists()
 
 
+def test_gt_generate_reads_a_parent_folder_of_child_datasets(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``--xml`` on a folder whose children are datasets reads every one of them.
+
+    A dataset folder holding nothing but child dataset folders -- ``smp-private/`` with one export
+    per subfolder -- has no XML files of its own, so the one-level listing answered it with
+    ``no ALTO/PageXML files in ...`` and a command that looked like it covered three datasets had
+    read none. The listing is recursive now, a dry run names each file relative to ``--xml`` so the
+    child it came from is visible, and ``--no-recursive`` is the old single-folder answer.
+    """
+    parent = tmp_path / "smp-private"
+    child = parent / "sam_44_mss_variants"
+    child.mkdir(parents=True)
+    (child / "000123456-1800.xml").write_bytes(PAGE_XML.format(size=SIZE, edge=SIZE - 4).encode())
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": {"use_case": "layout", "textregions": {"paragraph": 1}},
+            }
+        )
+    )
+    out = tmp_path / "gt"
+
+    dry = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        parent,
+        "-o",
+        out,
+        "--config",
+        gt_config,
+        "--dry-run",
+    )
+    assert dry.exit_code == 0, dry.output
+    assert "sam_44_mss_variants/000123456-1800.xml" in dry.output  # named through its child folder
+    assert not out.exists()
+
+    result = invoke(runner, "gt", "generate", "--xml", parent, "-o", out, "--config", gt_config)
+    assert result.exit_code == 0, result.output
+    assert [p.name for p in out.glob("*.png")] == ["1800.png"]
+
+    flat = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        parent,
+        "-o",
+        tmp_path / "flat",
+        "--config",
+        gt_config,
+        "--no-recursive",
+        "--dry-run",
+    )
+    assert flat.exit_code == 2 and f"no ALTO/PageXML files in {parent}" in flat.output
+
+
 def test_gt_generate_needs_a_use_case_or_a_config(
     runner: CliRunner, tmp_path: Path, xml_dir: Path, config_file: Path
 ) -> None:

@@ -123,7 +123,10 @@ when the `safetensors` dependency is installed.
 `--config` (a `GroundTruthConfig` JSON, the shape of `custom_config_page2label.json`) or
 `--use-case`, which the old script made you edit as a constant. `--type-output` is `2d` or `3d`
 (`--type` before), `--printspace` and `--min-area` carry over, and `--dry-run` lists the XML files
-it found without writing anything. A `rich` bar tracks the files when stdout is a terminal.
+it found without writing anything. `--xml` is searched inside subfolders too, so a *parent* of
+child datasets (`smp-private/` holding one folder per export) is one command and their pages all
+land in the flat `-o`; `--no-recursive` reads only the files directly inside the folder given. A
+`rich` bar tracks the files when stdout is a terminal.
 
 `sbb gt visualize XML [-o OUT] [--size H W] [--type-output 2d|3d]` renders a single ALTO/PageXML
 page -- the view that previously required opening the notebook.

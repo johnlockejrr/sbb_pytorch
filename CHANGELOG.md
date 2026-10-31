@@ -141,6 +141,16 @@ replacement.
   for the file-by-file table, including the four root JSON configs (now `configs/*.json`),
   `requirements.txt` (now `pyproject.toml`), and `train.md` (folded into the README and the
   changelogs).
+- **`--xml` folders are read recursively, and `--no-recursive` is the old listing.** A folder whose
+  children are datasets -- `smp-private/` holding one folder per export -- has no XML file of its
+  own, and `discover_xml_files` listed only the files directly inside the folder it was given, so
+  such a parent answered `no ALTO/PageXML files in ...` and a command that looked like it covered
+  three datasets had read none of them. `sbb gt generate` and `sbb gt reading-order` now descend by
+  default (`--recursive`, the new default, is what `discover_xml_files` does; `--no-recursive`
+  restricts it to the folder itself), `--images-dir` is searched the same way so a page's photo is
+  found in the folder its XML was found in, and the dry-run prints each path relative to `--xml`
+  because the folder is now part of the answer. Two children's page `0113` land in one output
+  folder through `unique_output_stem`, which is what makes merging them safe.
 - `--device` defaults to `auto` and is validated at parse time. `train.py` hard-coded `cuda` and
   called `pl.Trainer(accelerator=device, devices=1)`, which rejected the valid spec `cuda:1` and
   made the second GPU of a machine unreachable.
