@@ -91,7 +91,9 @@ replacement.
 - `sbb train --verbose-metrics/--no-verbose-metrics`, the flag that sets the `verbose` field of
   every `ModelCheckpoint` and `EarlyStopping` a run builds, plus the two callbacks that make a
   quiet run still readable: `training.callbacks.SBBProgressBar` (the rich bar plus the
-  `early_stopping/val_loss: 3/10` counters `early_stopping_fields` reads off the trainer) and
+  early-stopping counters it reads off the trainer -- first the `early_stopping/val_loss: 3/10`
+  fields `early_stopping_fields` returned, now an `EarlyStoppingColumn` beside the metrics that also
+  prints the best score, as the Fixed entry about it describes) and
   `training.callbacks.SBBModelSummary` (the same summary table without its `FLOPs` column and the
   `Total FLOPs: 0` line under it).
 - **`.safetensors` checkpoints: `Checkpoint.save_safetensors` and `Checkpoint.load_safetensors`.**
@@ -528,7 +530,25 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   the screen. `early_stopping_fields` printed `early_stopping/val_loss: 0/10` *and*
   `early_stopping/val_accuracy: 0/10` -- the metric names twice more, values left out, beside the same
   numbers shown as values -- and emits one `early_stopping: 0/10`, from the callback closest to
-  stopping.
+  stopping (the entry below supersedes where that counter sits: one field, now a column of the bar
+  rather than an entry in the metrics line).
+- **A finished epoch's line reported the epoch before it as its early-stopping count.** The counter
+  lived inside the metrics dict `SBBProgressBar.get_metrics` builds, and that dict is a snapshot --
+  Lightning rebuilds it at `on_train_batch_end`, `on_train_epoch_end` and `on_validation_end` and hands
+  the result to `MetricsTextColumn.update` -- so the frame an epoch left on screen carried whichever
+  snapshot was current when that epoch's last bar frame was drawn: a line for epoch 30 reading `0/10`
+  under a `val_loss` of its own that had already moved the count to 1, correcting itself only when
+  epoch 31 started. The counter is a column now, `training.callbacks.EarlyStoppingColumn`, attached by
+  an `SBBProgressBar._init_progress` override, so it renders when the frame is painted and a row's
+  count agrees with that row's losses. It prints `early_stopping: 1/10 best 0.04300`: the best score
+  beside the count is what the silenced `Metric val_loss improved. New best score: 0.449` line used to
+  print, so a count reads as "one epoch since 0.04300" without `--verbose-metrics`. The shape is
+  `oxygraphos-ocr`'s children's (`dfine_seg/lib/progress.py` and its sibling copies) with two of their
+  problems fixed -- theirs reads `trainer.early_stopping_callback`, Lightning's *first*
+  `EarlyStopping`, so a run with this package's pair reports one metric's count for both, and it
+  formats `best_score` unconditionally, printing the `inf`/`-inf` sentinel a callback holds before its
+  first validation. `SBBProgressBar.get_metrics` returns the logged metrics alone now, and
+  `early_stopping_fields` stays as the dict form for callers without a bar.
 
 ### Removed
 

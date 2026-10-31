@@ -40,8 +40,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -51,10 +52,17 @@ from pytorch_lightning.callbacks import (
     RichModelSummary,
     RichProgressBar,
 )
+from pytorch_lightning.callbacks.progress.rich_progress import (
+    CustomProgress,
+    MetricsTextColumn,
+)
 from pytorch_lightning.utilities.model_summary import (
     get_formatted_model_size,
     get_human_readable_count,
 )
+from rich import get_console, reconfigure
+from rich.progress import ProgressColumn
+from rich.text import Text
 from torch import Tensor
 
 from sbb_pytorch.config.models import SBBConfig
@@ -64,6 +72,8 @@ from sbb_pytorch.training.module import SBBLightningModule
 
 __all__ = [
     "DEFAULT_TOP_K",
+    "EarlyStoppingColumn",
+    "EarlyStoppingState",
     "SBBModelSummary",
     "SBBProgressBar",
     "StepCheckpoint",
@@ -71,6 +81,7 @@ __all__ = [
     "checkpoint_for",
     "early_stopping_fields",
     "early_stopping_for",
+    "early_stopping_states",
     "load_callbacks_file",
     "metric_mode",
     "metric_snapshot",
@@ -166,32 +177,122 @@ def early_stopping_for(
     )
 
 
-def early_stopping_fields(trainer: Any) -> dict[str, str]:
-    """``{"early_stopping": "3/10"}`` -- one field for every ``EarlyStopping`` on *trainer*.
+class EarlyStoppingState(NamedTuple):
+    """One ``EarlyStopping``'s live numbers: epochs waited, its patience, its best score.
 
-    The bar's version of what the ``verbose=True`` prints said: epochs a monitor has gone without
-    improving, over the patience that ends the run. The two callbacks this package registers (one per
-    monitored metric) used to each add a field -- ``early_stopping/val_loss: 3/10`` and
-    ``early_stopping/val_accuracy: 3/10`` -- which on the bar read as two more copies of the metric
-    *names* with the values left out, right next to the same numbers as ``val_loss: 0.449``. One
-    field now, carrying the callback closest to stopping (largest ``wait_count``, then the shortest
-    ``patience``); ``verbose=True`` still prints a line per callback for whoever wants both.
+    ``best_score`` is the number the ``Metric val_loss improved. New best score: 0.449`` line this
+    package silenced printed -- the number a ``wait_count`` is judged against -- and carrying it is
+    what makes ``early_stopping: 1/10 best 0.04300`` readable as "one epoch since 0.04300" instead of
+    a bare count. Before a callback's first validation it holds the sentinel its ``__init__`` leaves
+    in place -- ``+inf`` for a ``mode="min"`` monitor, ``-inf`` for ``mode="max"`` -- which
+    :class:`EarlyStoppingColumn` prints as no score at all; see :func:`_as_float`.
     """
-    counts = [
-        (callback.wait_count, callback.patience)
+
+    wait: int
+    patience: int
+    best_score: float
+
+
+def early_stopping_states(trainer: Any) -> list[EarlyStoppingState]:
+    """Every ``EarlyStopping`` on *trainer*, in registration order, as :class:`EarlyStoppingState`.
+
+    ``getattr(trainer, "callbacks", ())`` because the callers pass a real ``Trainer`` and a
+    ``SimpleNamespace(callbacks=[...])`` alike, and ``callback.monitor is not None`` because an
+    ``EarlyStopping`` built without a monitor watches nothing and has nothing to report.
+    """
+    return [
+        EarlyStoppingState(
+            int(callback.wait_count), int(callback.patience), _as_float(callback.best_score)
+        )
         for callback in getattr(trainer, "callbacks", ())
         if isinstance(callback, EarlyStopping) and callback.monitor is not None
     ]
-    if not counts:
+
+
+def _as_float(value: Any) -> float:
+    """``EarlyStopping.best_score`` as a float, whatever shape the callback keeps it in.
+
+    Lightning stores whatever it monitored -- a ``torch.Tensor`` out of ``trainer.callback_metrics``, a
+    plain float after ``EarlyStopping`` converts one -- so the render side formats a single type. The
+    conversion is what ``EarlyStopping`` itself does before printing ``New best score: 0.449``, and it
+    leaves the ``+inf``/``-inf`` sentinel of a callback that has not measured yet as a float too.
+    """
+    return float(value)
+
+
+def _most_advanced(states: list[EarlyStoppingState]) -> EarlyStoppingState | None:
+    """The callback closest to stopping: the largest ``wait``, then the shortest ``patience``.
+
+    The tie-break matters for the pair this package registers -- both stop the run, and the one with
+    less patience left is the one that will. Returns ``None`` for a trainer with no monitored
+    ``EarlyStopping``, which is what lets a run with a bar and no stopping rule still have a bar.
+    """
+    if not states:
+        return None
+    return max(states, key=lambda state: (state.wait, -state.patience))
+
+
+def early_stopping_fields(trainer: Any) -> dict[str, str]:
+    """``{"early_stopping": "3/10"}`` -- one field for every ``EarlyStopping`` on *trainer*.
+
+    The dict form of :func:`early_stopping_states`. The two callbacks this package registers (one per
+    monitored metric) used to each add a field -- ``early_stopping/val_loss: 3/10`` and
+    ``early_stopping/val_accuracy: 3/10`` -- which on the bar read as two more copies of the metric
+    *names* with the values left out, right next to the same numbers as ``val_loss: 0.449``. One
+    field now, from the callback closest to stopping; ``verbose=True`` still prints a line per
+    callback for whoever wants both.
+
+    The bar stopped rendering the counter from here -- see :class:`EarlyStoppingColumn` for why a
+    dict made it read one epoch behind. It stays as the answer for anything that wants the counters
+    without a bar in front of it, and it is what the bar's metrics dict used to carry.
+    """
+    leading = _most_advanced(early_stopping_states(trainer))
+    if leading is None:
         return {}
-    wait, patience = max(counts, key=lambda pair: (pair[0], -pair[1]))
-    return {"early_stopping": f"{wait}/{patience}"}
+    return {"early_stopping": f"{leading.wait}/{leading.patience}"}
+
+
+class EarlyStoppingColumn(ProgressColumn):
+    """``early_stopping: 1/10 best 0.04300`` -- the counter as a column of the bar, not a metric.
+
+    The counter used to ride inside the metrics dict (:func:`early_stopping_fields` merged it into
+    :meth:`SBBProgressBar.get_metrics`), and that dict is a *snapshot*: Lightning rebuilds it at
+    ``on_train_batch_end``, ``on_train_epoch_end`` and ``on_validation_end`` and hands the result to
+    ``MetricsTextColumn.update``, and with ``leave=True`` the row an epoch left on screen was painted
+    from whichever snapshot was current when that epoch's last bar frame was drawn. So an epoch's
+    printed ``early_stopping`` could disagree with the ``val_loss`` printed beside it -- a row for
+    epoch 30 reading ``0/10`` under a ``val_loss`` that had already moved the count to 1, because the
+    counter in that string came from epoch 29's validation. A column renders when the frame is
+    painted, so what a row shows is what the callbacks hold at that moment.
+
+    The shape is the one the ``oxygraphos-ocr`` children use (``dfine_seg/lib/progress.py`` and its
+    sibling copies): ``{wait}/{patience} {best_score}``, the best score beside it so a count is
+    readable as "1 epoch since 0.04300" without ``--verbose-metrics``. Two differences: theirs reads
+    ``trainer.early_stopping_callback`` -- Lightning's *first* ``EarlyStopping``, so a run with this
+    package's pair shows one metric's count for both -- and formats ``best_score`` even when it is the
+    ``+inf``/``-inf`` sentinel a callback holds before its first validation, which prints as ``inf``
+    (``mode="min"``) or ``-inf`` (``mode="max"``). Here the pair is collapsed by
+    :func:`_most_advanced` and the score stays off the line until it is a number.
+    """
+
+    def __init__(self, trainer: Any) -> None:
+        """Holds the trainer, which is where a column renders its numbers from (see *task*)."""
+        self._trainer = trainer
+        super().__init__()
+
+    def render(self, task: Any) -> Text:
+        """The counter for the bar being painted; ``task`` is rich's, and the count is not per-task."""
+        state = _most_advanced(early_stopping_states(self._trainer))
+        if state is None:
+            return Text("", justify="left")
+        best = f" best {state.best_score:.5f}" if math.isfinite(state.best_score) else ""
+        return Text(f"early_stopping: {state.wait}/{state.patience}{best}", justify="left")
 
 
 class SBBProgressBar(RichProgressBar):
     """``RichProgressBar`` that leaves every finished epoch's line on screen, counters included.
 
-    Two changes to the parent, both about what a bar is for:
+    Three changes to the parent, all about what a finished run leaves on the terminal:
 
     ``leave=True`` (the parent defaults to ``False``)
         Rich paints one *live* panel and repaints it in place, so with the default an epoch's bar is
@@ -199,23 +300,74 @@ class SBBProgressBar(RichProgressBar):
         epoch, not the run. The parent stops and rebuilds the live display at each epoch start when
         ``leave`` is on, which prints the finished frame first: ``Epoch 0/199 ...`` with the numbers
         that epoch ended on, then a fresh bar. A ``sbb train`` of 200 epochs ends with 200 lines.
-    :func:`early_stopping_fields` on the metrics line
-        The parent lists ``trainer.callback_metrics`` and says nothing about the two
-        ``EarlyStopping``\\ s registered beside it, so a run's remaining patience was only ever
-        visible as the ``Metric ...`` lines this package silenced. ``early_stopping: 3/10`` is now
-        part of the line, beside the losses.
+    :class:`EarlyStoppingColumn` after the metrics column
+        The parent's bar is ``configure_columns(trainer)`` plus the metrics column and nothing else,
+        so it said nothing about the two ``EarlyStopping``\\ s registered beside it until
+        :func:`early_stopping_fields` put the counters in the metrics line. They are a column now --
+        same line, live numbers; the class says what the old placement got wrong.
+    :meth:`get_metrics`
+        The parent's metrics and nothing else: exactly what ``self.log(..., prog_bar=True)`` filled,
+        tensors already converted. It used to append the counters, which is what made a frozen
+        epoch's row display a counter from the epoch after it.
     """
 
     def __init__(self, *args: Any, leave: bool = True, **kwargs: Any) -> None:
         """``leave`` defaults to ``True``; the parent's own arguments (``refresh_rate``, ``theme``,
         ``console_kwargs``) pass through unchanged."""
         super().__init__(*args, leave=leave, **kwargs)
+        #: The parent declares ``_metric_component`` here and has no slot for ours; see
+        #: :meth:`_init_progress`, which builds it once a trainer exists.
+        self._early_stopping_component: EarlyStoppingColumn | None = None
+
+    def _init_progress(self, trainer: pl.Trainer) -> None:
+        """The parent's columns, the metrics column, then the :class:`EarlyStoppingColumn`.
+
+        The body is the parent's -- including its Rich >= 14.1 ``_live_stack`` shim, which clears a
+        live display the old way or the new one depending on the rich installed -- rebuilt here for
+        the one thing it cannot express: ``CustomProgress`` is built from ``configure_columns(trainer)``
+        and the metrics column, and a subclass has no hook for a column of its own without rebuilding
+        the same object. The metrics column is therefore named here instead of inline, and the
+        early-stopping column follows it, which is the column order the ``oxygraphos-ocr`` children
+        this shape came from use.
+        """
+        if not (self.is_enabled and (self.progress is None or self._progress_stopped)):
+            return
+        self._reset_progress_bar_ids()
+        reconfigure(**self._console_kwargs)
+        self._console = get_console()
+        if hasattr(self._console, "_live_stack"):
+            # Rich >= 14.1: ``clear_live()`` pops one Live instead of clearing them all.
+            if len(self._console._live_stack) > 0:
+                self._console.clear_live()
+        else:
+            self._console.clear_live()
+        self._metric_component = MetricsTextColumn(
+            trainer,
+            self.theme.metrics,
+            self.theme.metrics_text_delimiter,
+            self.theme.metrics_format,
+        )
+        self._early_stopping_component = EarlyStoppingColumn(trainer)
+        self.progress = CustomProgress(
+            *self.configure_columns(trainer),
+            self._metric_component,
+            self._early_stopping_component,
+            auto_refresh=True,
+            refresh_per_second=self.refresh_rate if self.is_enabled else 1,
+            disable=self.is_disabled,
+            console=self._console,
+        )
+        self.progress.start()
+        self._progress_stopped = False
 
     def get_metrics(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> dict[str, Any]:
-        """The parent's metrics plus the early-stopping counters, as one dict."""
-        items = dict(super().get_metrics(trainer, pl_module))
-        items.update(early_stopping_fields(trainer))
-        return items
+        """The parent's metrics, as a dict the caller may mutate.
+
+        The parent returns a fresh dict (``BaseProgressBar``) with every tensor converted by
+        ``apply_to_collection``; this copy exists so the bar's metrics line has one documented source
+        now that the early-stopping counters moved to :class:`EarlyStoppingColumn`.
+        """
+        return dict(super().get_metrics(trainer, pl_module))
 
 
 class SBBModelSummary(RichModelSummary):

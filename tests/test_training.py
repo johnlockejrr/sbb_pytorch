@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, ModelSummary
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from rich.progress import Task
 
 from sbb_pytorch.config.models import SBBConfig
 from sbb_pytorch.exceptions import CheckpointError, ConfigError, TrainingError
@@ -24,6 +25,8 @@ from sbb_pytorch.losses import CombinedLoss, SoftDiceLoss
 from sbb_pytorch.storage.checkpoint import Checkpoint, safetensors_available
 from sbb_pytorch.storage.images import imwrite
 from sbb_pytorch.training import (
+    EarlyStoppingColumn,
+    EarlyStoppingState,
     SBBLightningModule,
     SBBModelSummary,
     SBBProgressBar,
@@ -37,6 +40,7 @@ from sbb_pytorch.training import (
     default_criterion,
     early_stopping_fields,
     early_stopping_for,
+    early_stopping_states,
     final_checkpoint,
     fit,
     metric_mode,
@@ -267,10 +271,25 @@ def test_early_stopping_fields_collapse_the_pair_into_one_field(tmp_path: Path) 
     assert early_stopping_fields(SimpleNamespace(callbacks=[])) == {}
 
 
-def test_progress_bar_carries_the_counters_alongside_the_losses(
+def _task() -> Task:
+    """A rich ``Task`` for the column tests: ``render`` is given one to say which bar to paint, and
+    the early-stopping count is not per-task, so nothing in it is read. ``_get_time`` has no default
+    in the rich installed (15.x), so it is the constructor's fifth argument either way."""
+    return Task(id=0, description="Epoch 0/199", total=10, completed=10, _get_time=lambda: 0.0)
+
+
+def test_progress_bar_metrics_are_the_logged_losses_and_nothing_else(
     stub: nn.Module, tmp_path: Path
 ) -> None:
-    """``SBBProgressBar.get_metrics`` is what puts them on the bar next to ``val_loss``."""
+    """``get_metrics`` is the metrics line; the counter left it for a column of its own.
+
+    The dict is a snapshot: Lightning rebuilds it at ``on_train_batch_end``, ``on_train_epoch_end``
+    and ``on_validation_end`` and hands the result to ``MetricsTextColumn.update``, so a counter
+    folded in here showed an epoch's row counting from the epoch *before* it -- ``0/10`` next to a
+    ``val_loss`` that had already moved the count to 1. The losses stay (they are what
+    ``self.log(..., prog_bar=True)`` logged, epoch value and running value together); the counter
+    renders live, in :class:`~sbb_pytorch.training.callbacks.EarlyStoppingColumn`.
+    """
     config = make()
     module = SBBLightningModule(config, stub)
     trainer = build_trainer(config, module, output_dir=tmp_path, logger=False)
@@ -280,8 +299,39 @@ def test_progress_bar_carries_the_counters_alongside_the_losses(
     trainer.progress_bar_metrics["val_loss"] = torch.tensor(0.5)
     items = bar.get_metrics(trainer, module)
     assert items["val_loss"] == pytest.approx(0.5)
-    assert items["early_stopping"] == "0/10"
+    assert "early_stopping" not in items  # moved to EarlyStoppingColumn, which renders it live
     assert "early_stopping/val_loss" not in items and "early_stopping/val_accuracy" not in items
+
+
+def test_the_counter_column_shows_the_count_and_the_score_it_counts_against() -> None:
+    """``early_stopping: 3/4 best 0.44900`` -- what ``--verbose-metrics`` printed, on the bar.
+
+    The callback closest to stopping answers for the pair (the rule :func:`early_stopping_fields`
+    uses too) and its best score rides along, which is the number the silenced ``Metric val_loss
+    improved. New best score: 0.449`` line printed and the only way to read a bare ``3/4`` as "three
+    epochs since 0.449". A ``mode="max"`` callback that has not measured yet holds ``-inf`` -- the
+    sentinel ``EarlyStopping.__init__`` sets, ``+inf`` for a ``mode="min"`` one -- and the field is
+    left off rather than printed as ``-inf``, which is what the ``oxygraphos-ocr`` columns do; they
+    also read ``trainer.early_stopping_callback``, Lightning's *first* callback, so they would show
+    only ``val_loss``'s count for a run with this package's pair.
+    """
+    config = make(patience=4)
+    stopping = early_stopping_for(config, "val_loss")
+    stopping.wait_count = 3
+    # float64 so the field round-trips exactly: a float32 metric widens to 0.4490000009536743.
+    stopping.best_score = torch.tensor(0.449, dtype=torch.float64)
+    fresh = early_stopping_for(config, "val_accuracy")
+    both = SimpleNamespace(callbacks=[stopping, fresh])
+    assert EarlyStoppingColumn(both).render(_task()).plain == "early_stopping: 3/4 best 0.44900"
+    assert early_stopping_states(both) == [
+        EarlyStoppingState(3, 4, 0.449),
+        EarlyStoppingState(0, 4, float("-inf")),
+    ]
+    assert (
+        EarlyStoppingColumn(SimpleNamespace(callbacks=[fresh])).render(_task()).plain
+        == "early_stopping: 0/4"
+    )
+    assert EarlyStoppingColumn(SimpleNamespace(callbacks=[])).render(_task()).plain == ""
 
 
 def test_progress_bar_leaves_the_epochs_it_finished_on_screen() -> None:

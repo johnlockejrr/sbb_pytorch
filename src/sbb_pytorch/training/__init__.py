@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from sbb_pytorch.training.callbacks import (
     DEFAULT_TOP_K,
+    EarlyStoppingColumn,
+    EarlyStoppingState,
     SBBModelSummary,
     SBBProgressBar,
     StepCheckpoint,
@@ -47,6 +49,7 @@ from sbb_pytorch.training.callbacks import (
     checkpoint_for,
     early_stopping_fields,
     early_stopping_for,
+    early_stopping_states,
     load_callbacks_file,
     metric_mode,
     metric_snapshot,
@@ -82,6 +85,8 @@ from sbb_pytorch.training.trainer import (
 
 __all__ = [
     "DEFAULT_TOP_K",
+    "EarlyStoppingColumn",
+    "EarlyStoppingState",
     "InitMethod",
     "RegularizationKind",
     "SBBLightningModule",
@@ -102,6 +107,7 @@ __all__ = [
     "default_criterion",
     "early_stopping_fields",
     "early_stopping_for",
+    "early_stopping_states",
     "final_checkpoint",
     "fit",
     "init_weights",
