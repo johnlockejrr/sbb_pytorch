@@ -69,6 +69,7 @@ from .geometry import (
     update_region_contours,
 )
 from .parser import (
+    ALTO_STEM_SUFFIX,
     DEFAULT_XML_ENCODING,
     Contour,
     Page,
@@ -76,7 +77,9 @@ from .parser import (
     Region,
     discover_xml_files,
     image_for,
+    page_identity,
     parse_pagexml,
+    select_page_files,
 )
 from .reading_order import (
     BACKGROUND_LABEL,
@@ -146,6 +149,7 @@ from .writer import (
 
 __all__ = [
     # parser — ALTO/PageXML schema
+    "ALTO_STEM_SUFFIX",
     "DEFAULT_XML_ENCODING",
     "GRAPHIC_REGION_TYPES",
     "LEGACY_INACTIVE_TEXT_TYPES",
@@ -158,7 +162,9 @@ __all__ = [
     "discover_xml_files",
     "image_for",
     "normalise_text_type",
+    "page_identity",
     "parse_pagexml",
+    "select_page_files",
     # geometry — contour arithmetic
     "DEFAULT_KERNEL",
     "DEFAULT_MIN_AREA_FRACTION",

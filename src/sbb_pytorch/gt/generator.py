@@ -48,6 +48,7 @@ from .parser import (
     discover_xml_files,
     normalise_text_type,
     parse_pagexml,
+    select_page_files,
 )
 from .render import (
     ARTIFICIAL_CLASS_COLOR,
@@ -362,6 +363,7 @@ def generate_ground_truth(
     images_output_dir: str | Path | None = None,
     xml_files: Sequence[Path] | None = None,
     recursive: bool = True,
+    dedupe_pages: bool = True,
     on_progress: Callable[[Path], None] | None = None,
 ) -> GenerationResult:
     """Generate ground-truth label images for every PageXML file in *xml_dir*.
@@ -375,9 +377,10 @@ def generate_ground_truth(
     xml_dir:
         Directory of PageXML/ALTO files.
     output_dir:
-        Where the label images go.  Each is named by :func:`unique_output_stem`, so two files
-        whose legacy stem matches -- two documents' page ``0113``, or a page's PageXML and its
-        ALTO -- write two labels instead of one overwriting the other.
+        Where the label images go.  Each is named by :func:`unique_output_stem`, so two documents'
+        page ``0113`` write two labels instead of one overwriting the other; a page's PageXML and
+        its ALTO write one, because *dedupe_pages* keeps the PageXML and the ALTO is the same page
+        in the other format rather than a second page to label.
     output_type:
         ``3d`` (palette RGB) or ``2d`` (class id per pixel) — see
         :class:`~.render.OutputType`.
@@ -392,6 +395,11 @@ def generate_ground_truth(
         Search *xml_dir* and *images_dir* in their subfolders too, so one call can cover a
         parent folder of child datasets. ``False`` is the pre-0.2.0 listing: files directly
         inside each folder and nothing deeper.
+    dedupe_pages:
+        Write one label per page rather than one per file: ``X.xml`` and ``X.alto.xml`` are one
+        page in two formats, and the PageXML is the one read (see
+        :func:`~sbb_pytorch.gt.parser.select_page_files`). ``False`` labels both, naming the
+        second ``X.alto.png`` beside the first -- what every run before this flag produced.
     on_progress:
         Called with each file after it is handled, so a caller can drive a progress bar
         without this package depending on ``rich``.
@@ -403,11 +411,12 @@ def generate_ground_truth(
     """
     resolved = GroundTruthConfig.parse(config)
     kind = OutputType.parse(output_type)
-    files = (
+    listed = (
         list(xml_files)
         if xml_files is not None
-        else discover_xml_files(xml_dir, recursive=recursive)
+        else discover_xml_files(xml_dir, recursive=recursive, dedupe_pages=False)
     )
+    files = select_page_files(listed) if dedupe_pages else listed
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 

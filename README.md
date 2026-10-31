@@ -126,7 +126,9 @@ when the `safetensors` dependency is installed.
 it found without writing anything. `--xml` is searched inside subfolders too, so a *parent* of
 child datasets (`smp-private/` holding one folder per export) is one command and their pages all
 land in the flat `-o`; `--no-recursive` reads only the files directly inside the folder given. A
-`rich` bar tracks the files when stdout is a terminal.
+page filed as both `X.xml` and `X.alto.xml` is labelled once, from the PageXML --
+`--no-dedupe-pages` labels each file separately, as it used to. A `rich` bar tracks the files when
+stdout is a terminal.
 
 `sbb gt visualize XML [-o OUT] [--size H W] [--type-output 2d|3d]` renders a single ALTO/PageXML
 page -- the view that previously required opening the notebook.

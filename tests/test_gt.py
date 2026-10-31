@@ -2270,6 +2270,47 @@ def test_build_label_map_is_none_when_the_page_has_nothing_to_label(tmp_path: Pa
     assert generator.build_label_map(page, generator.GroundTruthConfig()) is None
 
 
+def test_a_pages_alto_is_not_a_second_page(tmp_path: Path) -> None:
+    """``X.xml`` and ``X.alto.xml`` name one page, and a folder of both lists one file.
+
+    ALTO ships beside PageXML under its own name: the PageXML is ``X.xml`` (or ``X.page.xml``) and
+    the ALTO is ``X.alto.xml`` (or a bare ``X.alto``), and the two describe the same page -- one
+    the annotation, the other the OCR markup it was made on.  Listing them as two files makes two
+    labels of one page, so :func:`~sbb_pytorch.gt.parser.page_identity` answers ``X`` for all
+    three spellings and :func:`~sbb_pytorch.gt.parser.select_page_files` keeps the PageXML.
+    """
+    assert parser.page_identity(tmp_path / "000123456-1800.xml") == (
+        str(tmp_path),
+        "000123456-1800",
+    )
+    assert parser.page_identity(tmp_path / "000123456-1800.alto.xml") == (
+        str(tmp_path),
+        "000123456-1800",
+    )
+    assert parser.page_identity(tmp_path / "000123456-1800.alto") == (
+        str(tmp_path),
+        "000123456-1800",
+    )
+    assert parser.page_identity(tmp_path / "000123456-1800.PAGE.xml") == (
+        str(tmp_path),
+        "000123456-1800.PAGE",  # PageXML's other spelling -- never the ALTO's
+    )
+    # Two children of a parent dataset holding the same page name are two pages, not one.
+    assert parser.page_identity(tmp_path / "a" / "X.xml") != parser.page_identity(
+        tmp_path / "b" / "X.xml"
+    )
+
+    folder = tmp_path / "mixed"
+    folder.mkdir()
+    write_xml(folder, "000123456-1800.xml", "<PcGts/>")
+    write_xml(folder, "000123456-1800.alto.xml", "<PcGts/>")
+    assert parser.select_page_files(folder.glob("*.xml")) == [folder / "000123456-1800.xml"]
+    # A folder with only the ALTO of a page still yields it -- nothing is dropped for having no twin.
+    assert parser.select_page_files([folder / "000123456-1800.alto.xml"]) == [
+        folder / "000123456-1800.alto.xml"
+    ]
+
+
 def test_generate_ground_truth_writes_the_stem_named_label(tmp_path: Path) -> None:
     """One XML in, one PNG named ``1800`` out, and the exact ``summary()`` line the CLI prints --
     the call site that used to die on ``vars()`` of a slots dataclass."""
@@ -2294,6 +2335,32 @@ def test_generate_ground_truth_writes_the_stem_named_label(tmp_path: Path) -> No
             generator.build_label_map(page, config), generator._palette(config)
         ),
     )
+
+
+def test_generate_ground_truth_labels_a_page_filed_twice_once(tmp_path: Path) -> None:
+    """A page filed as ``X.xml`` and ``X.alto.xml`` writes one label, from the PageXML.
+
+    Every file in the folder used to get a label of its own, so the pair became two -- and the ALTO
+    sorts first, so it claimed the legacy stem ``1800`` while the PageXML was pushed to
+    ``000123456-1800.png``: one page, two labels, the annotated file renamed by its own OCR
+    markup.  ``dedupe_pages=False`` is that answer, kept as the opt-out.
+    """
+    folder = tmp_path / "xml"
+    folder.mkdir()
+    body = xml_document(
+        '<TextRegion ID="r1" type="paragraph"><Coords points="4,4 40,4 40,20 4,20"/></TextRegion>'
+    )
+    write_xml(folder, "000123456-1800.xml", body)
+    write_xml(folder, "000123456-1800.alto.xml", body)
+    config = generator.GroundTruthConfig(
+        use_case=generator.UseCase.LAYOUT, textregions={"paragraph": 1}
+    )
+
+    result = generator.generate_ground_truth(config, folder, tmp_path / "out")
+    assert [p.name for p in result.labels] == ["1800.png"]  # the PageXML's, named the legacy way
+
+    both = generator.generate_ground_truth(config, folder, tmp_path / "both", dedupe_pages=False)
+    assert sorted(p.name for p in both.labels) == ["000123456-1800.png", "1800.png"]
 
 
 def test_generate_ground_truth_crops_and_copies_the_source_image(tmp_path: Path) -> None:

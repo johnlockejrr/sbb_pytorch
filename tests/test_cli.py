@@ -1040,6 +1040,57 @@ def test_gt_generate_reads_a_parent_folder_of_child_datasets(
     assert flat.exit_code == 2 and f"no ALTO/PageXML files in {parent}" in flat.output
 
 
+def test_gt_generate_writes_one_label_for_a_page_filed_twice(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """A page filed as ``X.xml`` and ``X.alto.xml`` gets one ``X.png``, not two files.
+
+    The ALTO of a page used to be labelled as if it were a second page: two PNGs for one page, and
+    the ALTO sorting first so it took the legacy name ``1800`` and the annotated PageXML was
+    renamed ``000123456-1800``. The listing now keeps the PageXML; ``--no-dedupe-pages`` labels
+    every file, which is what every run before the flag did.
+    """
+    body = PAGE_XML.format(size=SIZE, edge=SIZE - 4).encode()
+    xml_dir = tmp_path / "xml"
+    xml_dir.mkdir()
+    (xml_dir / "000123456-1800.xml").write_bytes(body)
+    (xml_dir / "000123456-1800.alto.xml").write_bytes(body)
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": {"use_case": "layout", "textregions": {"paragraph": 1}},
+            }
+        )
+    )
+
+    one = invoke(
+        runner, "gt", "generate", "--xml", xml_dir, "-o", tmp_path / "one", "--config", gt_config
+    )
+    assert one.exit_code == 0, one.output
+    assert [p.name for p in (tmp_path / "one").glob("*.png")] == ["1800.png"]
+
+    both = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        xml_dir,
+        "-o",
+        tmp_path / "both",
+        "--config",
+        gt_config,
+        "--no-dedupe-pages",
+    )
+    assert both.exit_code == 0, both.output
+    assert sorted(p.name for p in (tmp_path / "both").glob("*.png")) == [
+        "000123456-1800.png",
+        "1800.png",
+    ]
+
+
 def test_gt_generate_needs_a_use_case_or_a_config(
     runner: CliRunner, tmp_path: Path, xml_dir: Path, config_file: Path
 ) -> None:

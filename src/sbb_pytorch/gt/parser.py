@@ -43,7 +43,7 @@ from __future__ import annotations
 import io
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from itertools import takewhile
 from pathlib import Path
@@ -63,6 +63,7 @@ from .vocabulary import (
 )
 
 __all__ = [
+    "ALTO_STEM_SUFFIX",
     "DEFAULT_XML_ENCODING",
     "GRAPHIC_REGION_TYPES",
     "LEGACY_INACTIVE_TEXT_TYPES",
@@ -74,7 +75,9 @@ __all__ = [
     "RegionKind",
     "discover_xml_files",
     "normalise_text_type",
+    "page_identity",
     "parse_pagexml",
+    "select_page_files",
 ]
 
 #: Encoding the legacy tool used for every PageXML file, and the fallback here when a
@@ -626,7 +629,58 @@ def _element_region(element: ET.Element, prefix: str) -> Region | None:
     return _read_region(element, prefix, RegionKind(_local_name(element.tag)), None)
 
 
-def discover_xml_files(directory: str | Path, *, recursive: bool = True) -> list[Path]:
+#: The extension chunk that names a file as a page's ALTO: ``000123456-1800.alto.xml`` and
+#: ``000123456-1800.alto`` are that page's ALTO in the two spellings datasets use, and the chunk
+#: is what tells the two apart from ``000123456-1800.xml``, the same page's PageXML.
+ALTO_STEM_SUFFIX: Final = ".alto"
+
+
+def page_identity(path: str | Path) -> tuple[str, str]:
+    """The page *path* describes: ``(folder, page name)``, in whichever format the file is in.
+
+    ``000123456-1800.xml`` and ``000123456-1800.alto.xml`` are one page written twice, and a bare
+    ``000123456-1800.alto`` is that page a third time; stripping the format marker leaves the
+    page's own name, which is what :func:`~sbb_pytorch.gt.generator.output_stem` then derives
+    ``1800`` from.  The folder belongs in the key because two children of a parent dataset can
+    hold two *documents* named alike -- same page name, different pages, and :func:`
+    select_page_files` keeps one file per page, not one file per dataset.
+    """
+    file = Path(path)
+    name = file.stem
+    if name.lower().endswith(ALTO_STEM_SUFFIX):
+        name = name[: -len(ALTO_STEM_SUFFIX)]
+    return (str(file.parent), name)
+
+
+def _is_alto(path: Path) -> bool:
+    """True when *path*'s name says ALTO (``X.alto`` or ``X.alto.xml``) rather than PageXML."""
+    return ALTO_STEM_SUFFIX in [suffix.lower() for suffix in Path(path).suffixes]
+
+
+def select_page_files(paths: Iterable[str | Path]) -> list[Path]:
+    """One file per page from *paths*, the PageXML of a page preferred over its ALTO.
+
+    A page annotated in both formats used to produce two labels -- ``000123456-1800.png`` from
+    the PageXML and ``000123456-1800.alto.png`` from the ALTO, since
+    :func:`~sbb_pytorch.gt.generator.output_stem` reads ``1800`` out of both names and
+    :func:`~sbb_pytorch.gt.generator.unique_output_stem` then disambiguates the second.  Two
+    labels of one page is one page trained on twice and one page scored twice, so the listing
+    keeps the PageXML: it is the annotated answer, where the ALTO is the OCR markup the annotation
+    was made on.  A folder holding only ALTO files (``X.alto.xml`` with no ``X.xml`` beside it)
+    still yields its labels -- nothing is dropped for lacking a PageXML twin.
+    """
+    best: dict[tuple[str, str], Path] = {}
+    for path in sorted(Path(p) for p in paths):
+        key = page_identity(path)
+        current = best.get(key)
+        if current is None or (_is_alto(current) and not _is_alto(path)):
+            best[key] = path
+    return sorted(best.values())
+
+
+def discover_xml_files(
+    directory: str | Path, *, recursive: bool = True, dedupe_pages: bool = True
+) -> list[Path]:
     """Every XML file under *directory*, sorted, extensions matched case-first.
 
     Replaces ``get_content_of_dir`` and the ``dir_imgs`` listings it was paired with: the
@@ -644,6 +698,12 @@ def discover_xml_files(directory: str | Path, *, recursive: bool = True) -> list
     Sorting is over the full paths, so a nested file sorts by its directory name first; which
     of two files answers the same stem (:func:`~sbb_pytorch.gt.generator.output_stem`) is
     therefore decided by folder order, not by the order the folders were created in.
+
+    ``dedupe_pages`` (the default) collapses a page's PageXML and its ALTO into the one file
+    :func:`select_page_files` prefers; ``dedupe_pages=False`` lists every XML file, which is what
+    ``sbb gt generate --no-dedupe-pages`` means and how a folder of pure ALTO files named
+    ``X.alto`` (no ``.xml`` suffix at all -- never listed here) would have to be read some other
+    way.
     """
     base = Path(directory)
     if not base.exists():
@@ -651,7 +711,8 @@ def discover_xml_files(directory: str | Path, *, recursive: bool = True) -> list
     if not base.is_dir():
         raise NotADirectoryError(f"{directory} is not a directory")
     entries = base.rglob("*") if recursive else base.iterdir()
-    return sorted(entry for entry in entries if entry.is_file() and entry.suffix.lower() == ".xml")
+    files = sorted(entry for entry in entries if entry.is_file() and entry.suffix.lower() == ".xml")
+    return select_page_files(files) if dedupe_pages else files
 
 
 def image_for(page: Page, directory: str | Path, *, recursive: bool = True) -> Path | None:

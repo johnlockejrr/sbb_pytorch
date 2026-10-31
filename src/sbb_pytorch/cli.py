@@ -1251,6 +1251,13 @@ def gt() -> None:
     "inside them, which is what every run before this flag did.",
 )
 @click.option(
+    "--dedupe-pages/--no-dedupe-pages",
+    default=True,
+    help="One label per page (the default): a page filed as both PageXML and ALTO is labelled "
+    "once, from the PageXML. --no-dedupe-pages labels every file, so X.xml and X.alto.xml "
+    "write X.png and X.alto.png -- what every run before this flag did.",
+)
+@click.option(
     "--min-area",
     type=float,
     default=None,
@@ -1270,6 +1277,7 @@ def gt_generate(
     images_dir: Path | None,
     images_output_dir: Path | None,
     recursive: bool,
+    dedupe_pages: bool,
     min_area: float | None,
     limit: int | None,
     dry_run: bool,
@@ -1288,6 +1296,10 @@ def gt_generate(
     subfolders are searched, so ``--xml smp-private`` covers every export inside it -- and their
     pages all land in the flat ``-o`` folder, each under its own stem. Pass ``--no-recursive`` for
     the old single-folder listing.
+
+    A page filed in both formats -- ``X.xml`` and its ``X.alto.xml`` -- is labelled *once*, from
+    the PageXML; ``--no-dedupe-pages`` goes back to labelling every file, which wrote
+    ``X.png`` and ``X.alto.png`` for one page.
     """
     if config_path is not None and use_case_raw is not None:
         raise click.BadParameter("give --config or --use-case, not both")
@@ -1311,7 +1323,7 @@ def gt_generate(
     # leaving it out asks the file; naming it still wins. The legacy option had no default either.
     resolved_output_type = OutputType.parse(output_type) if output_type else gt_config.type_output
 
-    xml_files = discover_xml_files(xml_dir, recursive=recursive)
+    xml_files = discover_xml_files(xml_dir, recursive=recursive, dedupe_pages=dedupe_pages)
     if limit is not None:
         xml_files = xml_files[: int(limit)]
     if not xml_files:
@@ -1336,6 +1348,7 @@ def gt_generate(
             images_output_dir=images_output_dir,
             xml_files=xml_files,
             recursive=recursive,
+            dedupe_pages=dedupe_pages,
             on_progress=advance,
         )
     state.logger.debug("generation result: %s", result)
@@ -1500,6 +1513,13 @@ def gt_enhance(
     "child datasets; --no-recursive reads only the files directly inside it.",
 )
 @click.option(
+    "--dedupe-pages/--no-dedupe-pages",
+    default=True,
+    help="One page per pair of formats (the default): a page filed as both PageXML and ALTO is "
+    "read once, from the PageXML. --no-dedupe-pages reads every file, pairing X.xml and "
+    "X.alto.xml as two pages.",
+)
+@click.option(
     "--size", nargs=2, type=int, default=None, metavar="H W", help="Rasters at this size."
 )
 @click.option(
@@ -1523,6 +1543,7 @@ def gt_reading_order(
     output_dir: Path,
     classes_dir: Path | None,
     recursive: bool,
+    dedupe_pages: bool,
     size: tuple[int, int] | None,
     min_area: float | None,
     max_area: float | None,
@@ -1539,9 +1560,10 @@ def gt_reading_order(
     included.
 
     ``--xml`` is searched in its subfolders as well, so a parent folder of child datasets is one
-    command; ``--no-recursive`` reads only the files directly inside it.
+    command; ``--no-recursive`` reads only the files directly inside it. A page filed in both
+    formats is read once, from its PageXML, unless ``--no-dedupe-pages``.
     """
-    xml_files = discover_xml_files(xml_dir, recursive=recursive)
+    xml_files = discover_xml_files(xml_dir, recursive=recursive, dedupe_pages=dedupe_pages)
     if limit is not None:
         xml_files = xml_files[: int(limit)]
     if not xml_files:

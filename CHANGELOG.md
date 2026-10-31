@@ -141,7 +141,7 @@ replacement.
   for the file-by-file table, including the four root JSON configs (now `configs/*.json`),
   `requirements.txt` (now `pyproject.toml`), and `train.md` (folded into the README and the
   changelogs).
-- **`--xml` folders are read recursively, and `--no-recursive` is the old listing.** A folder whose
+- **`--xml` folders are read recursively, and one page gets one label.** A folder whose
   children are datasets -- `smp-private/` holding one folder per export -- has no XML file of its
   own, and `discover_xml_files` listed only the files directly inside the folder it was given, so
   such a parent answered `no ALTO/PageXML files in ...` and a command that looked like it covered
@@ -149,8 +149,14 @@ replacement.
   default (`--recursive`, the new default, is what `discover_xml_files` does; `--no-recursive`
   restricts it to the folder itself), `--images-dir` is searched the same way so a page's photo is
   found in the folder its XML was found in, and the dry-run prints each path relative to `--xml`
-  because the folder is now part of the answer. Two children's page `0113` land in one output
-  folder through `unique_output_stem`, which is what makes merging them safe.
+  because the folder is now part of the answer.
+- **A page filed in both formats is labelled once, from its PageXML** (`--dedupe-pages`, the
+  default). `000123456-1800.xml` and its `000123456-1800.alto.xml` are one page written twice --
+  the annotation and the OCR markup it was made on -- and the previous behaviour labelled the ALTO
+  as a second page: two PNGs for one page, with the ALTO taking the legacy name `1800` (it sorts
+  first) and the PageXML renamed `000123456-1800`. `parser.select_page_files` keeps the PageXML,
+  and `parser.page_identity` names the page a file describes so that a folder holding *only* the
+  ALTO of a page still yields it. `--no-dedupe-pages` labels every file, as before.
 - `--device` defaults to `auto` and is validated at parse time. `train.py` hard-coded `cuda` and
   called `pl.Trainer(accelerator=device, devices=1)`, which rejected the valid spec `cuda:1` and
   made the second GPU of a machine unreachable.
