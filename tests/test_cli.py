@@ -628,7 +628,12 @@ def test_infer_ground_truth_refuses_a_task_with_no_mask(runner: CliRunner, tmp_p
     assert "gave no mask for task=classification" in result.output
 
 
-def _stub_predictor(monkeypatch: pytest.MonkeyPatch, prediction: Prediction) -> type:
+def _stub_predictor(
+    monkeypatch: pytest.MonkeyPatch,
+    prediction: Prediction,
+    *,
+    config: dict[str, object] | None = None,
+) -> type:
     """Answer every page with *prediction*, so the assertion is about the XML and not the weights.
 
     The ``--xml-file`` tests need to know the mask to know the regions a run should write, and the
@@ -637,11 +642,17 @@ def _stub_predictor(monkeypatch: pytest.MonkeyPatch, prediction: Prediction) -> 
     :meth:`~sbb_pytorch.inference.Predictor.predict_file`) and nothing else, so a signature change
     on the real predictor breaks these exactly as it breaks the other ``infer`` tests. The class is
     returned, and it remembers the checkpoint each call was handed -- which is how the ``--format``
-    test checks the CLI's answer rather than the model's.
+    test checks the CLI's answer rather than the model's. ``config`` replaces ``BASE`` where a test's
+    assertion depends on the mapping the run was trained with, since a mask's class ids mean nothing
+    without the ``page2label`` that named them.
     """
 
+    # Built outside the class body: a class namespace is not an enclosing scope, so `config` would
+    # be unbound inside a class that also assigns a name by that name.
+    resolved = SBBConfig.model_validate(config if config is not None else BASE)
+
     class Stub:
-        config = SBBConfig.model_validate(BASE)
+        config = resolved
         seen: ClassVar[list[str]] = []
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -701,6 +712,44 @@ def test_infer_xml_file_writes_the_regions_the_prediction_found(
     ] == [
         ("page_1_0", "", "structure {type:class_1;}", (4, 4, 24, 8)),
         ("page_2_0", "", "structure {type:class_2;}", (4, 16, 24, 8)),
+    ]
+
+
+def test_infer_xml_writes_no_region_for_a_predicted_boundary_class(
+    runner: CliRunner, tmp_path: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A textline run predicts three classes, and only one of them is something to write a region as.
+
+    The boundary ring the label generator carves between lines is a class of its own, so the model
+    predicts it as contours of its own -- and :func:`sbb_pytorch.cli._textline_regions` turned every
+    class the mask held into a block of lines, writing each ring as a ``TextRegion`` of thin
+    fragments beside the lines it rings. The writer now asks the config which ids name page content
+    (:meth:`~sbb_pytorch.config.models.Page2Label.region_class_ids`), so the ring is predicted,
+    trained on and never written: one block, one line, and no ``class_2`` region anywhere.
+    """
+    page = tmp_path / "page.png"
+    imwrite(page, np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+    source = tmp_path / "labels" / "page.xml"
+    source.parent.mkdir()
+    source.write_text(PAGE_XML.format(size=SIZE, edge=28))
+
+    mask = np.zeros((SIZE, SIZE), dtype=np.uint8)
+    mask[4:12, 4:28] = 1  # a line the model found
+    mask[16:24, 4:28] = 2  # a ring around a second line, which it never found as class 1
+    _stub_predictor(
+        monkeypatch,
+        Prediction(task=TaskType.SEGMENTATION, mask=mask),
+        config={
+            **BASE,
+            "page2label": {"use_case": "textline", "case_label": 1, "artificial_class_label": 2},
+        },
+    )
+
+    result = invoke(runner, "infer", run_dir, page, "--no-save", "--xml-file", source)
+    assert result.exit_code == 0, result.output
+    assert [(region.region_id, region.custom) for region in parse_pagexml(source).regions] == [
+        ("page_1_0", "structure {type:class_1;}"),  # the block the line forms
+        ("page_1_0_0", "structure {type:text_line;}"),  # and the line itself
     ]
 
 

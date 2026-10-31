@@ -101,19 +101,29 @@ def test_every_config_in_the_configs_directory_validates() -> None:
 
 
 def test_the_shipped_textline_config_is_single_class() -> None:
-    """``configs/textline.json`` predicts background plus one class, and now says so.
+    """``configs/textline.json`` predicts background, one line class, and the boundary between lines.
 
-    It said ``n_classes: 7`` -- ``configs/layout.json``'s count, copied onto a config whose own
-    upstream value is 2 -- so the head carried five channels nothing supervised.  The head width
-    is a function of this number, so the value is pinned here as loudly as the checkpoint that
-    stops loading under it.
+    The file has carried three numbers. ``7`` was ``configs/layout.json``'s count copied onto a
+    config whose own upstream value is not 7; ``2`` was correct for a *two*-class model but a
+    two-class textline model has no boundary class, so its labels painted every line at full size
+    against its neighbour and the trained model answered with the whole page joined into one
+    ``TextLine``. The legacy pipeline used three classes and the third is the artificial ring the
+    label generator carves out of each line -- ``artificial_class_label``, the field this file had
+    left unset. The head width is a function of the number, so it is pinned here as loudly as the
+    checkpoint that stops loading under it.
     """
     config = load_config(REPO_ROOT / "configs" / "textline.json")
-    assert config.n_classes == 2
+    assert config.n_classes == 3
     assert config.page2label is not None
     assert config.page2label.use_case.value == "textline"
     assert config.page2label.case_label == 1  # the field the model lacked and the file implies
-    assert config.page2label.legal_class_ids() == {0, 1}  # not the six ids the file's table lists
+    assert config.page2label.artificial_class_label == 2  # the ring that keeps two lines apart
+    # The layout table the file used to carry is gone: ids 2-6 belong to the layout use case, and
+    # id 2 would otherwise name both "header/heading" and "boundary".
+    assert config.page2label.all_regions() == {}
+    assert config.page2label.legal_class_ids() == {0, 1, 2}
+    assert config.page2label.region_class_ids() == {1}  # the boundary names no region
+    assert validate_pair(config) == []  # nothing left for `sbb validate` to advise about
 
 
 def test_legal_class_ids_follows_the_use_case_not_only_the_regions() -> None:
@@ -133,12 +143,20 @@ def test_legal_class_ids_follows_the_use_case_not_only_the_regions() -> None:
 
     layout = Page2Label(use_case="layout", textregions={"<a>": 1, "<b>": 2}, imageregion=4)
     assert layout.legal_class_ids() == {0, 1, 2, 4}  # unchanged: the region table, plus background
+    assert layout.region_class_ids() == {1, 2, 4}  # the same table, minus the background
 
     for use_case in CASE_LABEL_USE_CASES:
         assert Page2Label(use_case=use_case, case_label=3).legal_class_ids() == {0, 3}
+        # The region set is the data loader's answer minus the background -- and, below, minus the
+        # boundary id, which a label image carries without any region carrying it.
+        assert Page2Label(use_case=use_case, case_label=3).region_class_ids() == {3}
         assert Page2Label(
             use_case=use_case, case_label=3, textregions={"<a>": 1, "<b>": 7}
         ).legal_class_ids() == {0, 3}
+
+    with_boundary = Page2Label(use_case="layout", textregions={"<a>": 1}, artificial_class_label=9)
+    assert with_boundary.legal_class_ids() == {0, 1, 9}  # the ring the layout generator paints
+    assert with_boundary.region_class_ids() == {1}  # and the one class that names no region
 
 
 def test_page2label_carries_the_five_fields_the_legacy_file_has(tmp_path: Path) -> None:
@@ -159,8 +177,10 @@ def test_page2label_carries_the_five_fields_the_legacy_file_has(tmp_path: Path) 
     assert label.all_regions() == {}
     assert label.class_ids() == {}
     # The set the data loader consults is not that inversion: for this use case it is the
-    # background plus case_label, which class_ids() leaves out while the field names it.
-    assert label.legal_class_ids() == {0, 1}
+    # background, the case_label and the artificial_class_label -- the last two fields class_ids()
+    # leaves out while the fields name them, and the pair a label image carries that no region does.
+    assert label.legal_class_ids() == {0, 1, 8}
+    assert label.region_class_ids() == {1}
 
     # The flat legacy shape carried these keys beside ``use_case``; they fold into ``page2label``
     # instead of being left at the top level, where ``extra="forbid"`` would reject the file.
@@ -430,9 +450,17 @@ def test_scales_file_loads(tmp_path: Path) -> None:
 def test_validate_pair_flags_classes_the_config_cannot_represent() -> None:
     label = Page2Label(use_case="layout", textregions={"para": 1, "head": 7})
     assert validate_pair(SBBConfig.model_validate(make(n_classes=3)), label) == [
-        "page2label maps a region to class id 7, but n_classes=3 only covers ids 0..2"
+        "page2label needs class id 7, but n_classes=3 only covers ids 0..2"
     ]
     assert validate_pair(SBBConfig.model_validate(make(n_classes=8)), label) == []
+    # The single-class pair this repo shipped for a while: two classes named across three ids, so
+    # the label images were untrainable -- and invisible to a check that read the region table,
+    # which a single-class config leaves empty.
+    single = Page2Label(use_case="textline", case_label=1, artificial_class_label=2)
+    assert validate_pair(SBBConfig.model_validate(make(n_classes=2)), single) == [
+        "page2label needs class id 2, but n_classes=2 only covers ids 0..1"
+    ]
+    assert validate_pair(SBBConfig.model_validate(make(n_classes=3)), single) == []
     # No mapping at all is not a pairing problem; warnings() reports that instead.
     assert validate_pair(SBBConfig.model_validate(make())) == []
 

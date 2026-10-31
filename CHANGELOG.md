@@ -447,6 +447,22 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   `SINGLE_CLASS_USE_CASES` / `CASE_LABEL_USE_CASES` (the generator imports them), `Page2Label` gains
   `legal_class_ids()` -- `{0, case_label}` for those use cases, `{0, *class_ids()}` for the rest, so
   a layout config's mapping is exactly what it was -- and the loader asks it.
+- **A textline model with no boundary class fused every line into one.** The fix above left
+  `configs/textline.json` training on `{0, 1}`, which is a *two*-class model, and a two-class
+  textline model has no separators: `gt/generator.py::_single_class_map` paints each line at full
+  size unless `artificial_class_label` names a ring to carve out of it, so the lines in a label
+  image touched their neighbours and the trained model answered with one `TextLine` the width of the
+  page (the user's own `inference.xml`, 239 regions and no `TextLine` among them, was the same
+  defect seen from the writer). The legacy pipeline's third class was exactly that ring -- `9` in
+  `custom_config_page2label.json` -- and the file now carries it as `n_classes: 3` with
+  `artificial_class_label: 2` beside `case_label: 1`, the layout table that shared those ids
+  dropping out with it (`columns_width` among them, so the label generator no longer resizes a
+  one-column page to that table's 1000 px). `Page2Label.region_class_ids()` now separates the ids a
+  page is written from from the ids a label image may carry -- `legal_class_ids()` is that set plus
+  the background and the ring -- so a predicted boundary is trained on and never written as a
+  `TextRegion` of fragments beside the lines it rings, and `validate_pair`, which read the region
+  table and so saw nothing at all in a cleared single-class config, reads the legal set instead:
+  the check that would have flagged `n_classes: 2` sitting beside a class id of `2`.
 - **The `sbb train` bar kept only the epoch it was on, and two of its numbers.** `SBBProgressBar` is
   a `RichProgressBar`, and it inherited that class's `leave=False`: rich paints one *live* panel and
   repaints it in place, so epoch 0's line was erased the moment epoch 1 started and a finished run

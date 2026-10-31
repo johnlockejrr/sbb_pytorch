@@ -826,9 +826,21 @@ def _kind_for_class(config: SBBConfig, label: int) -> RegionKind:
     return RegionKind.TEXT
 
 
-def _mask_labels(mask: np.ndarray) -> list[int]:
-    """Every class id *mask* carries, background (``0``) excluded, smallest first."""
-    return sorted(int(value) for value in np.unique(mask) if int(value) != 0)
+def _mask_labels(mask: np.ndarray, config: SBBConfig | None = None) -> list[int]:
+    """Every class id *mask* carries that *config* calls page content, smallest first.
+
+    Background (``0``) never becomes a region, and neither does a class the config does not name:
+    with a ``page2label`` the answer is its
+    :meth:`~sbb_pytorch.config.models.Page2Label.region_class_ids` set filtered against the mask,
+    which is what leaves a predicted boundary ring out of a textline page instead of writing it as
+    a ``TextRegion`` of fragments beside the lines it rings. Without a ``page2label`` there is
+    nothing to consult, and every non-zero id is a class -- the same ``class_<id>`` fallback
+    :func:`_class_labels` applies to one.
+    """
+    values = sorted(int(value) for value in np.unique(mask) if int(value) != 0)
+    if config is None or config.page2label is None:
+        return values
+    return [value for value in values if value in config.page2label.region_class_ids()]
 
 
 #: The use case a mask answer takes its shape from when the config has no ``page2label`` to name one.
@@ -897,7 +909,7 @@ def _flat_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list[Reg
     region one pixel wide has an OpenCV area of zero.
     """
     regions: list[Region] = []
-    for label in _mask_labels(mask):
+    for label in _mask_labels(mask, config):
         # One raster per class, because ``cv2.findContours`` cannot segment a labelled field: the
         # port's own gt pipeline masks per class the same way (gt/generator.py builds its label map
         # first and asks geometry for the contours of one region at a time).
@@ -927,7 +939,7 @@ def _textline_regions(source: Path, config: SBBConfig, mask: np.ndarray) -> list
     ``header`` line never joins a ``paragraph`` block.
     """
     regions: list[Region] = []
-    for label in _mask_labels(mask):
+    for label in _mask_labels(mask, config):
         contours = contours_of_image(np.where(mask == label, 255, 0).astype(np.uint8), min_area=0.0)
         kind = _kind_for_class(config, label)
         name = _class_name(config, label)

@@ -244,9 +244,11 @@ class Page2Label(BaseModel):
     The five fields the legacy table carried and this model did not have -- ``case_label``,
     ``artificial_class_label``, ``printspace_as_class_in_layout``, ``tableregion``,
     ``noiseregion`` -- are here now, which is what lets a single-class config
-    (``configs/textline.json``, ``n_classes: 2``) name what its own model predicts instead of
-    inheriting the layout table's ids.  :meth:`all_regions` and :meth:`class_ids` keep naming only
-    the elements they always named, so the inversion a ``layout`` config produces is unchanged.
+    (``configs/textline.json``, ``n_classes: 3``) name what its own model predicts instead of
+    inheriting the layout table's ids: its :attr:`case_label` is the line class and its
+    :attr:`artificial_class_label` the boundary ring between lines. :meth:`all_regions` and
+    :meth:`class_ids` keep naming only the elements they always named, so the inversion a
+    ``layout`` config produces is unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -259,11 +261,17 @@ class Page2Label(BaseModel):
     columns_width: dict[str, int] = Field(default_factory=dict)
     #: The id every region of the use case's own class is labelled with -- the field
     #: :class:`~sbb_pytorch.gt.GroundTruthConfig` reads and this model lacked, so a single-class
-    #: config (``configs/textline.json``, ``n_classes: 2``) inherited the layout table's ids
-    #: instead of saying what its own model predicts.
+    #: config (``configs/textline.json``) inherited the layout table's ids instead of saying what
+    #: its own model predicts.
     case_label: int = Field(default=1, ge=0)
-    #: The id for content the label generator adds rather than reads (the ``adding_rgb_*``
-    #: composites), which the legacy label map painted in a colour of its own.
+    #: The id for content the label generator adds rather than reads: the ring it carves out of
+    #: every region so neighbouring ones never touch (``SINGLE_CLASS_BOUNDARY_RATES`` around a line,
+    #: ``BOUNDARY_RATES`` around a layout region) and the ``adding_rgb_*`` composites. The legacy
+    #: label map painted it in a colour of its own -- ``9`` in ``custom_config_page2label.json`` --
+    #: and the value's presence is the switch: without it the generator paints regions at full size,
+    #: and the lines a model learns from those labels fuse into one. Setting it puts the id in
+    #: :meth:`legal_class_ids`, so a label image carrying it trains, and keeps it out of
+    #: :meth:`region_class_ids`, so a predicted one is never written as a region.
     artificial_class_label: int | None = None
     #: The id painted everywhere outside the print space on a layout run.
     printspace_as_class_in_layout: int | None = None
@@ -296,17 +304,38 @@ class Page2Label(BaseModel):
             inverted.setdefault(int(value), []).append(name)
         return inverted
 
+    def region_class_ids(self) -> set[int]:
+        """The ids that name page *content* -- the classes a page's regions are written from.
+
+        The one answer both use cases agree on without duplicating it: a use case that labels
+        everything with :attr:`case_label` has one content class, and a ``layout`` config has the ids
+        :meth:`class_ids` inverts out of its tables. :meth:`legal_class_ids` is this set plus the two
+        classes a label image carries that it names no region for -- the background and the
+        :attr:`artificial_class_label` ring -- and :func:`sbb_pytorch.cli._mask_labels` asks *this*
+        one before writing, so a predicted id the config does not call content never becomes a
+        ``TextRegion`` of eroded line fragments beside the lines it rings.
+        """
+        if self.use_case in CASE_LABEL_USE_CASES:
+            return {self.case_label}
+        return set(self.class_ids())
+
     def legal_class_ids(self) -> set[int]:
         """Every class id a label image may carry under this config, background included.
 
-        :meth:`class_ids` names only the ids the *regions* use, which answers a ``layout`` question;
-        for a use case that labels everything with :attr:`case_label` it is the wrong table -- a
-        single-class config with the layout tables cleared yields ``{0: []}`` alone here, so a label
-        image holding ``0`` and ``1`` was refused as "no class id configured for label values [1]".
+        :meth:`region_class_ids` plus the background and the :attr:`artificial_class_label`, the two
+        classes a label image holds that it names no region for: asking this one is what lets
+        ``configs/textline.json`` train on ``0``, ``1`` and ``2`` -- background, line, boundary, the
+        three classes the legacy TensorFlow pipeline used -- and what lets
+        :func:`sbb_pytorch.storage.images.remap_mask` accept the ring the generator paints.
+        :meth:`class_ids` alone, the answer this method gave before, was the wrong table for a
+        single-class use case: with the layout tables cleared it inverts to ``{0: []}`` only, so a
+        label image holding ``0`` and ``1`` was refused as "no class id configured for label
+        values [1]".
         """
-        if self.use_case in CASE_LABEL_USE_CASES:
-            return {0, self.case_label}
-        return {0, *self.class_ids()}
+        ids = self.region_class_ids() | {0}
+        if self.artificial_class_label is not None:
+            ids = ids | {self.artificial_class_label}
+        return ids
 
 
 class ScalesConfig(BaseModel):
@@ -636,10 +665,14 @@ def validate_pair(config: SBBConfig, page2label: Page2Label | None = None) -> li
     if label is None:
         return []
 
-    highest = max(label.class_ids(), default=0)
+    # Legal ids, not the region table: a single-class config's classes are ``case_label`` and the
+    # ``artificial_class_label`` ring, which ``class_ids()`` never lists -- so a textline config
+    # saying ``n_classes: 2`` beside ``artificial_class_label: 2`` (the pair that made a retrain
+    # necessary) passed this check while its own label images were untrainable.
+    highest = max(label.legal_class_ids())
     if highest >= config.n_classes:
         return [
-            f"page2label maps a region to class id {highest}, but n_classes={config.n_classes} "
+            f"page2label needs class id {highest}, but n_classes={config.n_classes} "
             f"only covers ids 0..{config.n_classes - 1}"
         ]
     return []

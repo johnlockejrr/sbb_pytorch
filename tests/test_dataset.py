@@ -216,6 +216,23 @@ def test_single_class_config_trains_on_the_class_its_case_label_names(tmp_path: 
     assert with_tables.legal_class_ids() == {0, 1}
 
 
+def test_the_three_class_textline_pair_trains_on_the_boundary_ring(tmp_path: Path) -> None:
+    """``configs/textline.json``'s current shape: background, line, and the ring between lines.
+
+    The second half of the pair that merged every predicted line into one. With ``n_classes: 2`` the
+    ring the generator carves out of each line was a class id the config could not represent --
+    ``class id 2 for stored value 2 is outside [0, 2)`` -- so a model trained on those labels saw
+    full-size lines touching their neighbours and learned one connected ink field. Counting three
+    classes is what makes the separator the labels draw a class the model can be trained on.
+    """
+    root = tmp_path / "data"
+    write_pair(root, "page", label_values=(0, 1, 2))
+    page2label = Page2Label(use_case="textline", case_label=1, artificial_class_label=2)
+    dataset = SegmentationDataset(root, config=make_config(n_classes=3, page2label=page2label))
+    assert dataset._mapping == {0: 0, 1: 1, 2: 2}
+    assert set(dataset[0][1].unique().tolist()) == {0, 1, 2}
+
+
 def test_unreadable_pair_raises_with_the_path(dataset_root: Path) -> None:
     """``cv2.imread`` returning ``None`` used to become a ``TypeError`` hundreds of lines later,
     or -- inside a bare ``except:`` -- a silent all-white image."""

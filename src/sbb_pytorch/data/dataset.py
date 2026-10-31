@@ -228,13 +228,15 @@ class SegmentationDataset(Dataset):
         Two configs used to be refused by their own mapping. ``class_ids()`` lists only the ids the
         *regions* use, so 0 -- the background every other pixel of a rendered label carries -- was
         missing, and a generated label image failed with "no class id configured for label values
-        ``[0]``". And for a single-class use case it is the wrong table outright: ``configs/
-        textline.json`` pairs ``n_classes: 2`` with the layout ids 1-6, so every entry past ``1``
-        failed ``remap_mask``'s range check ("class id 2 for stored value 2 is outside [0, 2)") and
-        the config could not train on any label at all. ``legal_class_ids()`` answers the question
-        the use case actually asks -- ``{0, case_label}`` there, ``{0, *class_ids()}`` for layout --
-        so background maps to class 0, which is what ``n_classes`` counts for it, and the id the
-        model predicts is the one its config names.
+        ``[0]``". And for a single-class use case it was the wrong table outright: while
+        ``configs/textline.json`` paired ``n_classes: 2`` with the layout ids 1-6, every entry past
+        ``1`` failed ``remap_mask``'s range check ("class id 2 for stored value 2 is outside
+        [0, 2)") and the config could not train on any label at all. ``legal_class_ids()`` answers
+        the question the use case actually asks -- content ids plus the background and the
+        ``artificial_class_label`` ring -- so background maps to class 0, which is what
+        ``n_classes`` counts for it, and the ids a model predicts are the ones its config names --
+        ``{0, 1, 2}`` for the textline file as it now stands, ``{0, 1}`` for the two-class model it
+        used to describe.
         """
         if isinstance(mapping, Page2Label):
             return {class_id: class_id for class_id in sorted(mapping.legal_class_ids())}
