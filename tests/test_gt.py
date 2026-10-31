@@ -2008,6 +2008,26 @@ def test_output_stem_never_raises_where_the_legacy_split_did(name: str, expected
     assert generator.output_stem(name) == expected
 
 
+def test_two_files_answering_one_stem_now_get_two_files() -> None:
+    """Two documents' page ``0113`` used to write the same PNG: 2455 XMLs became 476 labels.
+
+    The legacy stem is the segment between the first hyphen and the first dot, so a second
+    document's page ``0113`` answers it too, and so does a page's ALTO beside its PageXML
+    (``882241214-0113.alto.xml`` reads as ``0113``) -- every one of them overwriting the file the
+    one before wrote. The first claim keeps the legacy name, so a dataset generated before this
+    rule still matches what the next run writes, and the ones behind it take the whole file stem
+    and then ``_1``.
+    """
+    taken: set[str] = set()
+    assert generator.unique_output_stem("882241214-0113.xml", taken) == "0113"
+    assert generator.unique_output_stem("901234567-0113.xml", taken) == "901234567-0113"
+    assert generator.unique_output_stem("882241214-0113.alto.xml", taken) == "882241214-0113.alto"
+    assert generator.unique_output_stem("a-b.xml", taken) == "b"
+    assert generator.unique_output_stem("a-b.xml", taken) == "a-b_1"  # whole stem taken too
+    assert generator.unique_output_stem("000123456.xml", taken) == "000123456"
+    assert generator.unique_output_stem("000123456.xml", taken) == "000123456_1"
+
+
 def test_from_dict_reads_the_legacy_and_the_sbbconfig_spellings() -> None:
     """``custom_config_page2label.json`` keeps the fields at the top level; an ``SBBConfig`` nests
     them under ``page2label``. Without the unwrap, ``sbb gt generate -c configs/layout.json`` read

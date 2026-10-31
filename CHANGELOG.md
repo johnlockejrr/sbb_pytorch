@@ -357,6 +357,13 @@ breaking/fix/api markers is [docs/migration.md](docs/migration.md).
   paragraph; `_find_image` preferred a page's `.xml` to its `.png` when both shared a stem; and
   `output_stem` produced `b-c` and `1800.tar` where the ported rule writes `b` and `1800`, so
   regenerating a dataset wrote a second file beside the existing one rather than overwriting it.
+  The ported rule itself turned out to be the next defect: `split('-')[1]` is not *unique*, so a
+  mixed folder -- two documents' page `0113`, a page's PageXML and its ALTO, which is what
+  `sam_44_mss_mixed` is -- wrote 2455 XMLs as 476 label images, each file overwritten by the next
+  one that wanted its name. `unique_output_stem` keeps the legacy answer for the first file to
+  claim a stem (so a dataset generated before still matches what the next run writes) and
+  disambiguates the rest to the whole file stem, then `_1`; the label and its copied image take
+  one stem, which is how the dataset loader pairs them.
 - **Config.** Any key a file omitted raised `KeyError` even when the value was irrelevant --
   `config_train_textline.json` was loadable through exactly one code path -- and a `" "`
   `dir_of_start_model` (the shipped way of writing "unset") is now `None`. `validate_configs`'

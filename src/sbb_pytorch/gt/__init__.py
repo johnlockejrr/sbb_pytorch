@@ -41,6 +41,7 @@ from .generator import (
     generate_ground_truth,
     labelled_contours,
     output_stem,
+    unique_output_stem,
 )
 from .geometry import (
     DEFAULT_KERNEL,
@@ -229,6 +230,7 @@ __all__ = [
     "generate_ground_truth",
     "labelled_contours",
     "output_stem",
+    "unique_output_stem",
     # vocabulary — the PageXML element and @type table
     "GRAPHIC_REGION_TYPES",
     "LEGACY_INACTIVE_TEXT_TYPES",

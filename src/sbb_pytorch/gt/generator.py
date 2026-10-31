@@ -374,7 +374,9 @@ def generate_ground_truth(
     xml_dir:
         Directory of PageXML/ALTO files.
     output_dir:
-        Where the label images go.
+        Where the label images go.  Each is named by :func:`unique_output_stem`, so two files
+        whose legacy stem matches -- two documents' page ``0113``, or a page's PageXML and its
+        ALTO -- write two labels instead of one overwriting the other.
     output_type:
         ``3d`` (palette RGB) or ``2d`` (class id per pixel) — see
         :class:`~.render.OutputType`.
@@ -401,6 +403,7 @@ def generate_ground_truth(
     out.mkdir(parents=True, exist_ok=True)
 
     result = GenerationResult()
+    taken: set[str] = set()  # stems this run has handed out -- see :func:`unique_output_stem`
     for xml_file in files:
         if on_progress is not None:
             on_progress(xml_file)
@@ -427,11 +430,14 @@ def generate_ground_truth(
             result.skipped[page.path] = f"no regions labelled by {resolved.source or 'config'}"
             continue
 
+        stem = unique_output_stem(page.path, taken)
         result.labels.append(
-            _write_label_image(page, label_map, resolved, out, kind, printspace=printspace)
+            _write_label_image(
+                page, label_map, resolved, out, kind, printspace=printspace, stem=stem
+            )
         )
         copied = _copy_source_image(
-            page, resolved, images_dir, images_output_dir, printspace=printspace
+            page, resolved, images_dir, images_output_dir, printspace=printspace, stem=stem
         )
         if copied is not None:
             result.images.append(copied)
@@ -586,6 +592,7 @@ def _write_label_image(
     output_type: OutputType,
     *,
     printspace: bool = False,
+    stem: str | None = None,
 ) -> Path:
     """Render, crop, resize and write one page's label map.
 
@@ -593,6 +600,9 @@ def _write_label_image(
     the crop and the resize duplicated in each of the two branches and the ``2d``/``3d``
     choice made by filling an RGB image with the class id.  Both formats now come from the
     same label map (:func:`~.render.to_label_map` / :func:`~.render.label_map_to_image`).
+
+    The file is named *stem*, which is :func:`unique_output_stem` for the page when the caller
+    is a whole run; left off it falls back to :func:`output_stem` for a page written on its own.
     """
     image = (
         to_label_map(label_map)
@@ -604,7 +614,7 @@ def _write_label_image(
     if target is not None and tuple(cropped.shape[:2]) != target:
         interpolation = cv2.INTER_NEAREST if output_type is OutputType.TWO_D else cv2.INTER_AREA
         cropped = cv2.resize(cropped, (target[1], target[0]), interpolation=interpolation)
-    return write_image(output_dir / f"{output_stem(page.path)}.png", cropped)
+    return write_image(output_dir / f"{stem or output_stem(page.path)}.png", cropped)
 
 
 def _palette(config: GroundTruthConfig) -> dict[int, tuple[int, int, int]]:
@@ -646,12 +656,17 @@ def _copy_source_image(
     images_output_dir: str | Path | None,
     *,
     printspace: bool = False,
+    stem: str | None = None,
 ) -> Path | None:
     """Copy (and match the label's transforms on) the page's source image.
 
     The legacy code did this inline in both branches and required the image to exist —
     ``ls_org_imgs_stem.index(...)`` raised ``ValueError`` for any page whose photo was
     missing, aborting the run.  A missing photo is skipped quietly here.
+
+    *stem* is the name the page's label was written under, so the two stay a pair: the dataset
+    loader matches ``images/X.png`` to ``labels/X.png`` by stem, and a label named one way and
+    its image another would be a page the run generated and the training never sees.
     """
     if images_dir is None or images_output_dir is None:
         return None
@@ -666,7 +681,8 @@ def _copy_source_image(
     target = _column_size(page, config)
     if target is not None and tuple(image.shape[:2]) != target:
         image = cv2.resize(image, (target[1], target[0]), interpolation=cv2.INTER_AREA)
-    return write_image(Path(images_output_dir) / f"{output_stem(page.path)}{source.suffix}", image)
+    name = stem or output_stem(page.path)
+    return write_image(Path(images_output_dir) / f"{name}{source.suffix}", image)
 
 
 def _find_image(page: Page, images_dir: str | Path) -> Path | None:
@@ -699,12 +715,44 @@ def output_stem(path: str | Path) -> str:
     the multi-hyphen and multi-dot spellings -- the segment between the first hyphen and the
     *last* extension is not what the legacy datasets were named with, so re-running one
     produced a second file beside the original instead of overwriting it.
+
+    The rule is not *unique*: ``882241214-0113.xml`` and ``901234567-0113.xml``, and a page's
+    PageXML and its ALTO, all answer ``0113``.  A run writes through
+    :func:`unique_output_stem`, which keeps this answer for the first file to claim a stem and
+    disambiguates the ones behind it.
     """
     name = Path(path).name
     parts = name.split("-")
     if len(parts) < 2:
         return name.split(".")[0]  # the legacy ``except`` branch, reached via IndexError
     return parts[1].split(".")[0]
+
+
+def unique_output_stem(path: str | Path, taken: set[str]) -> str:
+    """The stem *path*'s outputs are written under, once *taken* holds the names already claimed.
+
+    :func:`output_stem` is the legacy rule and on a mixed dataset it collides: two documents
+    that each hold a page ``0113`` both answer ``0113``, and so do a page's PageXML and its ALTO
+    (``882241214-0113.xml`` and ``882241214-0113.alto.xml`` read the same between the first
+    hyphen and the first dot).  Every file that wanted a name it had already given took the file
+    after it down with it, which is how a folder of 2455 XMLs became 476 label images.  The
+    first file to claim a stem keeps the legacy answer -- so a dataset generated before this
+    rule still matches what the next run writes -- and the ones behind it take the whole file
+    stem (``882241214-0113``, and ``882241214-0113.alto`` for the ALTO of a page whose PageXML
+    got there first), then ``_1``, ``_2``.  *taken* is updated in place, so a caller threading it
+    through a run gives every page in that run a file of its own.
+    """
+    stem = output_stem(path)
+    if stem not in taken:
+        taken.add(stem)
+        return stem
+    full = Path(path).stem
+    index = 1
+    while full in taken:
+        full = f"{Path(path).stem}_{index}"
+        index += 1
+    taken.add(full)
+    return full
 
 
 def labelled_contours(contours: Iterable[np.ndarray], label: int) -> list[tuple[np.ndarray, int]]:
