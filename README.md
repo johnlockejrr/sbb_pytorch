@@ -1,4 +1,4 @@
-# SBB PyTorch
+# SBB Pixelwise Segmentation PyTorch
 
 PyTorch implementation of the SBB (Staatsbibliothek zu Berlin) pixelwise document-image
 segmentation models -- layout, textline, binarization, printspace, glyph/word -- plus the two
@@ -235,7 +235,22 @@ README said MIT, which was simply wrong, and `pyproject.toml` now declares
 
 ## How to cite
 
-If you find this tool useful in your work, please consider citing our paper:
+If you find this project useful in your work, cite it as:
+
+```bibtex
+@misc{sbb_pixelwise_segmentation_pytorch,
+  title        = {{SBB Pixelwise Segmentation PyTorch}},
+  author       = {Locke, John},
+  year         = {2026},
+  howpublished = {\url{https://github.com/johnlockejrr/sbb_pytorch}},
+  note         = {GitHub: \texttt{johnlockejrr}}
+}
+```
+
+The packaged rewrite -- `sbb-pytorch` 0.2.0 and the single `sbb` command it installs -- is
+[johnlockejrr](https://github.com/johnlockejrr) (John Locke)'s own project.
+
+Cite the research it builds on separately:
 
 ```bibtex
 @inproceedings{hip23rezanezhad,
