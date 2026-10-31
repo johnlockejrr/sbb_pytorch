@@ -1258,6 +1258,14 @@ def gt() -> None:
     "write X.png and X.alto.png -- what every run before this flag did.",
 )
 @click.option(
+    "--legacy-stem",
+    is_flag=True,
+    help="Name outputs the way the legacy pipeline did -- the segment between the first hyphen "
+    "and the first dot, so 901234567-039.xml becomes 039.png. Without it the file's own name is "
+    "used (901234567-039.png), which is what a folder of mixed datasets needs: two documents "
+    "holding a page 039 want the same shortened name and only one of them can have it.",
+)
+@click.option(
     "--min-area",
     type=float,
     default=None,
@@ -1278,6 +1286,7 @@ def gt_generate(
     images_output_dir: Path | None,
     recursive: bool,
     dedupe_pages: bool,
+    legacy_stem: bool,
     min_area: float | None,
     limit: int | None,
     dry_run: bool,
@@ -1300,6 +1309,10 @@ def gt_generate(
     A page filed in both formats -- ``X.xml`` and its ``X.alto.xml`` -- is labelled *once*, from
     the PageXML; ``--no-dedupe-pages`` goes back to labelling every file, which wrote
     ``X.png`` and ``X.alto.png`` for one page.
+
+    Outputs are named after the file itself -- ``901234567-039.xml`` to ``901234567-039.png``.
+    ``--legacy-stem`` asks for the upstream shortening instead (``039.png``), which two documents
+    holding a page 039 cannot both have.
     """
     if config_path is not None and use_case_raw is not None:
         raise click.BadParameter("give --config or --use-case, not both")
@@ -1349,6 +1362,7 @@ def gt_generate(
             xml_files=xml_files,
             recursive=recursive,
             dedupe_pages=dedupe_pages,
+            legacy_stem=legacy_stem,
             on_progress=advance,
         )
     state.logger.debug("generation result: %s", result)

@@ -157,6 +157,17 @@ replacement.
   first) and the PageXML renamed `000123456-1800`. `parser.select_page_files` keeps the PageXML,
   and `parser.page_identity` names the page a file describes so that a folder holding *only* the
   ALTO of a page still yields it. `--no-dedupe-pages` labels every file, as before.
+- **Outputs are named after the file that produced them, folders included.** A label was named by
+  the upstream rule `name.split('-')[1].split('.')[0]`, which answers `039` for
+  `901234567-039.xml` and `1800` for `000123456-1800.xml` -- a shortening two documents holding a
+  page `039` cannot both use, which is why 2455 XMLs once became 476 labels. `gt.generator.file_stem`
+  is the name now: `901234567-039.xml` → `901234567-039.png`, and a page found inside a subfolder
+  of `--xml` carries that folder in the name (`mss-021/page-000.xml` → `mss-021_page-000.png`) so
+  the four children of a parent dataset keep their pages apart in the flat `-o`. A file sitting
+  directly inside `--xml` has no folder to carry and keeps its plain name. `--legacy-stem`
+  (`gt.generator.output_stem`) writes the old shortening for a run that must reproduce names an
+  earlier one wrote. The copied source image gets the same stem as its label, so the pair the
+  training loader matches by name stays a pair.
 - `--device` defaults to `auto` and is validated at parse time. `train.py` hard-coded `cuda` and
   called `pl.Trainer(accelerator=device, devices=1)`, which rejected the valid spec `cuda:1` and
   made the second GPU of a machine unreachable.

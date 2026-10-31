@@ -2045,22 +2045,70 @@ def test_output_stem_never_raises_where_the_legacy_split_did(name: str, expected
 def test_two_files_answering_one_stem_now_get_two_files() -> None:
     """Two documents' page ``0113`` used to write the same PNG: 2455 XMLs became 476 labels.
 
-    The legacy stem is the segment between the first hyphen and the first dot, so a second
+    The legacy rule is the segment between the first hyphen and the first dot, so a second
     document's page ``0113`` answers it too, and so does a page's ALTO beside its PageXML
     (``882241214-0113.alto.xml`` reads as ``0113``) -- every one of them overwriting the file the
-    one before wrote. The first claim keeps the legacy name, so a dataset generated before this
-    rule still matches what the next run writes, and the ones behind it take the whole file stem
-    and then ``_1``.
+    one before wrote.  The name is the file's own now, which two files in one folder cannot share;
+    ``legacy_stem=True`` keeps the old rule for a run that must reproduce names an earlier one
+    wrote, and that is the branch that still needs the numbering: the first claim keeps the legacy
+    name and the ones behind it take the whole file stem, then ``_1``.
     """
-    taken: set[str] = set()
-    assert generator.unique_output_stem("882241214-0113.xml", taken) == "0113"
+    taken: set[str] = set()  # the default: the file's own name
+    assert generator.unique_output_stem("882241214-0113.xml", taken) == "882241214-0113"
     assert generator.unique_output_stem("901234567-0113.xml", taken) == "901234567-0113"
     assert generator.unique_output_stem("882241214-0113.alto.xml", taken) == "882241214-0113.alto"
-    assert generator.unique_output_stem("a-b.xml", taken) == "b"
-    assert generator.unique_output_stem("a-b.xml", taken) == "a-b"  # the whole file stem
-    assert generator.unique_output_stem("a-b.xml", taken) == "a-b_1"  # legacy and full taken
+    assert generator.unique_output_stem("882241214-0113.xml", taken) == "882241214-0113_1"
     assert generator.unique_output_stem("000123456.xml", taken) == "000123456"
     assert generator.unique_output_stem("000123456.xml", taken) == "000123456_1"
+
+    legacy: set[str] = set()  # legacy_stem=True: upstream's shortening, and its collisions
+    assert generator.unique_output_stem("882241214-0113.xml", legacy, legacy_stem=True) == "0113"
+    assert (
+        generator.unique_output_stem("901234567-0113.xml", legacy, legacy_stem=True)
+        == "901234567-0113"
+    )
+    assert (
+        generator.unique_output_stem("882241214-0113.alto.xml", legacy, legacy_stem=True)
+        == "882241214-0113.alto"
+    )
+    assert generator.unique_output_stem("a-b.xml", legacy, legacy_stem=True) == "b"
+    assert generator.unique_output_stem("a-b.xml", legacy, legacy_stem=True) == "a-b"
+    assert generator.unique_output_stem("a-b.xml", legacy, legacy_stem=True) == "a-b_1"
+    assert generator.unique_output_stem("000123456.xml", legacy, legacy_stem=True) == "000123456"
+    assert generator.unique_output_stem("000123456.xml", legacy, legacy_stem=True) == "000123456_1"
+
+
+def test_a_page_named_in_a_folder_keeps_the_folder_it_came_from(tmp_path: Path) -> None:
+    """``file_stem`` joins in the folders above a file when told which directory the run was given.
+
+    Four child datasets each holding a ``page-000.xml`` otherwise write ``page-000.png`` plus
+    ``_1``, ``_2``, ``_3`` -- unique, but the dataset is gone from the name and only the order the
+    folder was walked says which is whose. The legacy rule ignores folders, so it stays alone here.
+    """
+    body = xml_document(
+        '<TextRegion ID="r1" type="paragraph"><Coords points="4,4 40,4 40,20 4,20"/></TextRegion>'
+    )
+    child = tmp_path / "mss-021"
+    child.mkdir()
+    page = write_xml(child, "page-000.xml", body)
+
+    assert generator.file_stem(page, relative_to=tmp_path) == "mss-021_page-000"
+    assert generator.file_stem(page) == "page-000"  # no directory given: the plain name
+    assert generator.file_stem(
+        write_xml(child, "page-000.alto.xml", body), relative_to=tmp_path
+    ) == ("mss-021_page-000.alto")
+    # deeper nesting joins every folder, and a file outside the root keeps its own name
+    (child / "vol-2").mkdir()
+    deep = write_xml(child / "vol-2", "page-007.xml", body)
+    assert generator.file_stem(deep, relative_to=tmp_path) == "mss-021_vol-2_page-007"
+    assert generator.file_stem(deep, relative_to=child) == "vol-2_page-007"
+    (tmp_path / "elsewhere").mkdir()
+    outside = write_xml(tmp_path / "elsewhere", "000123456-1800.xml", body)
+    assert generator.file_stem(outside, relative_to=child) == "000123456-1800"
+    taken: set[str] = set()
+    assert (
+        generator.unique_output_stem(deep, taken, relative_to=tmp_path) == "mss-021_vol-2_page-007"
+    )
 
 
 def test_from_dict_reads_the_legacy_and_the_sbbconfig_spellings() -> None:
@@ -2312,8 +2360,9 @@ def test_a_pages_alto_is_not_a_second_page(tmp_path: Path) -> None:
 
 
 def test_generate_ground_truth_writes_the_stem_named_label(tmp_path: Path) -> None:
-    """One XML in, one PNG named ``1800`` out, and the exact ``summary()`` line the CLI prints --
-    the call site that used to die on ``vars()`` of a slots dataclass."""
+    """One XML in, one PNG named after it -- ``000123456-1800.xml`` to ``000123456-1800.png`` -- and
+    the exact ``summary()`` line the CLI prints, the call site that used to die on ``vars()`` of a
+    slots dataclass."""
     xml_dir = tmp_path / "xml"
     _page(
         xml_dir,
@@ -2325,10 +2374,10 @@ def test_generate_ground_truth_writes_the_stem_named_label(tmp_path: Path) -> No
     )
     out = tmp_path / "out"
     result = generator.generate_ground_truth(config, xml_dir, out)
-    assert [p.name for p in result.labels] == ["1800.png"]
+    assert [p.name for p in result.labels] == ["000123456-1800.png"]
     assert (result.images, result.skipped) == ([], {})
     assert len(result) == 1 and result.summary() == "1 labels, 0 images, 0 skipped"
-    written = render.read_image(out / "1800.png")
+    written = render.read_image(out / "000123456-1800.png")
     assert np.array_equal(
         written,
         render.label_map_to_image(
@@ -2341,8 +2390,8 @@ def test_generate_ground_truth_labels_a_page_filed_twice_once(tmp_path: Path) ->
     """A page filed as ``X.xml`` and ``X.alto.xml`` writes one label, from the PageXML.
 
     Every file in the folder used to get a label of its own, so the pair became two -- and the ALTO
-    sorts first, so it claimed the legacy stem ``1800`` while the PageXML was pushed to
-    ``000123456-1800.png``: one page, two labels, the annotated file renamed by its own OCR
+    sorts first, so it claimed the name ``000123456-1800.png`` while the PageXML was pushed to
+    ``000123456-1800.alto.png``: one page, two labels, the annotated file named after its own OCR
     markup.  ``dedupe_pages=False`` is that answer, kept as the opt-out.
     """
     folder = tmp_path / "xml"
@@ -2357,10 +2406,15 @@ def test_generate_ground_truth_labels_a_page_filed_twice_once(tmp_path: Path) ->
     )
 
     result = generator.generate_ground_truth(config, folder, tmp_path / "out")
-    assert [p.name for p in result.labels] == ["1800.png"]  # the PageXML's, named the legacy way
+    assert [p.name for p in result.labels] == [
+        "000123456-1800.png"
+    ]  # the PageXML's, not the ALTO's
 
     both = generator.generate_ground_truth(config, folder, tmp_path / "both", dedupe_pages=False)
-    assert sorted(p.name for p in both.labels) == ["000123456-1800.png", "1800.png"]
+    assert sorted(p.name for p in both.labels) == [
+        "000123456-1800.alto.png",
+        "000123456-1800.png",
+    ]
 
 
 def test_generate_ground_truth_crops_and_copies_the_source_image(tmp_path: Path) -> None:
@@ -2386,7 +2440,7 @@ def test_generate_ground_truth_crops_and_copies_the_source_image(tmp_path: Path)
         images_dir=images_in,
         images_output_dir=tmp_path / "copied",
     )
-    assert [p.name for p in result.images] == ["1800.png"]
+    assert [p.name for p in result.images] == ["000123456-1800.png"]
     assert render.read_image(result.images[0]).shape == (60, 60, 3)
     cropped = generator.generate_ground_truth(
         config,
@@ -2412,8 +2466,12 @@ def test_an_image_dir_holding_the_xml_still_finds_the_photo(tmp_path: Path) -> N
     config = generator.GroundTruthConfig(use_case=generator.UseCase.LAYOUT, imageregion=4)
     assert generator._find_image(page, tmp_path).name == "1800.png"
     assert generator._copy_source_image(page, config, tmp_path, tmp_path / "copies") == (
-        tmp_path / "copies/1800.png"
+        tmp_path / "copies/000123456-1800.png"
     )
+    # ...and named after the page, not after whichever image file was found beside it.
+    assert generator._copy_source_image(
+        page, config, tmp_path, tmp_path / "legacy", legacy_stem=True
+    ) == (tmp_path / "legacy/1800.png")
 
 
 def test_generate_ground_truth_reports_unusable_pages(tmp_path: Path) -> None:
@@ -2438,7 +2496,8 @@ def test_generate_ground_truth_reports_unusable_pages(tmp_path: Path) -> None:
         use_case=generator.UseCase.LAYOUT, textregions={"paragraph": 1}
     )
     result = generator.generate_ground_truth(config, xml_dir, tmp_path / "out")
-    assert [p.name for p in result.labels] == ["100.png"]  # only the page the config can label
+    # only the page the config can label, named after its own file
+    assert [p.name for p in result.labels] == ["000111111-100.png"]
     reasons = {path.name: reason for path, reason in result.skipped.items()}
     assert reasons["000333333-300.xml"].startswith("parse failed:")
     assert reasons["000222222-200.xml"] == "no regions labelled by config"
@@ -2479,7 +2538,7 @@ def test_xml_files_and_the_progress_callback_bypass_discovery(tmp_path: Path) ->
         config, tmp_path, tmp_path / "out", xml_files=[page.path], on_progress=seen.append
     )
     assert seen == [page.path]
-    assert [p.name for p in result.labels] == ["1800.png"]
+    assert [p.name for p in result.labels] == ["000123456-1800.png"]
 
 
 def test_a_json_config_names_itself_in_the_skip_reason(tmp_path: Path) -> None:

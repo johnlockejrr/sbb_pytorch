@@ -72,7 +72,9 @@ __all__ = [
     "build_label_map",
     "generate_ground_truth",
     "labelled_contours",
+    "file_stem",
     "output_stem",
+    "unique_output_stem",
 ]
 
 
@@ -364,6 +366,7 @@ def generate_ground_truth(
     xml_files: Sequence[Path] | None = None,
     recursive: bool = True,
     dedupe_pages: bool = True,
+    legacy_stem: bool = False,
     on_progress: Callable[[Path], None] | None = None,
 ) -> GenerationResult:
     """Generate ground-truth label images for every PageXML file in *xml_dir*.
@@ -380,7 +383,10 @@ def generate_ground_truth(
         Where the label images go.  Each is named by :func:`unique_output_stem`, so two documents'
         page ``0113`` write two labels instead of one overwriting the other; a page's PageXML and
         its ALTO write one, because *dedupe_pages* keeps the PageXML and the ALTO is the same page
-        in the other format rather than a second page to label.
+        in the other format rather than a second page to label.  A page found in a subfolder of
+        *xml_dir* carries that folder in the name (``mss-021/page-000.xml`` →
+        ``mss-021_page-000.png``), so a parent folder of child datasets keeps every child's pages
+        apart in one flat output folder.
     output_type:
         ``3d`` (palette RGB) or ``2d`` (class id per pixel) — see
         :class:`~.render.OutputType`.
@@ -400,6 +406,12 @@ def generate_ground_truth(
         page in two formats, and the PageXML is the one read (see
         :func:`~sbb_pytorch.gt.parser.select_page_files`). ``False`` labels both, naming the
         second ``X.alto.png`` beside the first -- what every run before this flag produced.
+    legacy_stem:
+        Name outputs by :func:`output_stem`, upstream's rule that answers ``039`` for
+        ``901234567-039.xml``, instead of the file's own name.  Off by default since 0.2.0; the
+        legacy name collides across documents (two of them can hold a page ``039``) and
+        :func:`unique_output_stem` exists to untangle that, whereas a file's own name -- with its
+        folders joined in, which the legacy rule ignores -- cannot collide at all.
     on_progress:
         Called with each file after it is handled, so a caller can drive a progress bar
         without this package depending on ``rich``.
@@ -448,10 +460,18 @@ def generate_ground_truth(
             result.skipped[page.path] = f"no regions labelled by {resolved.source or 'config'}"
             continue
 
-        stem = unique_output_stem(page.path, taken)
+        stem = unique_output_stem(page.path, taken, legacy_stem=legacy_stem, relative_to=xml_dir)
         result.labels.append(
             _write_label_image(
-                page, label_map, resolved, out, kind, printspace=printspace, stem=stem
+                page,
+                label_map,
+                resolved,
+                out,
+                kind,
+                printspace=printspace,
+                stem=stem,
+                legacy_stem=legacy_stem,
+                relative_to=xml_dir,
             )
         )
         copied = _copy_source_image(
@@ -462,6 +482,8 @@ def generate_ground_truth(
             printspace=printspace,
             stem=stem,
             recursive=recursive,
+            legacy_stem=legacy_stem,
+            relative_to=xml_dir,
         )
         if copied is not None:
             result.images.append(copied)
@@ -617,6 +639,8 @@ def _write_label_image(
     *,
     printspace: bool = False,
     stem: str | None = None,
+    legacy_stem: bool = False,
+    relative_to: str | Path | None = None,
 ) -> Path:
     """Render, crop, resize and write one page's label map.
 
@@ -626,7 +650,9 @@ def _write_label_image(
     same label map (:func:`~.render.to_label_map` / :func:`~.render.label_map_to_image`).
 
     The file is named *stem*, which is :func:`unique_output_stem` for the page when the caller
-    is a whole run; left off it falls back to :func:`output_stem` for a page written on its own.
+    is a whole run; left off it falls back to :func:`_base_stem` -- the file's own name, or
+    :func:`output_stem` with *legacy_stem*, with *relative_to*'s folders joined in -- for a page
+    written on its own.
     """
     image = (
         to_label_map(label_map)
@@ -638,7 +664,8 @@ def _write_label_image(
     if target is not None and tuple(cropped.shape[:2]) != target:
         interpolation = cv2.INTER_NEAREST if output_type is OutputType.TWO_D else cv2.INTER_AREA
         cropped = cv2.resize(cropped, (target[1], target[0]), interpolation=interpolation)
-    return write_image(output_dir / f"{stem or output_stem(page.path)}.png", cropped)
+    name = stem or _base_stem(page.path, legacy_stem, relative_to=relative_to)
+    return write_image(output_dir / f"{name}.png", cropped)
 
 
 def _palette(config: GroundTruthConfig) -> dict[int, tuple[int, int, int]]:
@@ -682,6 +709,8 @@ def _copy_source_image(
     printspace: bool = False,
     stem: str | None = None,
     recursive: bool = True,
+    legacy_stem: bool = False,
+    relative_to: str | Path | None = None,
 ) -> Path | None:
     """Copy (and match the label's transforms on) the page's source image.
 
@@ -706,7 +735,7 @@ def _copy_source_image(
     target = _column_size(page, config)
     if target is not None and tuple(image.shape[:2]) != target:
         image = cv2.resize(image, (target[1], target[0]), interpolation=cv2.INTER_AREA)
-    name = stem or output_stem(page.path)
+    name = stem or _base_stem(page.path, legacy_stem, relative_to=relative_to)
     return write_image(Path(images_output_dir) / f"{name}{source.suffix}", image)
 
 
@@ -758,31 +787,81 @@ def output_stem(path: str | Path) -> str:
     return parts[1].split(".")[0]
 
 
-def unique_output_stem(path: str | Path, taken: set[str]) -> str:
+def file_stem(path: str | Path, *, relative_to: str | Path | None = None) -> str:
+    """The file's own name without its extension, plus the folders above it when *relative_to* is given.
+
+    ``901234567-039.xml`` → ``901234567-039``.  With *relative_to* the folders between that
+    directory and the file join in with ``_`` -- ``mss-021/page-000.xml`` → ``mss-021_page-000`` —
+    which is what a parent folder of several datasets needs: four documents can each hold a
+    ``page-000`` and the folder is the only thing saying which, so without it the second gets
+    ``page-000_1`` and its dataset name is gone.  A file sitting directly inside *relative_to* has
+    no folders to join and keeps its plain name; a file outside it is named on its own too.
+
+    This is the default since 0.2.0.  :func:`output_stem`'s legacy rule answers ``039`` for that
+    same file -- upstream's convention of shortening a page's label to the segment after the first
+    hyphen -- and two documents each holding a page ``039`` then want the same name.  A page's ALTO
+    keeps its own spelling as well: with ``--no-dedupe-pages`` its label is ``X.alto.png`` beside
+    the PageXML's ``X.png``, not ``X-1.png``.
+    """
+    file = Path(path)
+    if relative_to is None:
+        return file.stem
+    try:
+        relative = file.absolute().relative_to(Path(relative_to).absolute())
+    except ValueError:  # the file is not under the directory given -- name it on its own
+        return file.stem
+    *folders, name = relative.parts
+    return "_".join((*folders, Path(name).stem))
+
+
+def _base_stem(
+    path: str | Path, legacy_stem: bool, *, relative_to: str | Path | None = None
+) -> str:
+    """The name *path*'s outputs want: :func:`file_stem`, or :func:`output_stem` with *legacy_stem*.
+
+    *relative_to* reaches only the first of the two: the file's own name gains the folders above
+    it, while the legacy rule is a reading of the file name alone, folders included or not.
+    """
+    return output_stem(path) if legacy_stem else file_stem(path, relative_to=relative_to)
+
+
+def unique_output_stem(
+    path: str | Path,
+    taken: set[str],
+    *,
+    legacy_stem: bool = False,
+    relative_to: str | Path | None = None,
+) -> str:
     """The stem *path*'s outputs are written under, once *taken* holds the names already claimed.
 
-    :func:`output_stem` is the legacy rule and on a mixed dataset it collides: two documents
-    that each hold a page ``0113`` both answer ``0113``, and so do a page's PageXML and its ALTO
-    (``882241214-0113.xml`` and ``882241214-0113.alto.xml`` read the same between the first
-    hyphen and the first dot).  Every file that wanted a name it had already given took the file
-    after it down with it, which is how a folder of 2455 XMLs became 476 label images.  The
-    first file to claim a stem keeps the legacy answer -- so a dataset generated before this
-    rule still matches what the next run writes -- and the ones behind it take the whole file
-    stem (``882241214-0113``, and ``882241214-0113.alto`` for the ALTO of a page whose PageXML
-    got there first), then ``_1``, ``_2``.  *taken* is updated in place, so a caller threading it
+    The base name is :func:`file_stem` (the file's own name, with the folders above it joined in
+    when *relative_to* names the directory the run was pointed at) and, with ``legacy_stem``,
+    :func:`output_stem` -- the legacy rule, which on a mixed dataset is not *unique*:
+    ``882241214-0113.xml`` and ``901234567-0113.xml``, and a page's PageXML and its ALTO, all
+    answer ``0113``.  Every file that wanted a name it had already given took the file after it
+    down with it, which is how a folder of 2455 XMLs became 476 label images.  The first file to
+    claim a stem keeps the name it asked for -- so a dataset generated before this rule still
+    matches what the next run writes -- and the ones behind it take the whole file stem
+    (``882241214-0113``, and ``882241214-0113.alto`` for the ALTO of a page whose PageXML got
+    there first), then ``_1``, ``_2``.  *taken* is updated in place, so a caller threading it
     through a run gives every page in that run a file of its own.
+
+    With the default naming and *relative_to* set, the base name is already unique per file -- two
+    files cannot share a path -- so the numbering is reached only by a caller listing one file
+    twice; it exists for the legacy stem, whose whole purpose is answering one name for several.
     """
-    stem = output_stem(path)
+    stem = _base_stem(path, legacy_stem, relative_to=relative_to)
     if stem not in taken:
         taken.add(stem)
         return stem
-    full = Path(path).stem
+    own = file_stem(path, relative_to=relative_to)
+    name = own if legacy_stem else stem
     index = 1
-    while full in taken:
-        full = f"{Path(path).stem}_{index}"
+    while name in taken:
+        name = f"{own}_{index}"
         index += 1
-    taken.add(full)
-    return full
+    taken.add(name)
+    return name
 
 
 def labelled_contours(contours: Iterable[np.ndarray], label: int) -> list[tuple[np.ndarray, int]]:

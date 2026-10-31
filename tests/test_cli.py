@@ -1022,7 +1022,9 @@ def test_gt_generate_reads_a_parent_folder_of_child_datasets(
 
     result = invoke(runner, "gt", "generate", "--xml", parent, "-o", out, "--config", gt_config)
     assert result.exit_code == 0, result.output
-    assert [p.name for p in out.glob("*.png")] == ["1800.png"]
+    # the child folder is part of the name, so three children's ``000123456-1800.xml`` could not
+    # be mistaken for one another in the one flat output folder
+    assert [p.name for p in out.glob("*.png")] == ["sam_44_mss_variants_000123456-1800.png"]
 
     flat = invoke(
         runner,
@@ -1046,9 +1048,9 @@ def test_gt_generate_writes_one_label_for_a_page_filed_twice(
     """A page filed as ``X.xml`` and ``X.alto.xml`` gets one ``X.png``, not two files.
 
     The ALTO of a page used to be labelled as if it were a second page: two PNGs for one page, and
-    the ALTO sorting first so it took the legacy name ``1800`` and the annotated PageXML was
-    renamed ``000123456-1800``. The listing now keeps the PageXML; ``--no-dedupe-pages`` labels
-    every file, which is what every run before the flag did.
+    the ALTO sorting first so it took the name ``000123456-1800`` and the annotated PageXML was
+    pushed to ``000123456-1800.alto``. The listing now keeps the PageXML; ``--no-dedupe-pages``
+    labels every file, which is what every run before the flag did.
     """
     body = PAGE_XML.format(size=SIZE, edge=SIZE - 4).encode()
     xml_dir = tmp_path / "xml"
@@ -1070,7 +1072,7 @@ def test_gt_generate_writes_one_label_for_a_page_filed_twice(
         runner, "gt", "generate", "--xml", xml_dir, "-o", tmp_path / "one", "--config", gt_config
     )
     assert one.exit_code == 0, one.output
-    assert [p.name for p in (tmp_path / "one").glob("*.png")] == ["1800.png"]
+    assert [p.name for p in (tmp_path / "one").glob("*.png")] == ["000123456-1800.png"]
 
     both = invoke(
         runner,
@@ -1086,9 +1088,52 @@ def test_gt_generate_writes_one_label_for_a_page_filed_twice(
     )
     assert both.exit_code == 0, both.output
     assert sorted(p.name for p in (tmp_path / "both").glob("*.png")) == [
+        "000123456-1800.alto.png",
         "000123456-1800.png",
-        "1800.png",
     ]
+
+
+def test_gt_generate_legacy_stem_writes_the_upstream_shortened_name(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``--legacy-stem`` is the naming rule before 0.2.0's default: ``901234567-039.xml`` →
+    ``039.png``, the segment between the first hyphen and the first dot. The flag exists so a run
+    can reproduce the names an older one wrote; without it the file's own name is used.
+    """
+    xml_dir = tmp_path / "xml"
+    xml_dir.mkdir()
+    (xml_dir / "000123456-1800.xml").write_bytes(PAGE_XML.format(size=SIZE, edge=SIZE - 4).encode())
+    gt_config = tmp_path / "gt_config.json"
+    gt_config.write_text(
+        json.dumps(
+            {
+                "use_case": "layout",
+                "type_output": "2d",
+                "page2label": {"use_case": "layout", "textregions": {"paragraph": 1}},
+            }
+        )
+    )
+
+    legacy = invoke(
+        runner,
+        "gt",
+        "generate",
+        "--xml",
+        xml_dir,
+        "-o",
+        tmp_path / "legacy",
+        "--config",
+        gt_config,
+        "--legacy-stem",
+    )
+    assert legacy.exit_code == 0, legacy.output
+    assert [p.name for p in (tmp_path / "legacy").glob("*.png")] == ["1800.png"]
+
+    modern = invoke(
+        runner, "gt", "generate", "--xml", xml_dir, "-o", tmp_path / "modern", "--config", gt_config
+    )
+    assert modern.exit_code == 0, modern.output
+    assert [p.name for p in (tmp_path / "modern").glob("*.png")] == ["000123456-1800.png"]
 
 
 def test_gt_generate_needs_a_use_case_or_a_config(
